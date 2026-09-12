@@ -43,7 +43,6 @@ class CapturedDecodeGraph:
         return self.logits
 
 
-@torch.inference_mode()
 def capture_decode_graph(
     model: PreTrainedModel, prompt_ids: torch.Tensor, *, max_cache_len: int
 ) -> tuple[CapturedDecodeGraph, int]:
@@ -59,18 +58,20 @@ def capture_decode_graph(
         raise ValueError("max_cache_len must exceed prompt length")
     cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
     positions = torch.arange(prompt_length, device=prompt_ids.device)
-    prefill = model(input_ids=prompt_ids, past_key_values=cache, cache_position=positions, use_cache=True, return_dict=True)
+    with torch.no_grad():
+        prefill = model(input_ids=prompt_ids, past_key_values=cache, cache_position=positions, use_cache=True, return_dict=True)
     first_token = int(prefill.logits[:, -1, :].argmax(dim=-1).item())
     static_input_ids = torch.tensor([[first_token]], device=prompt_ids.device, dtype=prompt_ids.dtype)
     static_position = torch.tensor([prompt_length], device=prompt_ids.device, dtype=torch.long)
 
     # Warm up kernels outside capture to avoid recording one-time allocations.
     warm_cache = StaticCache(config=model.config, max_cache_len=max_cache_len)
-    model(input_ids=prompt_ids, past_key_values=warm_cache, cache_position=positions, use_cache=True, return_dict=True)
-    model(input_ids=static_input_ids, past_key_values=warm_cache, cache_position=static_position, use_cache=True, return_dict=True)
+    with torch.no_grad():
+        model(input_ids=prompt_ids, past_key_values=warm_cache, cache_position=positions, use_cache=True, return_dict=True)
+        model(input_ids=static_input_ids, past_key_values=warm_cache, cache_position=static_position, use_cache=True, return_dict=True)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.no_grad(), torch.cuda.graph(graph):
         outputs = model(
             input_ids=static_input_ids,
             past_key_values=cache,
