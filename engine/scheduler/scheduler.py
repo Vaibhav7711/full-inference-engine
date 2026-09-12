@@ -23,10 +23,14 @@ class FCFSScheduler:
             raise ValueError(f"duplicate request_id {request.request_id!r}")
         self.waiting.append(request)
 
-    def admit_available(self) -> list[GenerationRequest]:
+    def admit_available(self, *, max_active_requests: int | None = None) -> list[GenerationRequest]:
         """Admit requests in arrival order; a fragmented head blocks later requests."""
+        if max_active_requests is not None and max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive when provided")
         admitted: list[GenerationRequest] = []
         while self.waiting:
+            if max_active_requests is not None and len(self.active) >= max_active_requests:
+                break
             request = self.waiting[0]
             if request.reserved_tokens > self.allocator.capacity_tokens:
                 self.waiting.popleft()

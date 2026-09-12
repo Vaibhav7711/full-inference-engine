@@ -100,6 +100,18 @@ batching is introduced.
   --output results/static_batching.json
 ```
 
+## Stage 10: continuous batching control plane
+
+`ContinuousBatcher` replaces fixed membership with an explicit per-iteration plan:
+new arrivals prefill, existing requests decode, and completed requests release their KV
+reservation so the next waiting request can enter. The current component is tested at
+the scheduler/control-plane level; it does not pretend to provide physical batched KV
+compaction before the cache-execution layer exists.
+
+```bash
+!python -m pytest tests/batching/test_continuous.py -v
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
