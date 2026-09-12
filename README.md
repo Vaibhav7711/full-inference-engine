@@ -87,6 +87,19 @@ From a second terminal/session, send `POST /generate` for a complete response or
 `POST /generate/stream` for `text/event-stream` events. The CUDA correctness suite
 also verifies streamed token IDs equal normal greedy generation.
 
+## Stage 9: static batching
+
+Static batching keeps every row in the batch until every request finishes. It gives us
+the throughput baseline and exposes wasted work from completed rows before continuous
+batching is introduced.
+
+```bash
+!python -m benchmarks.batching.static \
+  --prompt 'Explain KV caching in one sentence.' \
+  --max-new-tokens 32 --batch-sizes 1,2,4,8 --warmup-runs 1 --runs 3 \
+  --output results/static_batching.json
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
