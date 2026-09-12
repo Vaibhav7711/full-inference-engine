@@ -41,6 +41,26 @@ class PagedKVCacheManager:
             raise ValueError("sequence_length exceeds reserved block capacity")
         request.sequence_length = sequence_length
 
+    def append_tokens(self, request_id: str, count: int = 1) -> bool:
+        """Grow a sequence, allocating new physical blocks only at block boundaries."""
+        if count <= 0:
+            raise ValueError("count must be positive")
+        request = self.requests[request_id]
+        target_length = request.sequence_length + count
+        blocks_needed = (target_length + self.block_size_tokens - 1) // self.block_size_tokens
+        extra_blocks = blocks_needed - len(request.table.physical_block_ids)
+        if extra_blocks:
+            new_ids = self.allocator.extend(request_id, extra_blocks)
+            if new_ids is None:
+                return False
+            request.table = BlockTable(
+                request_id,
+                self.block_size_tokens,
+                request.table.physical_block_ids + new_ids,
+            )
+        request.sequence_length = target_length
+        return True
+
     def release(self, request_id: str) -> BlockTable:
         request = self.requests.pop(request_id)
         self.allocator.release(request_id)

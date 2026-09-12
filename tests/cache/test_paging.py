@@ -29,3 +29,14 @@ def test_paged_manager_reuses_blocks_and_reports_internal_fragmentation() -> Non
     replacement = manager.reserve("replacement", capacity_tokens=8, sequence_length=1)
     assert replacement is not None
     assert set(released.physical_block_ids).issubset(set(replacement.physical_block_ids))
+
+
+def test_paged_manager_grows_only_when_crossing_a_block_boundary() -> None:
+    manager = PagedKVCacheManager(num_blocks=3, block_size_tokens=4)
+    table = manager.reserve("request", capacity_tokens=2, sequence_length=2)
+    assert table is not None
+    assert manager.append_tokens("request", 2)
+    assert len(manager.requests["request"].table.physical_block_ids) == 1
+    assert manager.append_tokens("request", 1)
+    assert len(manager.requests["request"].table.physical_block_ids) == 2
+    assert manager.requests["request"].sequence_length == 5

@@ -132,6 +132,18 @@ class BlockAllocator:
         self._free_blocks.sort()
         return block_ids
 
+    def extend(self, request_id: str, count: int) -> tuple[int, ...] | None:
+        """Append blocks to an existing allocation without requiring contiguity."""
+        if count <= 0:
+            raise ValueError("count must be positive")
+        if request_id not in self._allocations:
+            raise KeyError(f"request {request_id!r} has no block allocation")
+        if count > len(self._free_blocks):
+            return None
+        new_blocks = tuple(self._free_blocks.pop() for _ in range(count))
+        self._allocations[request_id] += new_blocks
+        return new_blocks
+
     @property
     def free_block_count(self) -> int:
         return len(self._free_blocks)

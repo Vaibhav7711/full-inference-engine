@@ -124,6 +124,14 @@ request can waste up to `block_size - 1` tokens internally.
 !python -m pytest tests/cache/test_paging.py -v
 ```
 
+Measure allocator behavior under the same deterministic mixed-length arrival stream:
+
+```bash
+!python -m benchmarks.cache.allocator_workload \
+  --capacity-tokens 8192 --steps 1000 --arrival-probability 0.7 \
+  --block-sizes 8,16,32,64 --output results/allocator_workload.json
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
