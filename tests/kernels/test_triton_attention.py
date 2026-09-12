@@ -79,7 +79,9 @@ def test_triton_attention_fp32_tight():
     v = torch.randn(1, 8, 128, 128, device=device, dtype=torch.float32)
 
     ref = _sdpa_reference(q, k, v, causal=True)
-    out = triton_attention(q, k, v, causal=True, block_m=64, block_n=64)
+    # No explicit tiles: kernel auto-selects sizes that fit the GPU shared-mem budget.
+    # (FP32 tiles are 2x FP16, so large tiles overflow a T4 — adaptivity handles it.)
+    out = triton_attention(q, k, v, causal=True)
 
     max_diff = (out - ref).abs().max().item()
     assert max_diff < 1e-3, f"FP32 max diff {max_diff:.4e} too large — math error"
@@ -117,9 +119,14 @@ def test_triton_attention_gqa_expanded():
 
 @cuda
 @requires_cuda
-@pytest.mark.parametrize("block_m,block_n", [(32, 32), (64, 64), (32, 64), (128, 64)])
+@pytest.mark.parametrize("block_m,block_n", [(16, 16), (32, 32), (64, 64), (32, 64)])
 def test_triton_attention_block_sizes(block_m, block_n):
-    """Different tile sizes must all produce the same correct result."""
+    """Different tile sizes must all produce the same correct result.
+
+    Only sizes that fit the T4's 64KB shared memory with FP16 head_dim=128 are tested.
+    Larger tiles (e.g. 128x64) overflow shared memory on a T4 — the launcher's
+    auto-selection avoids this in normal use; here we test forced fitting sizes.
+    """
     from engine.kernels.triton_attention import triton_attention
 
     torch.manual_seed(3)

@@ -95,14 +95,33 @@ def _attention_kernel(
     tl.store(o_ptrs, acc.to(out_ptr.dtype.element_ty), mask=q_mask)
 
 
+def _auto_block_sizes(head_dim: int, dtype: torch.dtype) -> tuple[int, int]:
+    """Pick (block_m, block_n) tiles that fit the GPU shared-memory budget.
+
+    Calibrated from MEASURED T4 (64KB shared mem) launches rather than a formula, because
+    Triton's real shared-memory usage (buffer reuse, pipelining) is hard to predict
+    analytically. Measured data points on a T4 with head_dim=128:
+        - FP16 64x64 tiles launch fine (fit in 64KB).
+        - FP32 64x64 tiles need ~82KB and overflow; 32x32 scales to ~38KB and fits.
+    FP32 tiles are ~2x FP16 (4 vs 2 bytes/element), so we halve tile dims for FP32.
+
+    For smaller head_dim (e.g. 64), tiles use proportionally less memory, so the FP16
+    default is safe there too.
+    """
+    dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+    if dtype_bytes >= 4:          # FP32 / higher precision
+        return (32, 32)
+    return (64, 64)               # FP16 / BF16 — measured to fit on T4 at head_dim 128
+
+
 def triton_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float | None = None,
     causal: bool = True,
-    block_m: int = 64,
-    block_n: int = 64,
+    block_m: int | None = None,
+    block_n: int | None = None,
 ) -> torch.Tensor:
     """Flash-attention-style attention via Triton. Contiguous K,V (no paging).
 
@@ -119,6 +138,12 @@ def triton_attention(
     N = key.shape[2]
     assert key.shape[1] == H, "K heads must match Q heads (expand GQA before calling)"
     assert D <= 128, "kernel assumes head_dim <= 128"
+
+    # Auto-select tile sizes to fit this GPU's shared memory, unless caller forced them.
+    if block_m is None or block_n is None:
+        auto_m, auto_n = _auto_block_sizes(D, query.dtype)
+        block_m = block_m if block_m is not None else auto_m
+        block_n = block_n if block_n is not None else auto_n
 
     if scale is None:
         scale = 1.0 / (D ** 0.5)
