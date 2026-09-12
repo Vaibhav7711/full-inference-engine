@@ -2,4 +2,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
-results/*.json
+
+# macOS clutter
+.DS_Store
+**/.DS_Store
+
+# Ignore heavy profiler traces, but TRACK result JSONs (they're portfolio evidence)
+results/*.trace
+results/*.prof
+*.nsys-rep
