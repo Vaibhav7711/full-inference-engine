@@ -1,0 +1,53 @@
+{
+  "device_info": {
+    "timestamp": "2026-09-12T14:09:17.029532+00:00",
+    "torch_version": "2.11.0+cu128",
+    "cuda_available": true,
+    "gpu_name": "Tesla T4",
+    "gpu_memory_gb": 15.64,
+    "cuda_version": "12.8",
+    "transformers_version": "5.16.1"
+  },
+  "config": {
+    "model": "Qwen/Qwen3-0.6B",
+    "prompt": "Explain KV caching in one sentence.",
+    "max_new_tokens": 32,
+    "block_sizes": "8,16,32",
+    "warmup_runs": 2,
+    "runs": 5,
+    "output": "results/paged_cache_bench.json"
+  },
+  "runs": {
+    "dynamic_cache_baseline": {
+      "generated_tokens": 32,
+      "total_ms_mean": 1339.36962890625,
+      "total_ms_std": 39.551156050425,
+      "tokens_per_sec": 23.891836360461372,
+      "runs": 5
+    },
+    "paged_block8": {
+      "generated_tokens": 32,
+      "total_ms_mean": 1517.6370361328125,
+      "total_ms_std": 197.78064116116266,
+      "tokens_per_sec": 21.085410567958487,
+      "runs": 5,
+      "overhead_pct_vs_baseline": 13.30979913081487
+    },
+    "paged_block16": {
+      "generated_tokens": 32,
+      "total_ms_mean": 1487.0678955078124,
+      "total_ms_std": 191.43150771403637,
+      "tokens_per_sec": 21.518856063443195,
+      "runs": 5,
+      "overhead_pct_vs_baseline": 11.027446301151024
+    },
+    "paged_block32": {
+      "generated_tokens": 32,
+      "total_ms_mean": 1491.4377197265626,
+      "total_ms_std": 201.14865175060507,
+      "tokens_per_sec": 21.45580708919365,
+      "runs": 5,
+      "overhead_pct_vs_baseline": 11.353706067270885
+    }
+  }
+}
