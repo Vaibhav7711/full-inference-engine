@@ -112,6 +112,18 @@ compaction before the cache-execution layer exists.
 !python -m pytest tests/batching/test_continuous.py -v
 ```
 
+## Stages 11–12: block tables and paged access
+
+The contiguous allocator is now accompanied by fixed-size physical blocks, request
+block tables, capacity accounting, and a reference paged gather path. This proves the
+logical-to-physical mapping before attempting model-specific paged attention. It lets
+us quantify the tradeoff directly: external fragmentation falls, while each active
+request can waste up to `block_size - 1` tokens internally.
+
+```bash
+!python -m pytest tests/cache/test_paging.py -v
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,

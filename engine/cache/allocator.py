@@ -99,3 +99,43 @@ class ContiguousKVAllocator:
             "free_bytes": self.geometry.bytes_for_tokens(self.free_tokens),
             "free_ranges": list(self._free_ranges),
         }
+
+
+class BlockAllocator:
+    """Fixed-size physical KV block allocator used by the paged-cache manager."""
+
+    def __init__(self, num_blocks: int, block_size_tokens: int):
+        if num_blocks <= 0 or block_size_tokens <= 0:
+            raise ValueError("num_blocks and block_size_tokens must be positive")
+        self.num_blocks = num_blocks
+        self.block_size_tokens = block_size_tokens
+        self._free_blocks: list[int] = list(range(num_blocks))
+        self._allocations: dict[str, tuple[int, ...]] = {}
+
+    def allocate(self, request_id: str, count: int) -> tuple[int, ...] | None:
+        if not request_id or count <= 0:
+            raise ValueError("request_id and count must be positive")
+        if request_id in self._allocations:
+            raise ValueError(f"request {request_id!r} already owns blocks")
+        if count > len(self._free_blocks):
+            return None
+        block_ids = tuple(self._free_blocks.pop() for _ in range(count))
+        self._allocations[request_id] = block_ids
+        return block_ids
+
+    def release(self, request_id: str) -> tuple[int, ...]:
+        try:
+            block_ids = self._allocations.pop(request_id)
+        except KeyError as error:
+            raise KeyError(f"request {request_id!r} has no block allocation") from error
+        self._free_blocks.extend(block_ids)
+        self._free_blocks.sort()
+        return block_ids
+
+    @property
+    def free_block_count(self) -> int:
+        return len(self._free_blocks)
+
+    @property
+    def used_block_count(self) -> int:
+        return self.num_blocks - self.free_block_count
