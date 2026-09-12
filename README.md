@@ -154,6 +154,18 @@ kernel.
   --output results/int8_weight_only.json
 ```
 
+## Stage 15: CUDA Graphs (fixed-shape experiment)
+
+CUDA Graphs are only eligible for a fixed batch, fixed sequence shape, static cache,
+and stable control flow. They are not a direct drop-in for continuous batching.
+
+```bash
+!python -m pytest tests/graphs -v
+!python -m benchmarks.inference.cuda_graph_decode \
+  --prompt 'Explain KV caching in one sentence.' --decode-steps 32 \
+  --output results/cuda_graph_decode.json
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
