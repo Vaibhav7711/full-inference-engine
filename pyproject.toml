@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "full-inference-engine"
+version = "0.1.0"
+description = "Explicit single-GPU decoder-only LLM inference runtime"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.51",
+  "accelerate>=1.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+markers = ["cuda: requires a CUDA GPU and model checkpoint"]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["engine*", "benchmarks*"]

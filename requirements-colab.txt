@@ -1,0 +1,5 @@
+# PyTorch is provided by the selected Colab GPU runtime.
+# Do not add torch here: its installed build must match Colab's CUDA runtime.
+transformers>=4.51
+accelerate>=1.4
+pytest>=8.0
