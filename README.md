@@ -59,6 +59,21 @@ bytes/token = 2 (K and V) × layers × KV heads × head dimension × 2 bytes
 This is intentionally separate from model-weight memory. The next cache stage will
 use this evidence to establish a naïve allocation baseline before paging is considered.
 
+## Stages 5, 7, and 8: baseline capacity, request state, and FCFS admission
+
+The next runtime baseline combines a first-fit contiguous logical KV arena with an
+explicit request state machine (`WAITING → PREFILLING → DECODING → FINISHED`) and a
+strict FCFS scheduler. Each request reserves `prompt_tokens + max_new_tokens` in one
+contiguous range. This is deliberately inefficient: it makes allocation failure and
+external fragmentation observable before block-based paging is introduced.
+
+These are deterministic CPU-only unit tests, so they can be run in Colab without
+loading the model:
+
+```bash
+!python -m pytest tests/cache tests/runtime tests/scheduler -v
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
