@@ -44,6 +44,10 @@ def main() -> None:
     normal_ms = start.elapsed_time(end)
 
     captured, first_token = capture_decode_graph(loaded.model, inputs, max_cache_len=inputs.shape[1] + args.decode_steps)
+    # Capture records the first decode but does not guarantee its static output buffer
+    # is materialized for host-side consumption. Replay that same position once before
+    # timing; overwriting the same static-cache slot is intentional and idempotent.
+    captured.replay(first_token, inputs.shape[1])
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     second_token = int(captured.logits[:, -1, :].argmax(dim=-1).item())
