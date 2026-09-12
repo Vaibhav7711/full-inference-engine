@@ -40,11 +40,13 @@ def main() -> None:
     depth_results = []
     for depth in depths:
         speculative, speculative_ms = timed(lambda: VanillaSpeculativeDecoder(target.model, draft.model, target.tokenizer, target.device).generate(args.prompt, max_new_tokens=args.max_new_tokens, speculation_depth=depth))
+        mismatch_index = next((index for index, pair in enumerate(zip(speculative.token_ids, reference.token_ids)) if pair[0] != pair[1]), None)
         depth_results.append({
             "speculation_depth": depth,
             "speculative_ms": speculative_ms,
             "speedup": reference_ms / speculative_ms,
             "target_tokens_match_reference": speculative.token_ids == reference.token_ids,
+            "first_mismatch_index": mismatch_index,
             "output_tokens": len(speculative.token_ids),
             "accepted_draft_tokens": speculative.accepted_draft_tokens,
             "proposed_draft_tokens": speculative.proposed_draft_tokens,

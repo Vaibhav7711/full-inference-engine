@@ -71,7 +71,13 @@ class VanillaSpeculativeDecoder:
     def _crop(state: _ModelState, length: int) -> _ModelState:
         if not hasattr(state.cache, "crop"):
             raise TypeError("speculative rollback requires an HF cache with crop(max_length)")
-        state.cache.crop(length)
+        tokens_to_remove = state.attention_mask.shape[1] - length
+        if tokens_to_remove < 0:
+            raise ValueError("cannot crop a cache to a longer sequence")
+        if tokens_to_remove:
+            # Transformers 5.18+ defines positive crop values as deprecated. The
+            # negative form explicitly means “remove this suffix length.”
+            state.cache.crop(-tokens_to_remove)
         return _ModelState(state.cache, state.attention_mask[:, :length], state.next_token)
 
     @torch.inference_mode()
