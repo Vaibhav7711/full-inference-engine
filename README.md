@@ -166,6 +166,19 @@ and stable control flow. They are not a direct drop-in for continuous batching.
   --output results/cuda_graph_decode.json
 ```
 
+## Stage 16: vanilla speculative decoding
+
+Use a smaller compatible checkpoint as the draft (`Qwen3-0.6B`) and a larger target
+(`Qwen3-1.7B`). This implementation owns proposal, target verification, acceptance,
+commit, and rollback; it does not call a library speculative-generation helper.
+
+```bash
+!python -m pytest tests/speculative -v
+!python -m benchmarks.speculative.vanilla \
+  --prompt 'Explain KV caching in one sentence.' --max-new-tokens 32 \
+  --speculation-depth 4 --output results/vanilla_speculation.json
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
