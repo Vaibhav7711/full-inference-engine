@@ -67,7 +67,9 @@ class ExplicitDecodeRunner:
             next_token=outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True),
         )
 
-    def generate(self, prompt: str, *, max_new_tokens: int, eos_token_id: int | None = None) -> GenerationResult:
+    def generate(
+        self, prompt: str, *, max_new_tokens: int, eos_token_id: int | list[int] | None = None
+    ) -> GenerationResult:
         if not prompt:
             raise ValueError("prompt must not be empty")
         if max_new_tokens < 1:
@@ -79,7 +81,11 @@ class ExplicitDecodeRunner:
         metrics.tokenization_ms = cpu_elapsed_ms(encode_start)
         input_ids = inputs.input_ids.to(self.device)
         attention_mask = inputs.attention_mask.to(self.device)
-        eos = self.tokenizer.eos_token_id if eos_token_id is None else eos_token_id
+        configured_eos = self.model.generation_config.eos_token_id
+        eos = configured_eos if eos_token_id is None else eos_token_id
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+        eos_ids = {eos} if isinstance(eos, int) else set(eos)
 
         torch.cuda.synchronize(self.device)
         event_start, event_end = torch.cuda.Event(True), torch.cuda.Event(True)
@@ -95,7 +101,7 @@ class ExplicitDecodeRunner:
         for step in range(max_new_tokens):
             token_id = int(state.next_token.item())
             generated.append(token_id)
-            if token_id == eos:
+            if token_id in eos_ids:
                 break
             if step == max_new_tokens - 1:
                 break
