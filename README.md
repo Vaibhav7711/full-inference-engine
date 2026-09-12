@@ -41,6 +41,24 @@ The benchmark writes JSON records containing hardware, package versions, model,
 generation configuration, latency breakdown, and memory measurements. Results from
 different GPUs must not be compared directly.
 
+## Stage 4: KV-cache accounting
+
+Before introducing an allocator, inspect the cache the reference runtime actually
+creates. This reports the GQA-aware analytic formula and physical cache-tensor bytes:
+
+```bash
+!python scripts/inspect_kv_cache.py --prompt 'Explain KV-cache memory.' --budget-gib 4
+```
+
+For BF16/FP16, the formula is:
+
+```text
+bytes/token = 2 (K and V) × layers × KV heads × head dimension × 2 bytes
+```
+
+This is intentionally separate from model-weight memory. The next cache stage will
+use this evidence to establish a naïve allocation baseline before paging is considered.
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
