@@ -132,6 +132,28 @@ Measure allocator behavior under the same deterministic mixed-length arrival str
   --block-sizes 8,16,32,64 --output results/allocator_workload.json
 ```
 
+## Stages 13–14: GQA reporting and INT8 weight-only reference
+
+KV-cache inspection now reports query heads, KV heads, GQA group size, and the KV
+memory avoided versus standard multi-head attention. Qwen3-0.6B's 32 query heads and
+8 KV heads yield a 4× GQA ratio, so its KV cache is 75% smaller than an otherwise
+identical MHA layout.
+
+The included INT8 experiment uses per-output-channel weights and explicitly reports
+storage/accuracy. It is a **reference** path that dequantizes before `F.linear`; it
+tests the memory-quality tradeoff but must not be benchmarked as an optimized INT8
+kernel.
+
+```bash
+!python -m pytest tests/quantization -v
+```
+
+```bash
+!python -m benchmarks.quantization.int8_weight_only \
+  --prompt 'Explain KV caching in one sentence.' --max-new-tokens 16 \
+  --output results/int8_weight_only.json
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
