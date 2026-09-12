@@ -30,7 +30,7 @@ Run the correctness test and baseline benchmark:
 
 ```bash
 !python -m pytest -m cuda
-!python -m benchmarks.inference.stage1 --prompt 'The capital of France is' --max-new-tokens 32
+!python -m benchmarks.inference.stage1 --prompt 'The capital of France is' --max-new-tokens 32 --warmup-runs 2 --runs 5
 !cat results/stage1.json
 ```
 
