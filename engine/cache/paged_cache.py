@@ -196,6 +196,37 @@ class PagedCache(DynamicCache):
     def get_seq_length(self, layer_idx: int = 0, *args, **kwargs) -> int:
         return self._paged_layers[layer_idx].get_seq_length()
 
+    # -- mask/length methods the model's masking machinery calls --
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
+        """Return (kv_length, kv_offset) for causal-mask construction.
+
+        The parent DynamicCache inspects layer types (CacheLayerMixin) which our
+        PagedLayer is not, so its implementation raises. We answer directly from our
+        stored sequence length.
+
+        IMPORTANT: this is called BEFORE update() writes the new tokens for this pass.
+        At call time, seq_len holds only previously-cached tokens, and query_length is
+        the number of new tokens in this forward pass. The mask needs the total KV
+        length that attention will see = past + new.
+            kv_length = past_seen + query_length
+            kv_offset = past_seen already attended before this pass (0 at prefill)
+        """
+        past_seen = self._paged_layers[layer_idx].seq_len
+        kv_length = past_seen + query_length
+        kv_offset = 0
+        return kv_length, kv_offset
+
+    def get_max_cache_shape(self, *args, **kwargs):
+        """Unbounded (dynamic growth) cache -> no fixed max length."""
+        return None
+
+    def get_max_length(self, *args, **kwargs):
+        return None
+
+    def __len__(self) -> int:
+        return len(self._paged_layers)
+
     # -- introspection --
     @property
     def layers(self):
