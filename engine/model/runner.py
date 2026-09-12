@@ -85,7 +85,7 @@ class ExplicitDecodeRunner:
         event_start, event_end = torch.cuda.Event(True), torch.cuda.Event(True)
         event_start.record()
         state = self.prefill(input_ids, attention_mask)
-        event_end.record(); event_end.synchronize(self.device)
+        event_end.record(); event_end.synchronize()
         metrics.prefill_ms = event_start.elapsed_time(event_end)
         metrics.ttft_ms = metrics.tokenization_ms + metrics.prefill_ms
         # The prefill logits contain the first output token; no decode step is needed.
@@ -101,7 +101,7 @@ class ExplicitDecodeRunner:
                 break
             event_start.record()
             state = self.decode_one(state.next_token, state)
-            event_end.record(); event_end.synchronize(self.device)
+            event_end.record(); event_end.synchronize()
             metrics.decode_ms.append(event_start.elapsed_time(event_end))
         metrics.total_ms = cpu_elapsed_ms(total_start)
         metrics.peak_allocated_bytes = torch.cuda.max_memory_allocated(self.device)

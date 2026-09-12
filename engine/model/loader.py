@@ -33,7 +33,7 @@ def load_model(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, revision=revision, torch_dtype=dtype
+        model_name, revision=revision, dtype=dtype
     ).to(device)
     model.eval()
     return LoadedModel(model_name, model, tokenizer, dtype, device)
