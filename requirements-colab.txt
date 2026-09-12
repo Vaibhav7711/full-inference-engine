@@ -3,3 +3,5 @@
 transformers>=4.51
 accelerate>=1.4
 pytest>=8.0
+fastapi>=0.115
+uvicorn[standard]>=0.30

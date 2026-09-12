@@ -74,6 +74,19 @@ loading the model:
 !python -m pytest tests/cache tests/runtime tests/scheduler -v
 ```
 
+## Stage 6: streaming API
+
+The server emits Server-Sent Events (SSE) one token at a time. It intentionally uses
+the reference single-request runner; scheduling-aware streaming comes later.
+
+```bash
+!uvicorn 'engine.server.api:create_app' --factory --host 0.0.0.0 --port 8000
+```
+
+From a second terminal/session, send `POST /generate` for a complete response or
+`POST /generate/stream` for `text/event-stream` events. The CUDA correctness suite
+also verifies streamed token IDs equal normal greedy generation.
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,

@@ -23,6 +23,14 @@ class GenerationResult:
     metrics: GenerationMetrics
 
 
+@dataclass(frozen=True)
+class StreamEvent:
+    token_id: int | None
+    text: str
+    index: int | None
+    finish_reason: str | None = None
+
+
 class ExplicitDecodeRunner:
     """Correctness-first, single-request greedy runtime.
 
@@ -113,3 +121,40 @@ class ExplicitDecodeRunner:
         metrics.peak_allocated_bytes = torch.cuda.max_memory_allocated(self.device)
         metrics.peak_reserved_bytes = torch.cuda.max_memory_reserved(self.device)
         return GenerationResult(generated, self.tokenizer.decode(generated, skip_special_tokens=True), metrics)
+
+    def stream_generate(
+        self, prompt: str, *, max_new_tokens: int, eos_token_id: int | list[int] | None = None
+    ):
+        """Yield generated tokens as soon as each GPU decode step completes.
+
+        This is intentionally a single-request reference stream. Scheduler-integrated
+        streaming comes after continuous batching exists.
+        """
+        if not prompt:
+            raise ValueError("prompt must not be empty")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs.input_ids.to(self.device)
+        attention_mask = inputs.attention_mask.to(self.device)
+        configured_eos = self.model.generation_config.eos_token_id
+        eos = configured_eos if eos_token_id is None else eos_token_id
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+        eos_ids = {eos} if isinstance(eos, int) else set(eos)
+        state = self.prefill(input_ids, attention_mask)
+        for index in range(max_new_tokens):
+            token_id = int(state.next_token.item())
+            is_eos = token_id in eos_ids
+            yield StreamEvent(
+                token_id=token_id,
+                text=self.tokenizer.decode([token_id], skip_special_tokens=True),
+                index=index,
+                finish_reason="EOS" if is_eos else None,
+            )
+            if is_eos:
+                return
+            if index == max_new_tokens - 1:
+                yield StreamEvent(token_id=None, text="", index=None, finish_reason="LENGTH")
+                return
+            state = self.decode_one(state.next_token, state)

@@ -5,13 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from engine.model import ExplicitDecodeRunner, LoadedModel, load_model
-
-
-@pytest.fixture(scope="module")
-def loaded() -> LoadedModel:
-    """Load the checkpoint once; each test is an independent request."""
-    return load_model()
+from engine.model import ExplicitDecodeRunner, LoadedModel
 
 
 def hf_greedy(loaded: LoadedModel, prompt: str, max_new_tokens: int) -> list[int]:

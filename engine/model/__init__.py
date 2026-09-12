@@ -1,4 +1,4 @@
 from .loader import LoadedModel, load_model
-from .runner import ExplicitDecodeRunner, GenerationResult
+from .runner import ExplicitDecodeRunner, GenerationResult, StreamEvent
 
-__all__ = ["ExplicitDecodeRunner", "GenerationResult", "LoadedModel", "load_model"]
+__all__ = ["ExplicitDecodeRunner", "GenerationResult", "LoadedModel", "StreamEvent", "load_model"]
