@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--speculation-depth", type=int, default=4)
+    parser.add_argument("--speculation-depths", default=None, help="Comma-separated depth sweep; overrides --speculation-depth")
     parser.add_argument("--target-model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--draft-model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--output", type=Path, default=Path("results/vanilla_speculation.json"))
@@ -33,22 +34,30 @@ def main() -> None:
     if target.tokenizer.vocab_size != draft.tokenizer.vocab_size:
         parser.error("target and draft tokenizers must have matching vocabularies")
     reference, reference_ms = timed(lambda: ExplicitDecodeRunner(target.model, target.tokenizer, target.device).generate(args.prompt, max_new_tokens=args.max_new_tokens))
-    speculative, speculative_ms = timed(lambda: VanillaSpeculativeDecoder(target.model, draft.model, target.tokenizer, target.device).generate(args.prompt, max_new_tokens=args.max_new_tokens, speculation_depth=args.speculation_depth))
+    depths = [int(value) for value in args.speculation_depths.split(",")] if args.speculation_depths else [args.speculation_depth]
+    if any(depth <= 0 for depth in depths):
+        parser.error("speculation depths must be positive")
+    depth_results = []
+    for depth in depths:
+        speculative, speculative_ms = timed(lambda: VanillaSpeculativeDecoder(target.model, draft.model, target.tokenizer, target.device).generate(args.prompt, max_new_tokens=args.max_new_tokens, speculation_depth=depth))
+        depth_results.append({
+            "speculation_depth": depth,
+            "speculative_ms": speculative_ms,
+            "speedup": reference_ms / speculative_ms,
+            "target_tokens_match_reference": speculative.token_ids == reference.token_ids,
+            "output_tokens": len(speculative.token_ids),
+            "accepted_draft_tokens": speculative.accepted_draft_tokens,
+            "proposed_draft_tokens": speculative.proposed_draft_tokens,
+            "acceptance_rate": speculative.acceptance_rate,
+            "rounds": speculative.rounds,
+            "target_forward_passes_baseline": len(reference.token_ids),
+            "target_forward_passes_speculative": speculative.rounds,
+        })
     record = {
         "target_model": args.target_model,
         "draft_model": args.draft_model,
-        "speculation_depth": args.speculation_depth,
         "reference_ms": reference_ms,
-        "speculative_ms": speculative_ms,
-        "speedup": reference_ms / speculative_ms,
-        "target_tokens_match_reference": speculative.token_ids == reference.token_ids,
-        "output_tokens": len(speculative.token_ids),
-        "accepted_draft_tokens": speculative.accepted_draft_tokens,
-        "proposed_draft_tokens": speculative.proposed_draft_tokens,
-        "acceptance_rate": speculative.acceptance_rate,
-        "rounds": speculative.rounds,
-        "target_forward_passes_baseline": len(reference.token_ids),
-        "target_forward_passes_speculative": speculative.rounds,
+        "depth_results": depth_results,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(record, indent=2) + "\n")

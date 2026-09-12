@@ -179,6 +179,14 @@ commit, and rollback; it does not call a library speculative-generation helper.
   --speculation-depth 4 --output results/vanilla_speculation.json
 ```
 
+After correctness passes, sweep depth rather than assuming a larger proposal is better:
+
+```bash
+!python -m benchmarks.speculative.vanilla \
+  --prompt 'Explain KV caching in one sentence.' --max-new-tokens 32 \
+  --speculation-depths 1,2,4,6,8 --output results/vanilla_depth_sweep.json
+```
+
 ## Why this exists
 
 The naive path calls `model.generate()`, which hides prefill, decode, cache lifetime,
