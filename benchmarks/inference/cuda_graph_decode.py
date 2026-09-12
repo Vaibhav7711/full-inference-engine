@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from engine.graphs import assess_graph_eligibility, capture_decode_graph
-from engine.model import load_model
+from engine.model import ExplicitDecodeRunner, load_model
 
 
 def main() -> None:
@@ -21,6 +21,9 @@ def main() -> None:
         parser.error("decode-steps must be at least 3")
     loaded = load_model(args.model)
     inputs = loaded.tokenizer(args.prompt, return_tensors="pt").input_ids.to(loaded.device)
+    dynamic_reference = ExplicitDecodeRunner(loaded.model, loaded.tokenizer, loaded.device).generate(
+        args.prompt, max_new_tokens=args.decode_steps
+    ).token_ids
     eligibility = assess_graph_eligibility(fixed_batch_size=True, fixed_sequence_length=True, static_cache=True, dynamic_arrivals=False)
     # Normal fixed-shape decode baseline. Its first decode is excluded to match graph
     # capture, which executes the first decode while recording the graph.
@@ -66,7 +69,9 @@ def main() -> None:
         "normal_decode_ms_per_token": normal_ms / (args.decode_steps - 2),
         "speedup": normal_ms / start.elapsed_time(end),
         "token_sequences_match": normal_tokens == tokens,
+        "static_cache_matches_dynamic_reference": normal_tokens == dynamic_reference,
         "token_ids": tokens,
+        "dynamic_reference_token_ids": dynamic_reference,
         "note": "Capture overhead excluded; compare only against a normal decode loop with the same fixed shapes.",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
