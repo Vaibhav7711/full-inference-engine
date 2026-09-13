@@ -1,0 +1,56 @@
+{
+  "device_info": {
+    "timestamp": "2026-09-13T07:31:28.170846+00:00",
+    "torch_version": "2.11.0+cu128",
+    "cuda_available": true,
+    "gpu_name": "Tesla T4",
+    "gpu_memory_gb": 15.64,
+    "cuda_version": "12.8"
+  },
+  "config": {
+    "model": "Qwen/Qwen3-0.6B",
+    "num_requests": 32,
+    "max_new_tokens": 32,
+    "concurrencies": "1,2,4,8,16",
+    "num_blocks": 1024,
+    "block_size": 16,
+    "warmup": true,
+    "output": "results/continuous_throughput.json"
+  },
+  "sweep": [
+    {
+      "concurrency": 2,
+      "elapsed_s": 23.917,
+      "total_tokens": 1024,
+      "throughput_tok_s": 42.8,
+      "speedup_vs_sequential": 1.818
+    },
+    {
+      "concurrency": 4,
+      "elapsed_s": 14.413,
+      "total_tokens": 1024,
+      "throughput_tok_s": 71.0,
+      "speedup_vs_sequential": 3.016
+    },
+    {
+      "concurrency": 8,
+      "elapsed_s": 8.566,
+      "total_tokens": 1024,
+      "throughput_tok_s": 119.5,
+      "speedup_vs_sequential": 5.075
+    },
+    {
+      "concurrency": 16,
+      "elapsed_s": 6.664,
+      "total_tokens": 1024,
+      "throughput_tok_s": 153.7,
+      "speedup_vs_sequential": 6.524
+    }
+  ],
+  "sequential": {
+    "max_active": 1,
+    "elapsed_s": 43.475,
+    "total_tokens": 1024,
+    "throughput_tok_s": 23.6
+  }
+}
