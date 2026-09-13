@@ -84,6 +84,7 @@ def _make_requests(n: int) -> list[str]:
 
 def _run_timed(engine, prompts, max_new_tokens, max_active):
     """Run prompts through the engine with a given max_active, return (elapsed_s, total_out_tokens)."""
+    engine.reset()   # clean allocator slate for a fair, repeatable run
     engine.max_active = max_active
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -100,7 +101,7 @@ def main():
     parser.add_argument("--num-requests", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--concurrencies", default="1,2,4,8,16")
-    parser.add_argument("--num-blocks", type=int, default=4096)
+    parser.add_argument("--num-blocks", type=int, default=1024)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--warmup", action="store_true", help="run a small warmup first")
     parser.add_argument("--output", default="results/continuous_throughput.json")
@@ -126,12 +127,14 @@ def main():
 
     results = {"device_info": _device_info(), "config": vars(args), "sweep": []}
 
+    # ONE engine, reused across all concurrency levels (the pool is large; don't make many).
+    engine = ContinuousBatchingEngine(model, tok, device,
+                                      num_blocks=args.num_blocks, block_size=args.block_size)
+
     # Warmup (compile kernels, warm caches)
     if args.warmup:
         print("Warmup...")
-        eng = ContinuousBatchingEngine(model, tok, device,
-                                       num_blocks=args.num_blocks, block_size=args.block_size)
-        _run_timed(eng, prompts[:4], 8, max_active=4)
+        _run_timed(engine, prompts[:4], 8, max_active=4)
 
     # --- SEQUENTIAL baseline: max_active=1 (one sequence at a time, same engine) ---
     print(f"\n{'='*66}")
@@ -139,9 +142,7 @@ def main():
           f"{args.max_new_tokens} tokens each)")
     print(f"{'='*66}")
 
-    eng_seq = ContinuousBatchingEngine(model, tok, device,
-                                       num_blocks=args.num_blocks, block_size=args.block_size)
-    seq_time, seq_tokens = _run_timed(eng_seq, prompts, args.max_new_tokens, max_active=1)
+    seq_time, seq_tokens = _run_timed(engine, prompts, args.max_new_tokens, max_active=1)
     seq_throughput = seq_tokens / seq_time
     results["sequential"] = {
         "max_active": 1,
@@ -158,9 +159,7 @@ def main():
     for c in concurrencies:
         if c == 1:
             continue  # already have sequential
-        eng = ContinuousBatchingEngine(model, tok, device,
-                                       num_blocks=args.num_blocks, block_size=args.block_size)
-        elapsed, tokens = _run_timed(eng, prompts, args.max_new_tokens, max_active=c)
+        elapsed, tokens = _run_timed(engine, prompts, args.max_new_tokens, max_active=c)
         throughput = tokens / elapsed
         speedup = seq_time / elapsed
         results["sweep"].append({

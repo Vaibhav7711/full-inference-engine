@@ -177,6 +177,18 @@ class ContinuousBatchingEngine:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         ALL_ATTENTION_FUNCTIONS[self.ATTN_NAME] = batched_decode_attention_forward
 
+    def reset(self) -> None:
+        """Reinitialize the allocator (fresh free-block list) for a clean run.
+
+        Blocks are already released as sequences finish, but this guarantees a clean
+        slate when reusing the same engine for multiple benchmark runs. The pool tensors
+        are reused (not reallocated) — only the allocator's bookkeeping resets.
+        """
+        from engine.cache.allocator import BlockAllocator
+        self.allocator = BlockAllocator(
+            num_blocks=self.key_pool[0].shape[0], block_size_tokens=self.block_size,
+        )
+
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
     # ------------------------------------------------------------------
