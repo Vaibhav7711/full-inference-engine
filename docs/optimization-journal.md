@@ -256,7 +256,7 @@ T4 result:
 
 Decision: `KEEP`.
 
-### Persistent decode metadata — awaiting T4 gate
+### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
 
@@ -282,6 +282,18 @@ Copying the full fixed-width block-table rows can cost more than rebuilding narr
 tables for very short contexts. This is an empirical tradeoff and must pass the same
 161.8 tok/s width-16 gate. A later version may use stable fixed request slots and copy
 only dirty block-table rows.
+
+T4 result:
+
+- All affected tests passed.
+- Sequential throughput was 23.2 tok/s.
+- Width-8 throughput was 105.1 tok/s.
+- Width-16 throughput was 172.6 tok/s.
+- Width-16 improved 3.0% over the unified-scheduler run (167.5 tok/s) and 0.8%
+  over the earlier block-manager run (171.2 tok/s).
+- Width-16 speedup was 7.43x over the same run's sequential path.
+
+Decision: `KEEP`.
 
 ### Request and scheduler unification — accepted
 
