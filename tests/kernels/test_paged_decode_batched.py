@@ -174,6 +174,46 @@ def test_batched_decode_fp32_tight():
 
 @cuda
 @requires_cuda
+def test_length_offset_matches_materialized_lengths():
+    """Kernel-side +1 must equal passing an allocated incremented length tensor."""
+    from engine.kernels.paged_decode_batched import paged_decode_batched
+
+    torch.manual_seed(19)
+    device, dtype = "cuda", torch.float16
+    num_heads, D, block_size = 8, 128, 16
+    lengths = [7, 16, 33]
+    queries = [
+        torch.randn(num_heads, 1, D, device=device, dtype=dtype) for _ in lengths
+    ]
+    seqs_kv = [
+        (
+            torch.randn(num_heads, n, D, device=device, dtype=dtype),
+            torch.randn(num_heads, n, D, device=device, dtype=dtype),
+        )
+        for n in lengths
+    ]
+    key_pages, value_pages, block_tables, seq_lens = _build_shared_pool(
+        seqs_kv, block_size, num_heads, D, device, dtype, seed=23,
+    )
+    query = torch.stack(queries)
+
+    materialized = paged_decode_batched(
+        query, key_pages, value_pages, block_tables, seq_lens, block_n=64,
+    )
+    kernel_offset = paged_decode_batched(
+        query,
+        key_pages,
+        value_pages,
+        block_tables,
+        seq_lens - 1,
+        block_n=64,
+        length_offset=1,
+    )
+    assert torch.equal(kernel_offset, materialized)
+
+
+@cuda
+@requires_cuda
 def test_batched_equals_separate_launches():
     """The core claim: ONE batched launch == S separate single-sequence launches.
 

@@ -54,6 +54,7 @@ def _paged_decode_batched_kernel(
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    LENGTH_OFFSET: tl.constexpr,
 ):
     pid_s = tl.program_id(0)   # which sequence
     pid_h = tl.program_id(1)   # which query head
@@ -66,7 +67,7 @@ def _paged_decode_batched_kernel(
     offs_n = tl.arange(0, BLOCK_N)
 
     # This sequence's KV length
-    seq_len = tl.load(sl_ptr + pid_s * stride_sl)
+    seq_len = tl.load(sl_ptr + pid_s * stride_sl) + LENGTH_OFFSET
 
     # Load this program's single query vector: [HEAD_DIM]
     q_base = q_ptr + pid_s * stride_qs + pid_h * stride_qh
@@ -131,10 +132,12 @@ def paged_decode_batched(
     seq_lens: torch.Tensor,     # [S] int
     scale: float | None = None,
     block_n: int = 64,
+    length_offset: int = 0,
 ) -> torch.Tensor:
     """Batched paged decode attention: S sequences, 1 query each, one kernel launch.
 
-    Returns out: [S, H, 1, D].
+    Returns out: [S, H, 1, D]. `length_offset` is applied inside the kernel,
+    avoiding a separate elementwise launch when callers store pre-write lengths.
     """
     S, H, one, D = query.shape
     assert one == 1, "K4 decode: query length must be 1 per sequence"
@@ -171,5 +174,6 @@ def paged_decode_batched(
         BLOCK_SIZE=block_size,
         HEAD_DIM=D,
         BLOCK_N=block_n,
+        LENGTH_OFFSET=length_offset,
     )
     return out

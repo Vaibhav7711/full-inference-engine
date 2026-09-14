@@ -96,16 +96,16 @@ def batched_decode_attention_forward(
         key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens
     )
 
-    # --- Run K4 batched decode: each query attends to its blocks [0 .. seq_lens[i]] ---
-    # New per-sequence KV length INCLUDING this token = seq_lens + 1.
-    kv_lens_now = ctx.seq_lens + 1
+    # Run K4 over lengths including the token just written. The +1 is performed while
+    # each attention program loads its length, rather than by a separate tensor kernel.
     out = paged_decode_batched(
         query,                 # [N, num_q_heads, 1, D]
         key_pool, value_pool,  # shared pool for this layer
         ctx.block_tables,      # [N, max_blocks]
-        kv_lens_now,           # [N] lengths including the just-written token
+        ctx.seq_lens,          # [N] lengths before the just-written token
         scale=scaling,
         block_n=64,
+        length_offset=1,
     )   # -> [N, num_q_heads, 1, D]
 
     # HF expects [N, 1, heads, D] (transposed form)
