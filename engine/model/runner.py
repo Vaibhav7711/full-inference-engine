@@ -95,28 +95,41 @@ class ExplicitDecodeRunner:
             eos = self.tokenizer.eos_token_id
         eos_ids = {eos} if isinstance(eos, int) else set(eos)
 
+        # Synchronize once before the measured GPU region. Decode timings below use
+        # distinct event pairs and are materialized only after generation, avoiding
+        # an otherwise redundant event synchronization after every token.
         torch.cuda.synchronize(self.device)
-        event_start, event_end = torch.cuda.Event(True), torch.cuda.Event(True)
-        event_start.record()
+        prefill_start, prefill_end = torch.cuda.Event(True), torch.cuda.Event(True)
+        prefill_start.record()
         state = self.prefill(input_ids, attention_mask)
-        event_end.record(); event_end.synchronize()
-        metrics.prefill_ms = event_start.elapsed_time(event_end)
-        metrics.ttft_ms = metrics.tokenization_ms + metrics.prefill_ms
-        # The prefill logits contain the first output token; no decode step is needed.
-        metrics.first_token_ms = metrics.prefill_ms
+        prefill_end.record()
 
         generated: list[int] = []
+        decode_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         for step in range(max_new_tokens):
+            # This transfer is required by the reference runner for Python EOS
+            # handling. It also guarantees the preceding prefill/decode event has
+            # completed, so a separate event_end.synchronize() would be duplicate.
             token_id = int(state.next_token.item())
+            if step == 0:
+                metrics.prefill_ms = prefill_start.elapsed_time(prefill_end)
+                metrics.ttft_ms = metrics.tokenization_ms + metrics.prefill_ms
+                # Prefill logits contain the first output token.
+                metrics.first_token_ms = metrics.prefill_ms
             generated.append(token_id)
             if token_id in eos_ids:
                 break
             if step == max_new_tokens - 1:
                 break
+            event_start, event_end = torch.cuda.Event(True), torch.cuda.Event(True)
             event_start.record()
             state = self.decode_one(state.next_token, state)
-            event_end.record(); event_end.synchronize()
-            metrics.decode_ms.append(event_start.elapsed_time(event_end))
+            event_end.record()
+            decode_events.append((event_start, event_end))
+        # Every decode event is complete because the following iteration reads the
+        # selected token to the host. Materialize all event durations without adding
+        # a second synchronization to each decode step.
+        metrics.decode_ms = [start.elapsed_time(end) for start, end in decode_events]
         metrics.total_ms = cpu_elapsed_ms(total_start)
         metrics.peak_allocated_bytes = torch.cuda.max_memory_allocated(self.device)
         metrics.peak_reserved_bytes = torch.cuda.max_memory_reserved(self.device)
