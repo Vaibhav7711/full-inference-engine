@@ -21,6 +21,12 @@ def main() -> None:
         record["gpu"] = properties.name
         record["gpu_memory_gib"] = round(properties.total_memory / 2**30, 2)
         record["capability"] = f"{properties.major}.{properties.minor}"
+        record["bf16_supported"] = torch.cuda.is_bf16_supported()
+        record["recommended_dtype"] = (
+            "bfloat16" if properties.major >= 8 and torch.cuda.is_bf16_supported() else "float16"
+        )
+        if properties.major == 7 and properties.minor == 5:
+            record["runtime_profile"] = "turing_t4"
     print(json.dumps(record, indent=2))
     if not torch.cuda.is_available():
         raise SystemExit(
