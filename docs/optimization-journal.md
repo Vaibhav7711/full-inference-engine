@@ -256,6 +256,42 @@ T4 result:
 
 Decision: `KEEP`.
 
+### Direct pool-backed prefill KV write — awaiting T4 gate
+
+Commit: `9eda221` — `Write prefill KV directly with Triton`
+
+Hypothesis:
+
+Prefill previously created a temporary `PagedCache`, grew and populated its per-layer
+pages, then copied every token of every layer again into the continuous engine's shared
+KV pool through nested Python loops. Writing the model-produced K/V directly into the
+authoritative shared pool should remove temporary KV ownership, repeated allocations,
+and thousands of Python-indexed CUDA assignments.
+
+Change:
+
+- Added a `DynamicCache`-compatible prefill adapter that returns the current K/V to
+  stock SDPA while making the shared pool the only persistent owner.
+- Added one Triton program that writes K and V together from `[1, H, S, D]` tensors to
+  arbitrary physical blocks in `[blocks, block_size, H, D]` storage.
+- Removed the scratch `PagedCache` allocation and the nested layer/token scatter from
+  the production continuous-prefill path.
+- Added boundary and non-contiguous-block correctness tests for the kernel. The existing
+  D1 integration test independently compares every stored layer/token against the old
+  paged-cache reference, and D2/D3 verify token-level decode and generation equivalence.
+
+Risk and gate:
+
+- The adapter relies on the verified Transformers cache-update contract and on K/V being
+  passed after RoPE, as established by the existing integration path.
+- Kernel compilation can make a first un-warmed run slower, so the throughput benchmark
+  must retain its warmup.
+- Accept only if all kernel and staged continuous tests pass and width-16 throughput is
+  at least 164.0 tok/s (within 5% of the immediate 172.6 tok/s baseline). Record all
+  concurrency points; do not claim a speedup from normal run-to-run noise.
+
+Decision: `PENDING T4 MEASUREMENT`.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
