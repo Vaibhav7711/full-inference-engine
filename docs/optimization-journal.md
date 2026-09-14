@@ -300,7 +300,7 @@ T4 result:
 
 Decision: `KEEP`.
 
-### Batched decode KV write — awaiting T4 gate
+### Batched decode KV write — accepted
 
 Commit: `a8469ab` — `Fuse batched decode KV writes`
 
@@ -326,6 +326,47 @@ Gate:
   178.3 tok/s baseline).
 - Because this modifies every decode layer and token, a same-session repeated benchmark
   will be required if the observed difference is small or unexpectedly negative.
+
+T4 result:
+
+- All focused KV-write and staged continuous-generation tests passed.
+- Sequential throughput was 23.5 tok/s.
+- Width-8 throughput was 154.8 tok/s, up 41.6% from 109.3 tok/s.
+- Width-16 throughput was 247.8 tok/s, up 39.0% from 178.3 tok/s.
+- Width-16 speedup reached 10.55x over the same run's sequential path.
+- The scaling-specific improvement strongly matches removal of work proportional to
+  active requests: the old callback performed 2 CUDA `.item()` synchronizations per
+  request per layer, or 896 synchronization points per decode step at width 16 across
+  Qwen3-0.6B's 28 layers.
+
+Decision: `KEEP`.
+
+### In-kernel decode length offset — awaiting T4 gate
+
+Commit: `291ccf8` — `Move decode length offset into attention kernel`
+
+Hypothesis:
+
+After the KV-write synchronization bottleneck was removed, the attention callback still
+formed `seq_lens + 1` independently in every transformer layer. Applying the constant
+offset when each Triton attention program loads its sequence length removes 28 temporary
+tensors and elementwise kernel launches per decode step.
+
+Change:
+
+- Added a compile-time `length_offset` to the batched paged-attention kernel.
+- Continuous decode now passes the persistent pre-write length buffer directly and uses
+  an in-kernel offset of one.
+- Other callers retain the default zero offset and unchanged semantics.
+- Added direct equality coverage between materialized incremented lengths and the
+  in-kernel offset path.
+
+Gate:
+
+- All paged-attention, KV-write, and continuous-generation tests must pass.
+- Width-16 must remain at least 235.4 tok/s (within 5% of 247.8 tok/s).
+- Expect a smaller improvement than the prior change; accept a neutral result because
+  it also removes repeated allocations, but revert a repeatable regression.
 
 Decision: `PENDING T4 MEASUREMENT`.
 
