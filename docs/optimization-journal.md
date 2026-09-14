@@ -255,3 +255,31 @@ T4 result:
 - The result is above the 161.8 tok/s acceptance floor.
 
 Decision: `KEEP`.
+
+### Request and scheduler unification — awaiting T4 gate
+
+Commit: `90485ba` — `Unify request scheduling with continuous execution`
+
+Change:
+
+- `GenerationRequest` now carries prompt token IDs, the next decode token, generated
+  output, lifecycle state, and its manager-owned KV allocation.
+- The FCFS scheduler now admits directly against `KVBlockManager` and reserves prompt
+  blocks lazily instead of reserving a request's maximum possible output up front.
+- The physical continuous engine now submits, admits, prefills, decodes, finishes, and
+  releases the same request object through that scheduler.
+- Removed the duplicate `SeqState` type.
+- Removed the obsolete planning-only `ContinuousBatcher` and `BatchPlan` implementation.
+- Removed its duplicate control-plane test module; lifecycle and refill behavior now
+  belong to the scheduler and physical-engine tests.
+- The K4 Triton kernel remains unchanged.
+
+Code-size effect: 250 lines removed and 143 lines added across the refactor, for a net
+reduction of 107 lines while joining the previously disconnected layers.
+
+T4 acceptance pending:
+
+- Runtime, scheduler, allocator, paging, K4, and full-generation tests pass.
+- Exact output tokens remain unchanged.
+- All blocks return to the manager after generation.
+- Width-16 throughput remains at least 161.8 tok/s.
