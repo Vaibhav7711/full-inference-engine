@@ -1,15 +1,26 @@
-"""Batched speculation correctness — gated against per-sequence vanilla speculation.
+"""Batched speculation correctness — with the CORRECT oracle.
 
-STAGED so failures localize:
-  test_bs_single_sequence  -> N=1: batched engine with one seq == vanilla speculative.
-                              (isolates the batched machinery from the ragged-commit logic)
-  test_bs_two_identical    -> N=2 same prompt: both sequences should produce identical output
-                              and match vanilla. (isolates batching without ragged divergence)
-  test_bs_two_different    -> N=2 different prompts: the real ragged case. Each must match
-                              its own vanilla speculative output.
+WHY THE OLD TEST WAS WRONG (and what the research says):
+    We compared batched-spec against SINGLE-sequence vanilla spec. Those run on different
+    GPU kernel paths (batched GEMM vs single-row GEMM) with different accumulation orders.
+    In FP16 the logits differ slightly; at a near-tie the argmax flips; autoregressive
+    decoding then amplifies one flipped token into a fully divergent (but coherent) output.
+    This is "batch non-invariance" — documented (HF issue #26869, LLM-42 paper 2026) and
+    NOT fixable by position_ids (confirmed by others and by our own zero-effect fix).
 
-If single-sequence passes but two-different fails, the bug is in the ragged commit/rollback.
-If single-sequence fails, the bug is in the basic batched draft/verify.
+THE CORRECT ORACLE:
+    Speculative decoding (correct) == greedy decoding of the target model.
+    So batched-spec must equal BATCHED-GREEDY on the SAME left-padded batch, driven through
+    the SAME batched prefill/decode code path. Same kernels, same accumulation order ->
+    any remaining mismatch is a real logic bug, not numerics.
+
+Tests (run in order):
+    test_batched_spec_matches_batched_greedy   -> THE gate. Same batch, same path. Must match.
+    test_near_tie_diagnostic                   -> proves single-vs-batched divergence is a
+                                                  near-tie (small logit gap), not corruption.
+    test_fp32_parity_with_single_sequence      -> in FP32 the numerical drift vanishes, so
+                                                  batched-spec should match single vanilla.
+                                                  (Confirms the FP16 explanation end to end.)
 
 Run:
     python -m pytest tests/batching/test_batched_speculative.py -v -m cuda
@@ -23,93 +34,147 @@ import torch
 cuda = pytest.mark.cuda
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-TARGET = "Qwen/Qwen3-1.7B"   # smaller target so the test loads fast; crossover uses 4B
+TARGET = "Qwen/Qwen3-1.7B"
 DRAFT = "Qwen/Qwen3-0.6B"
 
+PROMPTS = ["The capital of France is", "Once upon a time in a land far away"]
 
-def _load():
+
+def _load(dtype=torch.float16):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(TARGET, trust_remote_code=True)
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
     target = AutoModelForCausalLM.from_pretrained(
-        TARGET, dtype=torch.float16, device_map="cuda", trust_remote_code=True).eval()
+        TARGET, dtype=dtype, device_map="cuda", trust_remote_code=True).eval()
     draft = AutoModelForCausalLM.from_pretrained(
-        DRAFT, dtype=torch.float16, device_map="cuda", trust_remote_code=True).eval()
+        DRAFT, dtype=dtype, device_map="cuda", trust_remote_code=True).eval()
     target.config._attn_implementation = "sdpa"
     draft.config._attn_implementation = "sdpa"
     return target, draft, tok
 
 
-def _vanilla_reference(target, draft, tok, prompt, max_new, depth):
-    """Per-sequence vanilla speculative output — the oracle."""
-    from engine.speculative.vanilla import VanillaSpeculativeDecoder
-    dec = VanillaSpeculativeDecoder(target, draft, tok, torch.device("cuda"))
-    return dec.generate(prompt, max_new_tokens=max_new, speculation_depth=depth).token_ids
+def _batched_greedy(engine, prompts, max_new):
+    """THE ORACLE: greedy decode of the target on the SAME left-padded batch, through the
+    engine's own _batched_prefill/_batched_decode (same kernel path as batched-spec)."""
+    tok, device = engine.tok, engine.device
+    tok.padding_side = "left"
+    enc = tok(prompts, return_tensors="pt", padding=True).to(device)
+    cache, nxt, mask = engine._batched_prefill(engine.target, enc.input_ids, enc.attention_mask)
+    N = len(prompts)
+    outs = [[] for _ in range(N)]
+    done = [False] * N
+    for _ in range(max_new):
+        toks = nxt.tolist()
+        for i in range(N):
+            if not done[i]:
+                outs[i].append(toks[i][0])
+                if toks[i][0] in engine.eos_ids:
+                    done[i] = True
+        if all(done):
+            break
+        nxt, cache, mask = engine._batched_decode(engine.target, nxt, cache, mask)
+    return outs
 
+
+# ---------------------------------------------------------------------------
+# THE GATE: batched-spec == batched-greedy (same batch, same kernel path)
+# ---------------------------------------------------------------------------
 
 @cuda
 @requires_cuda
-def test_bs_single_sequence():
-    """N=1: batched engine == vanilla speculative. Isolates batched machinery."""
+def test_batched_spec_matches_batched_greedy():
     from engine.batching.batched_speculative import BatchedSpeculativeEngine
 
     target, draft, tok = _load()
     eng = BatchedSpeculativeEngine(target, draft, tok, torch.device("cuda"))
-
-    prompt = "The capital of France is"
     max_new, depth = 20, 4
 
-    ref = _vanilla_reference(target, draft, tok, prompt, max_new, depth)
-    out = eng.generate([prompt], max_new_tokens=max_new, speculation_depth=depth).outputs[0]
+    greedy = _batched_greedy(eng, PROMPTS, max_new)
+    spec = eng.generate(PROMPTS, max_new_tokens=max_new, speculation_depth=depth).outputs
 
-    # Trim to same length for comparison (batched may over/under-run by rounding)
-    n = min(len(ref), len(out))
-    assert out[:n] == ref[:n], (
-        f"N=1 batched != vanilla\n  ref: {ref[:n]}\n  out: {out[:n]}"
-    )
-
-
-@cuda
-@requires_cuda
-def test_bs_two_identical_prompts():
-    """N=2 same prompt: both outputs identical and match vanilla. Batching, no ragged divergence."""
-    from engine.batching.batched_speculative import BatchedSpeculativeEngine
-
-    target, draft, tok = _load()
-    eng = BatchedSpeculativeEngine(target, draft, tok, torch.device("cuda"))
-
-    prompt = "The capital of France is"
-    max_new, depth = 20, 4
-
-    ref = _vanilla_reference(target, draft, tok, prompt, max_new, depth)
-    res = eng.generate([prompt, prompt], max_new_tokens=max_new, speculation_depth=depth)
-
-    for i, out in enumerate(res.outputs):
-        n = min(len(ref), len(out))
-        assert out[:n] == ref[:n], (
-            f"N=2 identical, seq {i} != vanilla\n  ref: {ref[:n]}\n  out: {out[:n]}"
+    for i, (s, g) in enumerate(zip(spec, greedy)):
+        n = min(len(s), len(g))
+        assert s[:n] == g[:n], (
+            f"batched-spec != batched-greedy for seq {i} ({PROMPTS[i]!r}) — a REAL logic bug\n"
+            f"  greedy: {g[:n]}\n  spec:   {s[:n]}"
         )
 
 
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC: single-vs-batched divergence is a near-tie, not corruption
+# ---------------------------------------------------------------------------
+
 @cuda
 @requires_cuda
-def test_bs_two_different_prompts():
-    """N=2 different prompts: the REAL ragged case. Each matches its own vanilla output."""
+def test_near_tie_diagnostic():
+    """Where batched-greedy and single-greedy diverge, the top-2 logit gap is small.
+
+    This PROVES the divergence is FP16 numerics (a near-tie flipped by accumulation
+    order), not a corrupted cache (which would show a large gap toward a wrong token).
+    """
     from engine.batching.batched_speculative import BatchedSpeculativeEngine
 
     target, draft, tok = _load()
     eng = BatchedSpeculativeEngine(target, draft, tok, torch.device("cuda"))
+    max_new = 20
 
-    prompts = ["The capital of France is", "Once upon a time in a land far away"]
+    batched = _batched_greedy(eng, PROMPTS, max_new)
+
+    # Single-sequence greedy for seq 0 (different kernel path)
+    ids = tok(PROMPTS[0], return_tensors="pt").input_ids.cuda()
+    with torch.inference_mode():
+        single_out = target.generate(ids, max_new_tokens=max_new, do_sample=False,
+                                     temperature=None, top_p=None)
+    single = single_out[0, ids.shape[1]:].tolist()
+
+    b = batched[0]
+    n = min(len(b), len(single))
+    div = next((i for i in range(n) if b[i] != single[i]), None)
+    if div is None:
+        print("\nbatched and single agree fully on seq 0 — no near-tie reached in 20 tokens")
+        return
+
+    # Teacher-force the SHARED prefix (up to divergence) and inspect the top-2 gap
+    prefix = torch.tensor([ids[0].tolist() + single[:div]], device="cuda")
+    with torch.inference_mode():
+        logits = target(input_ids=prefix, use_cache=False, return_dict=True).logits[0, -1].float()
+    top2 = torch.topk(logits, 2)
+    gap = (top2.values[0] - top2.values[1]).item()
+    print(f"\nseq 0 diverges at index {div}: single={single[div]} batched={b[div]}")
+    print(f"top-2 candidates at that position: {top2.indices.tolist()}, logit gap = {gap:.4f}")
+    # Both candidates should be exactly the two tokens the two paths chose.
+    assert set(top2.indices.tolist()) == {single[div], b[div]}, \
+        "divergent tokens are not the top-2 — this would indicate corruption, not a near-tie"
+    assert gap < 1.0, f"logit gap {gap:.3f} is too large to be a near-tie flip"
+
+
+# ---------------------------------------------------------------------------
+# FP32 PARITY: with no FP16 drift, batched-spec should match single vanilla spec
+# ---------------------------------------------------------------------------
+
+@cuda
+@requires_cuda
+def test_fp32_parity_with_single_sequence():
+    """In FP32 the batched-vs-single drift vanishes, so batched-spec == single vanilla spec.
+
+    This closes the loop: if the FP16 mismatch were a logic bug, FP32 would ALSO mismatch.
+    If FP32 matches, the FP16 mismatch is confirmed numerical.
+    """
+    from engine.batching.batched_speculative import BatchedSpeculativeEngine
+    from engine.speculative.vanilla import VanillaSpeculativeDecoder
+
+    target, draft, tok = _load(dtype=torch.float32)
+    eng = BatchedSpeculativeEngine(target, draft, tok, torch.device("cuda"))
     max_new, depth = 20, 4
 
-    refs = [_vanilla_reference(target, draft, tok, p, max_new, depth) for p in prompts]
-    res = eng.generate(prompts, max_new_tokens=max_new, speculation_depth=depth)
+    spec = eng.generate(PROMPTS, max_new_tokens=max_new, speculation_depth=depth).outputs
 
-    for i, (out, ref) in enumerate(zip(res.outputs, refs)):
-        n = min(len(ref), len(out))
-        assert out[:n] == ref[:n], (
-            f"N=2 different, seq {i} ({prompts[i]!r}) != vanilla\n"
-            f"  ref: {ref[:n]}\n  out: {out[:n]}"
+    van = VanillaSpeculativeDecoder(target, draft, tok, torch.device("cuda"))
+    for i, p in enumerate(PROMPTS):
+        ref = van.generate(p, max_new_tokens=max_new, speculation_depth=depth).token_ids
+        n = min(len(ref), len(spec[i]))
+        assert spec[i][:n] == ref[:n], (
+            f"FP32 batched-spec != single vanilla for seq {i} — would indicate a real bug\n"
+            f"  ref:  {ref[:n]}\n  spec: {spec[i][:n]}"
         )
