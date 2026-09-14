@@ -34,7 +34,7 @@ from typing import Optional
 
 import torch
 
-from engine.cache.allocator import BlockAllocator
+from engine.cache.paging import KVBlockAllocation, KVBlockManager
 from engine.kernels.paged_decode_batched import paged_decode_batched
 
 
@@ -127,11 +127,17 @@ class SeqState:
     seq_id: str
     prompt_ids: list[int]
     max_new_tokens: int
-    block_table: list[int] = field(default_factory=list)
+    allocation: Optional[KVBlockAllocation] = None
     seq_len: int = 0
     output_ids: list[int] = field(default_factory=list)
     next_token: Optional[int] = None
     done: bool = False
+
+    @property
+    def block_table(self) -> list[int]:
+        if self.allocation is None:
+            return []
+        return self.allocation.physical_block_ids
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +177,9 @@ class ContinuousBatchingEngine:
             for _ in range(self.num_layers)
         ]
         self.value_pool = [torch.zeros_like(k) for k in self.key_pool]
-        self.allocator = BlockAllocator(num_blocks=num_blocks, block_size_tokens=block_size)
+        self.block_manager = KVBlockManager(
+            num_blocks=num_blocks, block_size_tokens=block_size
+        )
 
         # Register the batched attention fn once.
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -184,8 +192,7 @@ class ContinuousBatchingEngine:
         slate when reusing the same engine for multiple benchmark runs. The pool tensors
         are reused (not reallocated) — only the allocator's bookkeeping resets.
         """
-        from engine.cache.allocator import BlockAllocator
-        self.allocator = BlockAllocator(
+        self.block_manager = KVBlockManager(
             num_blocks=self.key_pool[0].shape[0], block_size_tokens=self.block_size,
         )
 
@@ -205,14 +212,18 @@ class ContinuousBatchingEngine:
         ids = torch.tensor([seq.prompt_ids], device=self.device)
         prompt_len = ids.shape[1]
 
-        nblocks = (prompt_len + self.block_size - 1) // self.block_size
-        phys = self.allocator.allocate(seq.seq_id, nblocks)
-        if phys is None:
+        allocation = self.block_manager.reserve(
+            seq.seq_id, prompt_len, sequence_length=prompt_len
+        )
+        if allocation is None:
             raise RuntimeError(f"pool exhausted prefilling {seq.seq_id}")
-        seq.block_table = list(phys)
+        seq.allocation = allocation
 
-        scratch = PagedCache(num_layers=self.num_layers,
-                             block_size_tokens=self.block_size, initial_blocks=nblocks + 1)
+        scratch = PagedCache(
+            num_layers=self.num_layers,
+            block_size_tokens=self.block_size,
+            initial_blocks=len(seq.block_table) + 1,
+        )
         out = self.model(input_ids=ids, past_key_values=scratch, use_cache=True, return_dict=True)
 
         # Scatter each layer's captured (rotated) K,V into the pool at seq's blocks
@@ -252,24 +263,15 @@ class ContinuousBatchingEngine:
         input_ids = torch.tensor([[s.next_token] for s in active], device=self.device)  # [N,1]
         position_ids = torch.tensor([[s.seq_len] for s in active], device=self.device)  # [N,1]
 
-        # Build block_tables [N, max_blocks] and seq_lens [N]
-        max_blocks = max(len(s.block_table) for s in active)
-        block_tables = torch.zeros((N, max_blocks), dtype=torch.int32, device=self.device)
-        seq_lens = torch.zeros((N,), dtype=torch.int32, device=self.device)
-        for i, s in enumerate(active):
-            for j, pb in enumerate(s.block_table):
-                block_tables[i, j] = pb
-            seq_lens[i] = s.seq_len
-
         # Ensure each sequence has a block for its new token (grow if at a boundary)
-        for i, s in enumerate(active):
-            need_blocks = (s.seq_len + 1 + self.block_size - 1) // self.block_size
-            if need_blocks > len(s.block_table):
-                new = self.allocator.extend(s.seq_id, need_blocks - len(s.block_table))
-                if new is None:
-                    raise RuntimeError(f"pool exhausted growing {s.seq_id}")
-                s.block_table.extend(new)
-        # Rebuild block_tables after possible growth
+        for s in active:
+            if not self.block_manager.ensure_capacity(s.seq_id, s.seq_len + 1):
+                raise RuntimeError(f"pool exhausted growing {s.seq_id}")
+
+        # Build metadata once, after all possible block-table growth.
+        seq_lens = torch.tensor(
+            [s.seq_len for s in active], dtype=torch.int32, device=self.device
+        )
         max_blocks = max(len(s.block_table) for s in active)
         block_tables = torch.zeros((N, max_blocks), dtype=torch.int32, device=self.device)
         for i, s in enumerate(active):
@@ -291,6 +293,7 @@ class ContinuousBatchingEngine:
         next_tokens = out.logits[:, -1, :].argmax(dim=-1)   # [N]
         for i, s in enumerate(active):
             s.seq_len += 1
+            self.block_manager.set_sequence_length(s.seq_id, s.seq_len)
             tok = int(next_tokens[i].item())
             s.next_token = tok
             s.output_ids.append(tok)
@@ -319,7 +322,7 @@ class ContinuousBatchingEngine:
                 s = waiting.pop(0)
                 self.prefill(s)
                 if s.done:
-                    self.allocator.release(s.seq_id)
+                    self.block_manager.release(s.seq_id)
                     finished.append(s)
                 else:
                     active.append(s)
@@ -334,7 +337,7 @@ class ContinuousBatchingEngine:
             still_active = []
             for s in active:
                 if s.done:
-                    self.allocator.release(s.seq_id)
+                    self.block_manager.release(s.seq_id)
                     finished.append(s)
                 else:
                     still_active.append(s)

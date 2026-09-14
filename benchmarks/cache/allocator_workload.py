@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from engine.cache import ContiguousKVAllocator, KVCacheGeometry, PagedKVCacheManager
+from engine.cache import ContiguousKVAllocator, KVBlockManager, KVCacheGeometry
 from engine.metrics import latency_summary_ms
 
 
@@ -64,7 +64,7 @@ def simulate_contiguous(arrivals: list[RequestSpec | None], capacity_tokens: int
 
 
 def simulate_paged(arrivals: list[RequestSpec | None], capacity_tokens: int, block_size_tokens: int) -> dict[str, object]:
-    manager = PagedKVCacheManager(capacity_tokens // block_size_tokens, block_size_tokens)
+    manager = KVBlockManager(capacity_tokens // block_size_tokens, block_size_tokens)
     active: dict[str, int] = {}
     internal_fragmentation: list[int] = []
     admitted = rejected = exhausted = 0
