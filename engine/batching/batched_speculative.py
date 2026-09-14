@@ -63,22 +63,43 @@ class BatchedSpeculativeEngine:
         eos = target.generation_config.eos_token_id or tokenizer.eos_token_id
         self.eos_ids = {eos} if isinstance(eos, int) else set(eos)
 
+    @staticmethod
+    def _position_ids_from_mask(attention_mask):
+        """Correct position_ids for a (left-padded) batch: cumsum of the mask - 1.
+
+        Left-padded rows have pads on the left; their real tokens must be positioned 0,1,2..
+        regardless of pad count. cumsum(mask)-1 gives exactly that; pads get a dummy pos.
+        """
+        pos = attention_mask.long().cumsum(-1) - 1
+        pos.masked_fill_(attention_mask == 0, 1)
+        return pos
+
     @torch.inference_mode()
     def _batched_prefill(self, model, input_ids, attention_mask):
         """Prefill the padded batch. Returns (cache, next_tokens [N,1], mask)."""
+        position_ids = self._position_ids_from_mask(attention_mask)
         out = model(input_ids=input_ids, attention_mask=attention_mask,
-                    use_cache=True, return_dict=True)
-        # next token per sequence from the LAST non-pad position.
-        # With left padding, the last position is the real last token for every row.
+                    position_ids=position_ids, use_cache=True, return_dict=True)
+        # next token per sequence from the LAST position (right-most = real last token,
+        # since left padding puts reals on the right).
         next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)   # [N,1]
         return out.past_key_values, next_tokens, attention_mask
 
     @torch.inference_mode()
     def _batched_decode(self, model, tokens, cache, attention_mask):
-        """One batched decode step. tokens [N,1] -> next [N,1], updated cache + mask."""
+        """One batched decode step. tokens [N,1] -> next [N,1], updated cache + mask.
+
+        Passes per-row position_ids so left-padded sequences keep correct RoPE positions.
+        The new token's position for each row = (real tokens so far) = cumsum(new_mask)-1
+        at the last column.
+        """
         new_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1),
                               device=self.device, dtype=attention_mask.dtype)], dim=1)
-        out = model(input_ids=tokens, attention_mask=new_mask,
+        # position of the new token per row = number of real tokens so far - 1... actually
+        # the NEW token's position = (count of real tokens INCLUDING it) - 1 = cumsum-1 at last col.
+        pos_full = new_mask.long().cumsum(-1) - 1            # [N, L]
+        position_ids = pos_full[:, -1:].clamp(min=0)         # [N,1] position of the new token
+        out = model(input_ids=tokens, attention_mask=new_mask, position_ids=position_ids,
                     past_key_values=cache, use_cache=True, return_dict=True)
         next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         return next_tokens, out.past_key_values, new_mask
@@ -121,7 +142,11 @@ class BatchedSpeculativeEngine:
             # Target sees [N, depth] and predicts the token AFTER each position.
             verify_mask = torch.cat([tgt_mask, torch.ones((N, depth), device=self.device,
                                      dtype=tgt_mask.dtype)], dim=1)
+            # position_ids for the `depth` verify tokens per row (left-padding aware).
+            v_pos_full = verify_mask.long().cumsum(-1) - 1        # [N, L]
+            verify_pos = v_pos_full[:, -depth:].clamp(min=0)      # [N, depth]
             v_out = self.target(input_ids=proposals_t, attention_mask=verify_mask,
+                                position_ids=verify_pos,
                                 past_key_values=tgt_cache, use_cache=True, return_dict=True)
             # target prediction at position j is argmax of logits[:, j, :]
             # prediction[0] should match proposals[0] if draft agreed; etc.
