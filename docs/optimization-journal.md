@@ -341,7 +341,7 @@ T4 result:
 
 Decision: `KEEP`.
 
-### In-kernel decode length offset — awaiting T4 gate
+### In-kernel decode length offset — accepted
 
 Commit: `291ccf8` — `Move decode length offset into attention kernel`
 
@@ -368,7 +368,36 @@ Gate:
 - Expect a smaller improvement than the prior change; accept a neutral result because
   it also removes repeated allocations, but revert a repeatable regression.
 
-Decision: `PENDING T4 MEASUREMENT`.
+T4 result:
+
+- All 21 paged-attention, KV-write, and continuous-generation tests passed.
+- Sequential throughput was 23.9 tok/s.
+- Width-4 throughput was 86.3 tok/s.
+- Width-8 throughput was 142.6 tok/s; this individual point was below the preceding
+  154.8 tok/s run and is treated as cross-run variance rather than a separate claim.
+- Width-16 throughput was 263.5 tok/s, up 6.3% from 247.8 tok/s.
+- Width-16 scaling reached 11.01x over the same run's sequential path.
+
+Decision: `KEEP`.
+
+### Post-synchronization decode profile — awaiting T4 evidence
+
+Commit: `c9bcf82` — `Add continuous decode profiler`
+
+Purpose:
+
+The major known host-synchronization and temporary-length launches have now been
+removed. The next optimization must be selected from the new measured profile rather
+than from the obsolete Phase 0 operator trace.
+
+Change:
+
+- Added a continuous-engine profiler that warms the model and Triton kernels first.
+- Prefill occurs outside the profiling window, isolating batched decode.
+- Reports separate top operators by self GPU and self CPU time, including call counts.
+- Saves structured environment, configuration, and operator data for later comparison.
+
+Decision: `DIAGNOSTIC PENDING`; profiler timings will not be presented as throughput.
 
 ### Persistent decode metadata — accepted
 
