@@ -166,6 +166,10 @@ def test_d3_full_generation_matches_ref():
     # Continuous batching
     outs = eng.generate(prompts, max_new_tokens=max_new)
 
+    snapshot = eng.block_manager.snapshot()
+    assert snapshot["active_requests"] == 0
+    assert snapshot["free_blocks"] == snapshot["num_blocks"]
+
     for i, (out, ref) in enumerate(zip(outs, refs)):
         assert out == ref, (
             f"continuous batching diverged from reference for prompt {i}\n"
@@ -193,6 +197,10 @@ def test_d3_mixed_lengths_and_staggered():
     max_new = 20
     refs = [_reference_greedy(model, tok, p, max_new_tokens=max_new) for p in prompts]
     outs = eng.generate(prompts, max_new_tokens=max_new)
+
+    snapshot = eng.block_manager.snapshot()
+    assert snapshot["active_requests"] == 0
+    assert snapshot["free_blocks"] == snapshot["num_blocks"]
 
     for i, (out, ref) in enumerate(zip(outs, refs)):
         assert out == ref, (

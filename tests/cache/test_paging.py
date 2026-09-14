@@ -40,3 +40,13 @@ def test_paged_manager_grows_only_when_crossing_a_block_boundary() -> None:
     assert manager.append_tokens("request", 1)
     assert len(manager.requests["request"].physical_block_ids) == 2
     assert manager.requests["request"].sequence_length == 5
+
+
+def test_failed_growth_does_not_change_request_ownership() -> None:
+    manager = KVBlockManager(num_blocks=2, block_size_tokens=4)
+    allocation = manager.reserve("request", capacity_tokens=4, sequence_length=4)
+    assert allocation is not None
+    original_blocks = list(allocation.physical_block_ids)
+    assert not manager.ensure_capacity("request", 12)
+    assert allocation.physical_block_ids == original_blocks
+    assert allocation.sequence_length == 4
