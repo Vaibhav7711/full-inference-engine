@@ -1,16 +1,16 @@
-"""Stage 8 FCFS admission scheduler over the contiguous KV baseline."""
+"""FCFS admission and lifecycle scheduler over production KV blocks."""
 
 from __future__ import annotations
 
 from collections import deque
 
-from engine.cache import ContiguousKVAllocator
+from engine.cache import KVBlockManager
 from engine.runtime import GenerationRequest, RequestState
 
 
 class FCFSScheduler:
-    def __init__(self, allocator: ContiguousKVAllocator):
-        self.allocator = allocator
+    def __init__(self, block_manager: KVBlockManager):
+        self.block_manager = block_manager
         self.waiting: deque[GenerationRequest] = deque()
         self.active: dict[str, GenerationRequest] = {}
         self.rejected_count = 0
@@ -24,7 +24,7 @@ class FCFSScheduler:
         self.waiting.append(request)
 
     def admit_available(self, *, max_active_requests: int | None = None) -> list[GenerationRequest]:
-        """Admit requests in arrival order; a fragmented head blocks later requests."""
+        """Admit requests in arrival order while request slots and blocks are available."""
         if max_active_requests is not None and max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive when provided")
         admitted: list[GenerationRequest] = []
@@ -32,12 +32,18 @@ class FCFSScheduler:
             if max_active_requests is not None and len(self.active) >= max_active_requests:
                 break
             request = self.waiting[0]
-            if request.reserved_tokens > self.allocator.capacity_tokens:
+            if request.reserved_tokens > (
+                self.block_manager.allocator.num_blocks * self.block_manager.block_size_tokens
+            ):
                 self.waiting.popleft()
                 request.transition(RequestState.REJECTED, reason="KV_CAPACITY_EXCEEDED")
                 self.rejected_count += 1
                 continue
-            allocation = self.allocator.allocate(request.request_id, request.reserved_tokens)
+            allocation = self.block_manager.reserve(
+                request.request_id,
+                request.prompt_token_count,
+                sequence_length=request.prompt_token_count,
+            )
             if allocation is None:
                 break
             self.waiting.popleft()
@@ -55,7 +61,7 @@ class FCFSScheduler:
 
     def finish(self, request_id: str, reason: str = "EOS") -> GenerationRequest:
         request = self.active.pop(request_id)
-        self.allocator.release(request_id)
+        self.block_manager.release(request_id)
         request.transition(RequestState.FINISHED, reason=reason)
         return request
 
@@ -66,7 +72,7 @@ class FCFSScheduler:
                 request.transition(RequestState.CANCELLED, reason=reason)
                 return request
         request = self.active.pop(request_id)
-        self.allocator.release(request_id)
+        self.block_manager.release(request_id)
         request.transition(RequestState.CANCELLED, reason=reason)
         return request
 
@@ -77,5 +83,5 @@ class FCFSScheduler:
             "admission_count": self.admission_count,
             "rejected_count": self.rejected_count,
             "head_request_id": self.waiting[0].request_id if self.waiting else None,
-            "allocator": self.allocator.snapshot(),
+            "block_manager": self.block_manager.snapshot(),
         }

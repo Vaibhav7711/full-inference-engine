@@ -1,12 +1,10 @@
-import torch
-
-from engine.cache import ContiguousKVAllocator, KVCacheGeometry
+from engine.cache import KVBlockManager
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
 
 
 def make_scheduler(capacity: int = 10) -> FCFSScheduler:
-    return FCFSScheduler(ContiguousKVAllocator(capacity, KVCacheGeometry(1, 1, 1, torch.float16)))
+    return FCFSScheduler(KVBlockManager(num_blocks=capacity, block_size_tokens=1))
 
 
 def test_fcfs_admission_and_release() -> None:
@@ -19,7 +17,8 @@ def test_fcfs_admission_and_release() -> None:
     scheduler.mark_decoding("first")
     scheduler.finish("first")
     assert first.state is RequestState.FINISHED
-    assert scheduler.allocator.free_tokens == 5
+    # Paging reserves prompt blocks lazily; output capacity grows during decode.
+    assert scheduler.block_manager.snapshot()["free_blocks"] == 8
 
 
 def test_oversized_request_is_rejected_without_blocking_queue() -> None:

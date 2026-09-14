@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from time import perf_counter_ns
 
-from engine.cache import ContiguousAllocation
+from engine.cache import KVBlockAllocation
 
 
 class RequestState(StrEnum):
@@ -38,8 +38,10 @@ class GenerationRequest:
     state: RequestState = RequestState.WAITING
     created_ns: int = field(default_factory=perf_counter_ns)
     admitted_ns: int | None = None
-    allocation: ContiguousAllocation | None = None
+    prompt_token_ids: list[int] = field(default_factory=list)
+    allocation: KVBlockAllocation | None = None
     output_token_ids: list[int] = field(default_factory=list)
+    next_token_id: int | None = None
     finish_reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -49,10 +51,27 @@ class GenerationRequest:
             raise ValueError("prompt_token_count must be positive")
         if self.max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+        if self.prompt_token_ids and len(self.prompt_token_ids) != self.prompt_token_count:
+            raise ValueError("prompt_token_ids length must equal prompt_token_count")
 
     @property
     def reserved_tokens(self) -> int:
         return self.prompt_token_count + self.max_new_tokens
+
+    @property
+    def block_table(self) -> list[int]:
+        if self.allocation is None:
+            return []
+        return self.allocation.physical_block_ids
+
+    @property
+    def done(self) -> bool:
+        return self.state in {
+            RequestState.FINISHED,
+            RequestState.CANCELLED,
+            RequestState.FAILED,
+            RequestState.REJECTED,
+        }
 
     def transition(self, next_state: RequestState, *, reason: str | None = None) -> None:
         if next_state not in _ALLOWED_TRANSITIONS[self.state]:

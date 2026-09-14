@@ -29,13 +29,15 @@ Staged tests (run in order): test_d1 (prefill), test_d2 (one decode step), test_
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-from engine.cache.paging import KVBlockAllocation, KVBlockManager
+from engine.cache.paging import KVBlockManager
 from engine.kernels.paged_decode_batched import paged_decode_batched
+from engine.runtime import GenerationRequest, RequestState
+from engine.scheduler import FCFSScheduler
 
 
 # ---------------------------------------------------------------------------
@@ -119,28 +121,6 @@ def batched_decode_attention_forward(
 
 
 # ---------------------------------------------------------------------------
-# Sequence state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SeqState:
-    seq_id: str
-    prompt_ids: list[int]
-    max_new_tokens: int
-    allocation: Optional[KVBlockAllocation] = None
-    seq_len: int = 0
-    output_ids: list[int] = field(default_factory=list)
-    next_token: Optional[int] = None
-    done: bool = False
-
-    @property
-    def block_table(self) -> list[int]:
-        if self.allocation is None:
-            return []
-        return self.allocation.physical_block_ids
-
-
-# ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
 
@@ -180,6 +160,7 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
+        self.scheduler = FCFSScheduler(self.block_manager)
 
         # Register the batched attention fn once.
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -195,12 +176,13 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=self.key_pool[0].shape[0], block_size_tokens=self.block_size,
         )
+        self.scheduler = FCFSScheduler(self.block_manager)
 
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def prefill(self, seq: SeqState) -> None:
+    def prefill(self, request: GenerationRequest) -> None:
         """Prefill seq's prompt with stock attention, scatter K,V into pool, get 1st token."""
         from engine.cache.paged_cache import PagedCache
 
@@ -209,20 +191,17 @@ class ContinuousBatchingEngine:
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = "sdpa"
 
-        ids = torch.tensor([seq.prompt_ids], device=self.device)
+        if request.state is not RequestState.PREFILLING or request.allocation is None:
+            raise RuntimeError("request must be admitted before prefill")
+        if not request.prompt_token_ids:
+            raise ValueError("prefill requires prompt_token_ids")
+        ids = torch.tensor([request.prompt_token_ids], device=self.device)
         prompt_len = ids.shape[1]
-
-        allocation = self.block_manager.reserve(
-            seq.seq_id, prompt_len, sequence_length=prompt_len
-        )
-        if allocation is None:
-            raise RuntimeError(f"pool exhausted prefilling {seq.seq_id}")
-        seq.allocation = allocation
 
         scratch = PagedCache(
             num_layers=self.num_layers,
             block_size_tokens=self.block_size,
-            initial_blocks=len(seq.block_table) + 1,
+            initial_blocks=len(request.block_table) + 1,
         )
         out = self.model(input_ids=ids, past_key_values=scratch, use_cache=True, return_dict=True)
 
@@ -234,21 +213,22 @@ class ContinuousBatchingEngine:
             for pos in range(prompt_len):
                 lb = pos // self.block_size
                 off = pos % self.block_size
-                pb = seq.block_table[lb]
+                pb = request.block_table[lb]
                 self.key_pool[layer_idx][pb, off] = k_flat[pos]
                 self.value_pool[layer_idx][pb, off] = v_flat[pos]
 
-        seq.seq_len = prompt_len
-        seq.next_token = int(out.logits[0, -1, :].argmax().item())
-        seq.output_ids.append(seq.next_token)
-        if seq.next_token in self.eos_ids or len(seq.output_ids) >= seq.max_new_tokens:
-            seq.done = True
+        request.next_token_id = int(out.logits[0, -1, :].argmax().item())
+        self.scheduler.mark_decoding(request.request_id)
+        request.append_token(request.next_token_id)
+        if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
+            reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
+            self.scheduler.finish(request.request_id, reason=reason)
 
     # ------------------------------------------------------------------
     # D2: one batched decode step over all active sequences
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def decode_step(self, active: list[SeqState]) -> None:
+    def decode_step(self, active: list[GenerationRequest]) -> None:
         """Advance all active sequences by one token via a single batched forward."""
         N = len(active)
         if N == 0:
@@ -260,17 +240,20 @@ class ContinuousBatchingEngine:
             self.model.config._attn_implementation_internal = self.ATTN_NAME
 
         # Build batched inputs
-        input_ids = torch.tensor([[s.next_token] for s in active], device=self.device)  # [N,1]
-        position_ids = torch.tensor([[s.seq_len] for s in active], device=self.device)  # [N,1]
+        input_ids = torch.tensor([[s.next_token_id] for s in active], device=self.device)  # [N,1]
+        position_ids = torch.tensor(
+            [[s.allocation.sequence_length] for s in active], device=self.device
+        )  # [N,1]
 
         # Ensure each sequence has a block for its new token (grow if at a boundary)
         for s in active:
-            if not self.block_manager.ensure_capacity(s.seq_id, s.seq_len + 1):
-                raise RuntimeError(f"pool exhausted growing {s.seq_id}")
+            target_length = s.allocation.sequence_length + 1
+            if not self.block_manager.ensure_capacity(s.request_id, target_length):
+                raise RuntimeError(f"pool exhausted growing {s.request_id}")
 
         # Build metadata once, after all possible block-table growth.
         seq_lens = torch.tensor(
-            [s.seq_len for s in active], dtype=torch.int32, device=self.device
+            [s.allocation.sequence_length for s in active], dtype=torch.int32, device=self.device
         )
         max_blocks = max(len(s.block_table) for s in active)
         block_tables = torch.zeros((N, max_blocks), dtype=torch.int32, device=self.device)
@@ -292,13 +275,13 @@ class ContinuousBatchingEngine:
         # Sample next token per sequence, advance state
         next_tokens = out.logits[:, -1, :].argmax(dim=-1)   # [N]
         for i, s in enumerate(active):
-            s.seq_len += 1
-            self.block_manager.set_sequence_length(s.seq_id, s.seq_len)
+            self.block_manager.append_tokens(s.request_id)
             tok = int(next_tokens[i].item())
-            s.next_token = tok
-            s.output_ids.append(tok)
-            if tok in self.eos_ids or len(s.output_ids) >= s.max_new_tokens:
-                s.done = True
+            s.next_token_id = tok
+            s.append_token(tok)
+            if tok in self.eos_ids or len(s.output_token_ids) >= s.max_new_tokens:
+                reason = "EOS" if tok in self.eos_ids else "LENGTH"
+                self.scheduler.finish(s.request_id, reason=reason)
 
     # ------------------------------------------------------------------
     # D3: the continuous loop
@@ -306,46 +289,31 @@ class ContinuousBatchingEngine:
     @torch.inference_mode()
     def generate(self, prompts: list[str], max_new_tokens: int = 32) -> list[list[int]]:
         """Run all prompts through continuous batching. Returns output token ids per prompt."""
-        # Build sequences
-        seqs = []
+        requests = []
         for i, p in enumerate(prompts):
             ids = self.tokenizer(p, return_tensors="pt").input_ids[0].tolist()
-            seqs.append(SeqState(seq_id=f"seq{i}", prompt_ids=ids, max_new_tokens=max_new_tokens))
+            request = GenerationRequest(
+                request_id=f"seq{i}",
+                prompt_token_count=len(ids),
+                max_new_tokens=max_new_tokens,
+                prompt_token_ids=ids,
+            )
+            requests.append(request)
+            self.scheduler.submit(request)
 
-        waiting = list(seqs)
-        active: list[SeqState] = []
-        finished: list[SeqState] = []
+        while self.scheduler.waiting or self.scheduler.active:
+            admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
+            for request in admitted:
+                self.prefill(request)
+            active = [
+                request
+                for request in self.scheduler.active.values()
+                if request.state is RequestState.DECODING
+            ]
+            if active:
+                self.decode_step(active)
 
-        while waiting or active:
-            # Admit and prefill new sequences up to max_active
-            while waiting and len(active) < self.max_active:
-                s = waiting.pop(0)
-                self.prefill(s)
-                if s.done:
-                    self.block_manager.release(s.seq_id)
-                    finished.append(s)
-                else:
-                    active.append(s)
-
-            if not active:
-                continue
-
-            # One batched decode step over all active
-            self.decode_step(active)
-
-            # Evict finished
-            still_active = []
-            for s in active:
-                if s.done:
-                    self.block_manager.release(s.seq_id)
-                    finished.append(s)
-                else:
-                    still_active.append(s)
-            active = still_active
-
-        # Return in original order
-        by_id = {s.seq_id: s for s in finished}
-        return [by_id[f"seq{i}"].output_ids for i in range(len(prompts))]
+        return [request.output_token_ids for request in requests]
 
     def attn_call_count(self) -> int:
         return _ATTN_CALLS

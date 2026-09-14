@@ -19,6 +19,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from engine.runtime import GenerationRequest
+
 cuda = pytest.mark.cuda
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -47,6 +49,18 @@ def _reference_greedy(model, tok, prompt, max_new_tokens):
     return out[0, ids.shape[1]:].tolist()
 
 
+def _admit(eng, request_id, prompt_ids, max_new_tokens):
+    request = GenerationRequest(
+        request_id,
+        prompt_token_count=len(prompt_ids),
+        max_new_tokens=max_new_tokens,
+        prompt_token_ids=prompt_ids,
+    )
+    eng.scheduler.submit(request)
+    assert eng.scheduler.admit_available(max_active_requests=eng.max_active) == [request]
+    return request
+
+
 # ---------------------------------------------------------------------------
 # D1: prefill stores correct K,V into the pool
 # ---------------------------------------------------------------------------
@@ -55,7 +69,7 @@ def _reference_greedy(model, tok, prompt, max_new_tokens):
 @requires_cuda
 def test_d1_prefill_stores_correct_kv():
     """After prefill, the pool holds the same K,V a single-sequence PagedCache would."""
-    from engine.batching.continuous_batching import ContinuousBatchingEngine, SeqState
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
     from engine.cache.paged_cache import PagedCache
 
     model, tok = _load()
@@ -63,11 +77,11 @@ def test_d1_prefill_stores_correct_kv():
 
     prompt = "The capital of France is"
     ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
-    seq = SeqState(seq_id="s0", prompt_ids=ids, max_new_tokens=8)
+    seq = _admit(eng, "s0", ids, 8)
     eng.prefill(seq)
 
     prompt_len = len(ids)
-    assert seq.seq_len == prompt_len
+    assert seq.allocation.sequence_length == prompt_len
 
     # Reference: prefill the same prompt with a standalone PagedCache
     model.config._attn_implementation = "sdpa"
@@ -104,7 +118,7 @@ def test_d2_decode_step_matches_per_seq():
     produced token equals what stock generation gives as that sequence's first decode
     token. (The first decode token after prefill is deterministic greedy.)
     """
-    from engine.batching.continuous_batching import ContinuousBatchingEngine, SeqState
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
 
     model, tok = _load()
     eng = ContinuousBatchingEngine(model, tok, "cuda", num_blocks=1024, block_size=16)
@@ -121,20 +135,20 @@ def test_d2_decode_step_matches_per_seq():
     seqs = []
     for i, p in enumerate(prompts):
         ids = tok(p, return_tensors="pt").input_ids[0].tolist()
-        s = SeqState(seq_id=f"s{i}", prompt_ids=ids, max_new_tokens=8)
+        s = _admit(eng, f"s{i}", ids, 8)
         eng.prefill(s)
         seqs.append(s)
-        assert s.output_ids[0] == refs[i][0], (
-            f"prefill token mismatch seq {i}: got {s.output_ids[0]}, ref {refs[i][0]}"
+        assert s.output_token_ids[0] == refs[i][0], (
+            f"prefill token mismatch seq {i}: got {s.output_token_ids[0]}, ref {refs[i][0]}"
         )
 
     # One batched decode step -> each seq's SECOND token
     eng.decode_step(seqs)
 
     for i, s in enumerate(seqs):
-        assert s.output_ids[1] == refs[i][1], (
+        assert s.output_token_ids[1] == refs[i][1], (
             f"batched decode token mismatch seq {i}: "
-            f"got {s.output_ids[1]}, ref {refs[i][1]}\n"
+            f"got {s.output_token_ids[1]}, ref {refs[i][1]}\n"
             f"  prompt: {prompts[i]}"
         )
 

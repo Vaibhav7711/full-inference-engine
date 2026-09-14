@@ -225,7 +225,7 @@ Interpretation:
 - The Phase 2 refactor must retain at least 161.8 tok/s at width 16 (a 5% tolerance)
   before any further optimization claim is accepted.
 
-### Block-ownership unification — awaiting T4 gate
+### Block-ownership unification — accepted
 
 Commit: `acc719d` — `Unify continuous KV block ownership`
 
@@ -246,8 +246,12 @@ Local validation:
 - KV ownership/growth/release smoke test passed.
 - Synthetic paged allocator workload passed.
 
-T4 acceptance pending:
+T4 result:
 
-- Paged manager unit tests.
-- K4 kernel and continuous-generation correctness tests.
-- Width-16 throughput >= 161.8 tok/s.
+- All allocator, paging, K4 kernel, and continuous-generation tests passed.
+- Sequential throughput improved from 23.2 to 23.7 tok/s.
+- Width-16 throughput improved from 170.3 to 171.2 tok/s (+0.5%).
+- Width-16 speedup was 7.22x versus the refactored sequential path.
+- The result is above the 161.8 tok/s acceptance floor.
+
+Decision: `KEEP`.
