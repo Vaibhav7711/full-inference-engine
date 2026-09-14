@@ -31,7 +31,8 @@ def environment_record(device: torch.device | str = "cuda") -> dict[str, object]
         "compute_capability": f"{properties.major}.{properties.minor}",
         "multiprocessor_count": properties.multi_processor_count,
         "total_memory_bytes": properties.total_memory,
-        "bf16_supported": torch.cuda.is_bf16_supported(),
+        "framework_bf16_supported": torch.cuda.is_bf16_supported(),
+        "native_bf16_tensor_cores": properties.major >= 8,
     }
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
