@@ -256,7 +256,7 @@ T4 result:
 
 Decision: `KEEP`.
 
-### Direct pool-backed prefill KV write — awaiting T4 gate
+### Direct pool-backed prefill KV write — accepted
 
 Commit: `9eda221` — `Write prefill KV directly with Triton`
 
@@ -289,6 +289,43 @@ Risk and gate:
 - Accept only if all kernel and staged continuous tests pass and width-16 throughput is
   at least 164.0 tok/s (within 5% of the immediate 172.6 tok/s baseline). Record all
   concurrency points; do not claim a speedup from normal run-to-run noise.
+
+T4 result:
+
+- All focused kernel and staged continuous-generation tests passed.
+- Sequential throughput was 23.3 tok/s.
+- Width-8 throughput was 109.3 tok/s, up 4.0% from 105.1 tok/s.
+- Width-16 throughput was 178.3 tok/s, up 3.3% from 172.6 tok/s.
+- Width-16 speedup was 7.65x over the same run's sequential path.
+
+Decision: `KEEP`.
+
+### Batched decode KV write — awaiting T4 gate
+
+Commit: `a8469ab` — `Fuse batched decode KV writes`
+
+Hypothesis:
+
+The decode attention callback still loops over active requests in Python for every
+transformer layer. Each request performs two `.item()` reads from CUDA metadata before
+two indexed K/V assignments. Replacing this with one request-by-head Triton grid should
+remove host synchronization and issue one fused K/V write kernel per layer.
+
+Change:
+
+- Added a batched single-token Triton writer for `[N, H, 1, D]` decode K/V.
+- Sequence positions and physical-block lookup remain on the GPU.
+- Replaced the per-request Python loop in the physical decode callback.
+- Added correctness coverage across block boundaries, distinct sequence lengths, and
+  non-contiguous physical block tables.
+
+Gate:
+
+- All kernel and continuous-generation tests must remain token-exact.
+- Width-16 throughput must remain at least 169.4 tok/s (within 5% of the immediate
+  178.3 tok/s baseline).
+- Because this modifies every decode layer and token, a same-session repeated benchmark
+  will be required if the observed difference is small or unexpectedly negative.
 
 Decision: `PENDING T4 MEASUREMENT`.
 
