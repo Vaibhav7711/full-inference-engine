@@ -142,8 +142,9 @@ def main():
     print(f"Speculation x Batching crossover  (depth={args.depth}, {args.max_new_tokens} tok/seq, "
           f"warmup={args.warmup}, runs={args.runs})")
     print(f"{'='*72}")
-    print(f"{'batch':>6} {'greedy tok/s':>13} {'spec tok/s':>11} {'ratio':>7} {'accept':>8} {'verdict':>14}")
-    print("-" * 66)
+    print(f"{'batch':>6} {'greedy tok/s':>13} {'spec tok/s':>11} {'ratio':>7} "
+          f"{'true acc':>9} {'commit acc':>11} {'commit=1':>9} {'verdict':>12}")
+    print("-" * 92)
 
     for N in batch_sizes:
         prompts = [PROMPT_POOL[i % len(PROMPT_POOL)] for i in range(N)]
@@ -163,15 +164,23 @@ def main():
         ratio = s_tps / g_tps if g_tps > 0 else 0.0
         verdict = "spec HELPS" if ratio > 1.0 else "spec hurts"
 
+        hist = s_res.commit_hist or {}
+        rounds = max(sum(hist.values()), 1)
+        commit1_frac = hist.get(1, 0) / rounds
         results["sweep"].append({
             "batch_size": N,
             "greedy_tok_s": round(g_tps, 1), "greedy_s": round(g_s, 3),
             "spec_tok_s": round(s_tps, 1), "spec_s": round(s_s, 3),
             "spec_over_greedy": round(ratio, 3),
-            "acceptance_rate": round(s_res.acceptance_rate, 3),
+            "committed_acceptance": round(s_res.acceptance_rate, 3),
+            "true_acceptance": round(s_res.true_acceptance_rate, 3),
+            "commit_eq_1_frac": round(commit1_frac, 3),
+            "commit_hist": {str(k): v for k, v in sorted(hist.items())},
             "spec_rounds": s_res.total_rounds,
         })
-        print(f"{N:>6} {g_tps:>13.1f} {s_tps:>11.1f} {ratio:>6.2f}x {s_res.acceptance_rate:>7.0%} {verdict:>14}")
+        print(f"{N:>6} {g_tps:>13.1f} {s_tps:>11.1f} {ratio:>6.2f}x "
+              f"{s_res.true_acceptance_rate:>8.0%} {s_res.acceptance_rate:>10.0%} "
+              f"{commit1_frac:>8.0%} {verdict:>12}")
 
     # --- Reading ---
     print(f"\n{'='*72}")
@@ -180,8 +189,12 @@ def main():
     helps = [r for r in results["sweep"] if r["spec_over_greedy"] > 1.0]
     if not helps:
         print("Speculation never beats batched greedy at any tested batch size on this GPU.")
-        print("Consistent with: draft not cheap relative to target (memory-latency-bound),")
-        print("and batching already consuming the idle compute speculation would need.")
+        print("Two separable causes — read the columns:")
+        print("  * batch=1 loss   -> physics: draft ~ target cost on a memory-bound T4.")
+        print("  * batch>=2 cliff -> the min-commit throttle: the batch advances at its SLOWEST")
+        print("    sequence's rate. If 'true acc' stays high while 'commit acc' collapses and")
+        print("    'commit=1' frequency climbs with N, the throttle (not physics) is the cause.")
+        print("    Fix = per-sequence ragged commit, which needs paged KV (per-seq lengths).")
     else:
         best = max(helps, key=lambda r: r["spec_over_greedy"])
         cross = next((r for r in results["sweep"] if r["spec_over_greedy"] <= 1.0), None)

@@ -42,13 +42,21 @@ from transformers import DynamicCache
 @dataclass
 class BatchedSpecResult:
     outputs: list[list[int]]         # output token ids per sequence
-    total_accepted: int
+    total_accepted: int              # COMMITTED accepted (deflated by min-commit)
     total_proposed: int
     total_rounds: int
+    true_accepted: int = 0           # per-sequence agreement BEFORE min-commit (the real rate)
+    commit_hist: dict = None         # {commit_len: count} — how often each commit length occurred
 
     @property
     def acceptance_rate(self) -> float:
+        """Committed acceptance — what actually advanced. Deflated by min-commit."""
         return self.total_accepted / self.total_proposed if self.total_proposed else 0.0
+
+    @property
+    def true_acceptance_rate(self) -> float:
+        """True draft-target agreement, independent of the min-commit throttle."""
+        return self.true_accepted / self.total_proposed if self.total_proposed else 0.0
 
 
 class BatchedSpeculativeEngine:
@@ -119,6 +127,8 @@ class BatchedSpeculativeEngine:
         outputs: list[list[int]] = [[] for _ in range(N)]
         done = [False] * N
         total_accepted = total_proposed = total_rounds = 0
+        true_accepted = 0
+        commit_hist: dict = {}
 
         # We advance all sequences in lockstep. A sequence that's "done" still rides along
         # in the batch (its tokens are ignored) until all finish — simplest correct batching.
@@ -203,6 +213,7 @@ class BatchedSpeculativeEngine:
             # Append the committed (min) tokens to each active sequence's output.
             # Sequences that accepted MORE re-propose the rest next round (correct, just
             # more rounds — no tokens lost, still greedy-equivalent).
+            commit_hist[commit] = commit_hist.get(commit, 0) + 1
             for i in active:
                 for t in round_emit[i][:commit]:
                     if len(outputs[i]) < max_new_tokens and not done[i]:
@@ -210,6 +221,7 @@ class BatchedSpeculativeEngine:
                         if t in self.eos_ids:
                             done[i] = True
                 total_accepted += min(accepted_counts[i], commit)
+                true_accepted += accepted_counts[i]     # real agreement, before throttle
 
             prev_len = tgt_mask.shape[1]
 
@@ -240,4 +252,5 @@ class BatchedSpeculativeEngine:
             tgt_next, tgt_cache, tgt_mask = self._batched_decode(self.target, last_committed, tgt_cache, tgt_mask)
             drf_next, drf_cache, drf_mask = self._batched_decode(self.draft, last_committed, drf_cache, drf_mask)
 
-        return BatchedSpecResult(outputs, total_accepted, total_proposed, total_rounds)
+        return BatchedSpecResult(outputs, total_accepted, total_proposed, total_rounds,
+                                 true_accepted=true_accepted, commit_hist=commit_hist)
