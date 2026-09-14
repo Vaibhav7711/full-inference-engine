@@ -224,3 +224,30 @@ Interpretation:
   metadata construction and per-layer launch overhead.
 - The Phase 2 refactor must retain at least 161.8 tok/s at width 16 (a 5% tolerance)
   before any further optimization claim is accepted.
+
+### Block-ownership unification — awaiting T4 gate
+
+Commit: `acc719d` — `Unify continuous KV block ownership`
+
+Change:
+
+- Replaced the reference-only `PagedKVCacheManager` with `KVBlockManager`.
+- `KVBlockManager` is now the sole owner of each live request's physical block IDs,
+  committed sequence length, capacity growth, release, and fragmentation accounting.
+- Continuous sequence state references its manager-owned allocation instead of copying
+  a second mutable Python block list.
+- Decode now guarantees capacity first and constructs the GPU block table once. The
+  previous path constructed it before growth and discarded/rebuilt it after growth.
+- The K4 Triton kernel and its tensor contract are unchanged.
+
+Local validation:
+
+- All project Python files parse successfully.
+- KV ownership/growth/release smoke test passed.
+- Synthetic paged allocator workload passed.
+
+T4 acceptance pending:
+
+- Paged manager unit tests.
+- K4 kernel and continuous-generation correctness tests.
+- Width-16 throughput >= 161.8 tok/s.
