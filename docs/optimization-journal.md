@@ -202,3 +202,25 @@ Acceptance gate:
 - Exact deterministic token correctness.
 - No allocation leaks across completion, cancellation, or failure.
 - Throughput within 5% of the pre-refactor K4 baseline before further optimization.
+
+### Pre-refactor K4 throughput baseline
+
+Environment: target T4 environment above. Workload: 16 requests, 32 output tokens per
+request, block size 16, 1,024 physical blocks, with a compilation/cache warmup.
+
+| Maximum active sequences | Elapsed | Throughput | Speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 22.056 s | 23.2 tok/s | 1.00x |
+| 2 | 12.116 s | 42.3 tok/s | 1.82x |
+| 4 | 6.732 s | 76.1 tok/s | 3.28x |
+| 8 | 4.949 s | 103.5 tok/s | 4.46x |
+| 16 | 3.006 s | 170.3 tok/s | 7.34x |
+
+Interpretation:
+
+- Physical batching is working and materially amortizes model-weight reads.
+- Width 16 is the best measured point and processes the workload in one active wave.
+- Scaling is sublinear because prefill remains sequential and decode still has Python
+  metadata construction and per-layer launch overhead.
+- The Phase 2 refactor must retain at least 161.8 tok/s at width 16 (a 5% tolerance)
+  before any further optimization claim is accepted.
