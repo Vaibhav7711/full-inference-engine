@@ -172,40 +172,46 @@ class BatchedSpeculativeEngine:
             if not active:
                 break
             emit_lens = [len(round_emit[i]) for i in active]
-            commit = min(emit_lens)   # tokens all active sequences commit this round
+            commit = min(emit_lens)   # uniform rectangular commit length this round
+            # commit >= 1 always (every sequence emits at least the correction/bonus token).
 
-            # Append committed tokens to outputs; check EOS/length
+            # Append the committed (min) tokens to each active sequence's output.
+            # Sequences that accepted MORE re-propose the rest next round (correct, just
+            # more rounds — no tokens lost, still greedy-equivalent).
             for i in active:
                 for t in round_emit[i][:commit]:
-                    if len(outputs[i]) < max_new_tokens:
+                    if len(outputs[i]) < max_new_tokens and not done[i]:
                         outputs[i].append(t)
                         if t in self.eos_ids:
                             done[i] = True
                 total_accepted += min(accepted_counts[i], commit)
 
-            # Roll BOTH caches back to (prev_len + commit). prev_len = tgt_mask length.
             prev_len = tgt_mask.shape[1]
-            target_len = prev_len + commit
-            # target cache after verify has prev_len + depth; crop to target_len
-            tgt_over = (prev_len + depth) - target_len
+
+            # THE FIX: crop BOTH caches to prev_len + commit - 1 (one short), then decode the
+            # last committed token ONCE. This adds the last committed token exactly once
+            # (avoiding the double-count that corrupted the cache before). The decode's
+            # output gives next_token for the next round, and the cache ends at prev_len+commit.
+            crop_len = prev_len + commit - 1
+
+            tgt_over = (prev_len + depth) - crop_len
             if tgt_over > 0:
                 v_out.past_key_values.crop(-tgt_over)
             tgt_cache = v_out.past_key_values
-            tgt_mask = verify_mask[:, :target_len]
+            tgt_mask = verify_mask[:, :crop_len]
 
-            # draft cache grew by depth during proposal; crop to target_len as well
             drf_len_now = local_drf_mask.shape[1]
-            drf_over = drf_len_now - target_len
+            drf_over = drf_len_now - crop_len
             if drf_over > 0:
                 local_drf_cache.crop(-drf_over)
             drf_cache = local_drf_cache
-            drf_mask = local_drf_mask[:, :target_len]
+            drf_mask = local_drf_mask[:, :crop_len]
 
-            # Next starting token per sequence = the last committed token, re-fed.
+            # The last committed token per sequence = round_emit[i][commit-1].
             last_committed = torch.tensor(
-                [[outputs[i][-1]] if (not done[i] and outputs[i]) else [self.pad_id]
+                [[round_emit[i][commit - 1]] if i in active else [self.pad_id]
                  for i in range(N)], device=self.device)   # [N,1]
-            # Re-decode the last committed token to set up next round's next_token + grow cache by 1
+            # Decode it ONCE: adds it to cache (now at prev_len+commit) and yields next_token.
             tgt_next, tgt_cache, tgt_mask = self._batched_decode(self.target, last_committed, tgt_cache, tgt_mask)
             drf_next, drf_cache, drf_mask = self._batched_decode(self.draft, last_committed, drf_cache, drf_mask)
 
