@@ -231,10 +231,11 @@ class ContinuousBatchingEngine:
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def prefill(self, request: GenerationRequest) -> None:
-        """Prefill seq's prompt with stock attention, scatter K,V into pool, get 1st token."""
-        from engine.cache.paged_cache import PagedCache
+        """Run stock prefill while K/V is written directly into the shared pool."""
+        from engine.cache.pool_cache import PoolBackedPrefillCache
 
-        # Use stock sdpa for prefill (correct, simple). We capture K,V from a PagedCache.
+        # Stock SDPA computes prefill attention; the cache adapter writes the already
+        # RoPE-rotated K/V directly into this engine's authoritative shared pool.
         self.model.config._attn_implementation = "sdpa"
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = "sdpa"
@@ -244,26 +245,14 @@ class ContinuousBatchingEngine:
         if not request.prompt_token_ids:
             raise ValueError("prefill requires prompt_token_ids")
         ids = torch.tensor([request.prompt_token_ids], device=self.device)
-        prompt_len = ids.shape[1]
 
-        scratch = PagedCache(
-            num_layers=self.num_layers,
-            block_size_tokens=self.block_size,
-            initial_blocks=len(request.block_table) + 1,
+        block_table = torch.tensor(
+            request.block_table, dtype=torch.int32, device=self.device
         )
-        out = self.model(input_ids=ids, past_key_values=scratch, use_cache=True, return_dict=True)
-
-        # Scatter each layer's captured (rotated) K,V into the pool at seq's blocks
-        for layer_idx in range(self.num_layers):
-            pl = scratch._paged_layers[layer_idx]
-            k_flat = pl.key_pages.flatten(0, 1)[:prompt_len]     # [prompt_len, kv_heads, D]
-            v_flat = pl.value_pages.flatten(0, 1)[:prompt_len]
-            for pos in range(prompt_len):
-                lb = pos // self.block_size
-                off = pos % self.block_size
-                pb = request.block_table[lb]
-                self.key_pool[layer_idx][pb, off] = k_flat[pos]
-                self.value_pool[layer_idx][pb, off] = v_flat[pos]
+        cache = PoolBackedPrefillCache(self.key_pool, self.value_pool, block_table)
+        out = self.model(
+            input_ids=ids, past_key_values=cache, use_cache=True, return_dict=True
+        )
 
         request.next_token_id = int(out.logits[0, -1, :].argmax().item())
         self.scheduler.mark_decoding(request.request_id)
