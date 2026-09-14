@@ -35,6 +35,7 @@ from typing import Optional
 import torch
 
 from engine.cache.paging import KVBlockManager
+from engine.kernels.kv_write import write_decode_kv
 from engine.kernels.paged_decode_batched import paged_decode_batched
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
@@ -85,23 +86,15 @@ def batched_decode_attention_forward(
 
     N, num_q_heads, one, D = query.shape
     assert one == 1, "batched decode: 1 new token per sequence"
-    kv_heads = key.shape[1]
-    block_size = ctx.block_size
 
     key_pool = ctx.key_pool[layer_idx]      # [num_blocks, block_size, kv_heads, D]
     value_pool = ctx.value_pool[layer_idx]
 
-    # --- Write each sequence's new K,V into the pool at its next slot ---
-    # seq_lens[i] is the length BEFORE this token, so the new token goes at position
-    # seq_lens[i] -> block = seq_lens[i] // block_size, offset = seq_lens[i] % block_size.
-    for i in range(N):
-        pos = int(ctx.seq_lens[i].item())
-        lb = pos // block_size
-        off = pos % block_size
-        pblock = int(ctx.block_tables[i, lb].item())
-        # key[i]: [kv_heads, 1, D] -> [kv_heads, D]
-        key_pool[pblock, off] = key[i, :, 0, :]
-        value_pool[pblock, off] = value[i, :, 0, :]
+    # One kernel writes every sequence's new token. Keeping positions and block-table
+    # lookups on-device avoids 2*N `.item()` synchronizations in every model layer.
+    write_decode_kv(
+        key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens
+    )
 
     # --- Run K4 batched decode: each query attends to its blocks [0 .. seq_lens[i]] ---
     # New per-sequence KV length INCLUDING this token = seq_lens + 1.
