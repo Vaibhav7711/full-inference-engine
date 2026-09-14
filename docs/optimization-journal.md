@@ -380,7 +380,7 @@ T4 result:
 
 Decision: `KEEP`.
 
-### Post-synchronization decode profile — awaiting T4 evidence
+### Post-synchronization decode profile — complete
 
 Commit: `c9bcf82` — `Add continuous decode profiler`
 
@@ -397,7 +397,33 @@ Change:
 - Reports separate top operators by self GPU and self CPU time, including call counts.
 - Saves structured environment, configuration, and operator data for later comparison.
 
-Decision: `DIAGNOSTIC PENDING`; profiler timings will not be presented as throughput.
+T4 evidence (concurrency 16, 31 decode steps, decode only):
+
+- Matrix multiplication remained the largest GPU category: 6,107 `aten::mm` calls and
+  237.7 ms self GPU time. Most are expected model projections and cannot simply be
+  removed.
+- K4 paged attention used 35.8 ms across 868 calls, exactly 28 layers × 31 steps. It is
+  material but no longer the dominant end-to-end bottleneck.
+- The model issued 3,503 reduction chains: `mean` used 35.7 ms, with corresponding
+  `pow`, `rsqrt`, `add`, and multiply kernels. This identifies fused Triton RMSNorm as
+  the next substantial GPU elementwise target; Qwen's extra Q/K norms explain why the
+  count exceeds two normalization sites per transformer layer.
+- There were 40,548 `cudaLaunchKernel` calls and 283.5 ms CPU launch time, confirming
+  that fusion/launch reduction now matters alongside GEMM performance.
+- There were 496 `cudaStreamSynchronize` calls, exactly 16 requests × 31 decode steps.
+  These originate from reading each sampled token separately with CUDA `.item()`.
+  Batching the sampled-token device-to-host transfer can reduce this to one necessary
+  synchronization per decode step before larger RMSNorm work begins.
+- `aten::cat` still appeared 1,767 times and should be localized with a stack/shape
+  trace if it remains prominent after the synchronization and norm passes.
+
+Next order:
+
+1. Batch sampled-token materialization to remove per-request stream synchronizations.
+2. Implement and validate model-compatible Triton RMSNorm, including Q/K norm shapes.
+3. Re-profile before considering SwiGLU or projection-level fusion.
+
+Decision: `DIAGNOSTIC COMPLETE`; no performance claim is made from profiler timings.
 
 ### Persistent decode metadata — accepted
 
