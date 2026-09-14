@@ -256,7 +256,34 @@ T4 result:
 
 Decision: `KEEP`.
 
-### Request and scheduler unification — awaiting T4 gate
+### Persistent decode metadata — awaiting T4 gate
+
+Commit: `5126ade` — `Persist continuous decode metadata buffers`
+
+Hypothesis:
+
+The engine rebuilt input IDs, position IDs, sequence lengths, and block tables as new
+GPU tensors every decode step, including individual Python-driven GPU writes for every
+block-table entry. Persistent buffers should reduce allocation and small-copy overhead.
+
+Change:
+
+- Preallocate pinned-host staging tensors and GPU tensors for all decode metadata.
+- Populate scalar metadata on the host and issue four batched asynchronous copies.
+- Reuse the same storage for every decode iteration.
+- Keep GPU block-table rows at their complete fixed width so the view remains
+  contiguous. The K4 wrapper therefore does not materialize another contiguous table
+  once per transformer layer.
+- The K4 kernel math and KV pool layout remain unchanged.
+
+Risk:
+
+Copying the full fixed-width block-table rows can cost more than rebuilding narrow
+tables for very short contexts. This is an empirical tradeoff and must pass the same
+161.8 tok/s width-16 gate. A later version may use stable fixed request slots and copy
+only dirty block-table rows.
+
+### Request and scheduler unification — accepted
 
 Commit: `90485ba` — `Unify request scheduling with continuous execution`
 
@@ -277,9 +304,13 @@ Change:
 Code-size effect: 250 lines removed and 143 lines added across the refactor, for a net
 reduction of 107 lines while joining the previously disconnected layers.
 
-T4 acceptance pending:
+T4 result:
 
-- Runtime, scheduler, allocator, paging, K4, and full-generation tests pass.
-- Exact output tokens remain unchanged.
-- All blocks return to the manager after generation.
-- Width-16 throughput remains at least 161.8 tok/s.
+- All runtime, scheduler, allocator, paging, K4, and full-generation tests passed.
+- Width-16 throughput was 167.5 tok/s, 2.2% below the 171.2 tok/s immediate baseline
+  and above the 161.8 tok/s acceptance floor.
+- The width-16 speedup was 7.49x relative to that run's 22.4 tok/s sequential path.
+- The batch-one result varied from 23.7 to 22.4 tok/s across separate Colab runs,
+  reinforcing that small comparisons need same-session A/B measurement.
+
+Decision: `KEEP`.
