@@ -1,194 +1,175 @@
-"""M2 benchmark: PagedCache (vectorized paged storage) vs stock DynamicCache.
-
-The headline comparison: M1's naive Python-loop gather cost ~51% overhead. M2's gather
-is vectorized (flatten + slice + transpose, no per-token loop). This benchmark measures
-how much of that 51% the vectorized path recovers.
-
-Three-way comparison:
-    1. stock DynamicCache   — the baseline (model.generate default path)
-    2. PagedCache           — our authoritative block-structured store, batch=1
-    (M1's paged read path numbers are in results/paged_read_path.json for reference)
-
-Note: M2's write path still contains a small per-token Python loop for the scatter
-(handling block-straddling writes explicitly). The decode phase writes 1 token/step, so
-that loop is length-1 during decode — cheap. Prefill writes N tokens once. We measure
-the real end-to-end effect.
-
-Usage:
-    python -m benchmarks.cache.paged_cache_bench \
-        --prompt "Explain KV caching in one sentence." \
-        --max-new-tokens 32 --block-sizes 8,16,32 \
-        --warmup-runs 2 --runs 5 --output results/paged_cache_bench.json
-"""
+"""Compare DynamicCache and the reference PagedCache with identical decode loops."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
-from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
 
 import torch
+from transformers.cache_utils import DynamicCache
+
+from benchmarks.common import assert_repeatable_tokens, environment_record
+from engine.cache.paged_cache import PagedCache
+from engine.model import load_model
 
 
-def _device_info() -> dict:
-    info = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "torch_version": torch.__version__,
-        "cuda_available": torch.cuda.is_available(),
-    }
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        info.update({
-            "gpu_name": torch.cuda.get_device_name(0),
-            "gpu_memory_gb": round(props.total_memory / 1e9, 2),
-            "cuda_version": torch.version.cuda,
-        })
-    try:
-        import transformers
-        info["transformers_version"] = transformers.__version__
-    except Exception:
-        pass
-    return info
+def _eos_ids(model, tokenizer) -> set[int]:
+    configured = model.generation_config.eos_token_id
+    if configured is None:
+        configured = tokenizer.eos_token_id
+    if isinstance(configured, int):
+        return {configured}
+    return set(configured or ())
 
 
-def _time_stock(model, tokenizer, prompt, max_new_tokens, device):
-    ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    prompt_len = ids.shape[1]
+@torch.inference_mode()
+def _run_once(
+    model,
+    tokenizer,
+    device: torch.device,
+    prompt: str,
+    max_new_tokens: int,
+    cache_factory: Callable[[], object],
+) -> dict[str, object]:
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    cache = cache_factory()
+    eos = _eos_ids(model, tokenizer)
+    generated: list[int] = []
+
+    torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
-    ev_s, ev_e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    ev_s.record()
-    with torch.inference_mode():
-        out = model.generate(ids, max_new_tokens=max_new_tokens, do_sample=False,
-                             temperature=None, top_p=None)
-    ev_e.record()
-    torch.cuda.synchronize(device)
-    return out.shape[1] - prompt_len, ev_s.elapsed_time(ev_e)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    output = model(input_ids=input_ids, past_key_values=cache, use_cache=True, return_dict=True)
+    next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    for step in range(max_new_tokens):
+        token_id = int(next_token.item())
+        generated.append(token_id)
+        if token_id in eos or step == max_new_tokens - 1:
+            break
+        output = model(
+            input_ids=next_token,
+            past_key_values=cache,
+            use_cache=True,
+            return_dict=True,
+        )
+        next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
-
-def _time_paged(model, tokenizer, prompt, max_new_tokens, device, num_layers, block_size):
-    from engine.cache.paged_cache import PagedCache
-
-    ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    eos_ids = set()
-    cfg_eos = model.generation_config.eos_token_id
-    if isinstance(cfg_eos, int):
-        eos_ids.add(cfg_eos)
-    elif isinstance(cfg_eos, (list, tuple)):
-        eos_ids.update(cfg_eos)
-
-    torch.cuda.synchronize(device)
-    ev_s, ev_e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    ev_s.record()
-
-    cache = PagedCache(num_layers=num_layers, block_size_tokens=block_size, initial_blocks=4)
-    generated = []
-    with torch.inference_mode():
-        out = model(input_ids=ids, past_key_values=cache, use_cache=True, return_dict=True)
-        nt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        generated.append(int(nt.item()))
-        for _ in range(max_new_tokens - 1):
-            if generated[-1] in eos_ids:
-                break
-            out = model(input_ids=nt, past_key_values=cache, use_cache=True, return_dict=True)
-            nt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated.append(int(nt.item()))
-
-    ev_e.record()
-    torch.cuda.synchronize(device)
-    return len(generated), ev_s.elapsed_time(ev_e)
-
-
-def _run(fn, warmup, runs):
-    for _ in range(warmup):
-        fn()
-    totals, gen = [], 0
-    for _ in range(runs):
-        gen, ms = fn()
-        totals.append(ms)
+    end.record()
+    end.synchronize()
+    snapshot = cache.snapshot() if hasattr(cache, "snapshot") else None
     return {
-        "generated_tokens": gen,
-        "total_ms_mean": statistics.mean(totals),
-        "total_ms_std": statistics.stdev(totals) if len(totals) > 1 else 0.0,
-        "tokens_per_sec": gen / (statistics.mean(totals) / 1000.0),
-        "runs": runs,
+        "token_ids": generated,
+        "elapsed_ms": start.elapsed_time(end),
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "cache_snapshot": snapshot,
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def _measure(
+    run: Callable[[], dict[str, object]], warmup_runs: int, measured_runs: int
+) -> dict[str, object]:
+    for _ in range(warmup_runs):
+        run()
+    measured = [run() for _ in range(measured_runs)]
+    token_runs = [item["token_ids"] for item in measured]
+    assert_repeatable_tokens(token_runs)
+    times = [float(item["elapsed_ms"]) for item in measured]
+    output_tokens = len(token_runs[0])
+    median_ms = statistics.median(times)
+    return {
+        "token_ids": token_runs[0],
+        "output_tokens": output_tokens,
+        "elapsed_ms": {
+            "mean": statistics.mean(times),
+            "median": median_ms,
+            "min": min(times),
+            "max": max(times),
+            "stdev": statistics.stdev(times) if len(times) > 1 else 0.0,
+        },
+        "tokens_per_second_from_median": output_tokens / (median_ms / 1000),
+        "peak_allocated_bytes_max": max(int(item["peak_allocated_bytes"]) for item in measured),
+        "peak_reserved_bytes_max": max(int(item["peak_reserved_bytes"]) for item in measured),
+        "cache_snapshot": measured[-1]["cache_snapshot"],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fair DynamicCache/PagedCache comparison")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--prompt", default="Explain KV caching in one sentence.")
+    parser.add_argument("--revision", default=None)
+    parser.add_argument("--prompt", default="Explain paged KV caching in one sentence.")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--block-sizes", default="8,16,32")
     parser.add_argument("--warmup-runs", type=int, default=2)
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--output", default="results/paged_cache_bench.json")
+    parser.add_argument("--output", type=Path, default=Path("results/paged_cache_bench.json"))
     args = parser.parse_args()
+    if args.max_new_tokens < 1 or args.warmup_runs < 0 or args.runs < 1:
+        parser.error("invalid token count or run count")
+    block_sizes = [int(value) for value in args.block_sizes.split(",")]
+    if not block_sizes or any(value <= 0 for value in block_sizes):
+        parser.error("block sizes must be positive")
 
-    if not torch.cuda.is_available():
-        raise SystemExit("This benchmark requires CUDA.")
-
-    device = torch.device("cuda")
-    block_sizes = [int(b) for b in args.block_sizes.split(",")]
-
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    print(f"Loading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float16, device_map="cuda", trust_remote_code=True,
-    )
-    model.eval()
+    loaded = load_model(args.model, revision=args.revision, dtype=args.dtype)
+    model, tokenizer, device = loaded.model, loaded.tokenizer, loaded.device
     model.config._attn_implementation = "sdpa"
-    num_layers = model.config.num_hidden_layers
+    if hasattr(model.config, "_attn_implementation_internal"):
+        model.config._attn_implementation_internal = "sdpa"
 
-    results = {"device_info": _device_info(), "config": vars(args), "runs": {}}
-
-    # Baseline: stock DynamicCache
-    print("\n=== Baseline (stock DynamicCache) ===")
-    baseline = _run(
-        lambda: _time_stock(model, tokenizer, args.prompt, args.max_new_tokens, device),
-        args.warmup_runs, args.runs,
+    common = (model, tokenizer, device, args.prompt, args.max_new_tokens)
+    baseline = _measure(
+        lambda: _run_once(*common, cache_factory=DynamicCache),
+        args.warmup_runs,
+        args.runs,
     )
-    results["runs"]["dynamic_cache_baseline"] = baseline
-    print(f"  {baseline['tokens_per_sec']:.1f} tok/s  total={baseline['total_ms_mean']:.1f}ms "
-          f"(+/- {baseline['total_ms_std']:.1f})")
-
-    # PagedCache per block size
-    for bs in block_sizes:
-        print(f"\n=== PagedCache (block_size={bs}) ===")
-        res = _run(
-            lambda bs=bs: _time_paged(model, tokenizer, args.prompt, args.max_new_tokens,
-                                      device, num_layers, bs),
-            args.warmup_runs, args.runs,
+    variants: dict[str, object] = {"dynamic_cache": baseline}
+    for block_size in block_sizes:
+        result = _measure(
+            lambda size=block_size: _run_once(
+                *common,
+                cache_factory=lambda: PagedCache(
+                    num_layers=model.config.num_hidden_layers,
+                    block_size_tokens=size,
+                    initial_blocks=4,
+                ),
+            ),
+            args.warmup_runs,
+            args.runs,
         )
-        overhead = (res["total_ms_mean"] / baseline["total_ms_mean"] - 1.0) * 100
-        res["overhead_pct_vs_baseline"] = overhead
-        results["runs"][f"paged_block{bs}"] = res
-        print(f"  {res['tokens_per_sec']:.1f} tok/s  total={res['total_ms_mean']:.1f}ms  "
-              f"overhead=+{overhead:.1f}% vs DynamicCache")
+        if result["token_ids"] != baseline["token_ids"]:
+            raise RuntimeError(f"PagedCache block size {block_size} changed generated tokens")
+        baseline_ms = float(baseline["elapsed_ms"]["median"])
+        result["latency_change_pct"] = (
+            float(result["elapsed_ms"]["median"]) / baseline_ms - 1.0
+        ) * 100
+        variants[f"paged_block_{block_size}"] = result
 
-    # Summary
-    print(f"\n{'='*66}")
-    print("M2 PagedCache — Vectorized Paged Storage vs Stock DynamicCache")
-    print(f"{'='*66}")
-    print(f"{'Config':<26} {'Tok/s':>8} {'Total ms':>10} {'Overhead':>12}")
-    print("-" * 58)
-    b = results["runs"]["dynamic_cache_baseline"]
-    print(f"{'dynamic_cache_baseline':<26} {b['tokens_per_sec']:>8.1f} {b['total_ms_mean']:>10.1f} {'—':>12}")
-    for bs in block_sizes:
-        r = results["runs"][f"paged_block{bs}"]
-        print(f"{'paged_block'+str(bs):<26} {r['tokens_per_sec']:>8.1f} {r['total_ms_mean']:>10.1f} "
-              f"{'+'+format(r['overhead_pct_vs_baseline'],'.1f')+'%':>12}")
-
-    print("\nCompare against M1 naive-gather overhead (~51%) in results/paged_read_path.json")
-
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"Saved -> {args.output}")
+    record = {
+        **environment_record(device),
+        "model": {
+            "name": loaded.model_name,
+            "requested_revision": loaded.requested_revision,
+            "resolved_revision": loaded.resolved_revision,
+            "dtype": str(loaded.dtype),
+        },
+        "workload": {
+            "prompt_tokens": len(tokenizer(args.prompt).input_ids),
+            "max_new_tokens": args.max_new_tokens,
+            "warmup_runs": args.warmup_runs,
+            "measured_runs": args.runs,
+            "block_sizes": block_sizes,
+        },
+        "variants": variants,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2) + "\n")
+    print(json.dumps(record, indent=2))
 
 
 if __name__ == "__main__":
