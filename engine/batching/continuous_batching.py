@@ -131,6 +131,8 @@ class ContinuousBatchingEngine:
 
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16):
+        if num_blocks <= 0 or block_size <= 0 or max_active <= 0:
+            raise ValueError("num_blocks, block_size, and max_active must be positive")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -157,6 +159,23 @@ class ContinuousBatchingEngine:
             for _ in range(self.num_layers)
         ]
         self.value_pool = [torch.zeros_like(k) for k in self.key_pool]
+
+        # Decode metadata has a fixed upper bound. Keep both pinned-host staging and
+        # GPU tensors alive for the engine lifetime so each token step performs a few
+        # batched copies rather than allocating tensors and launching one scalar copy
+        # per block-table entry.
+        self._host_input_ids = torch.empty((max_active, 1), dtype=torch.long, pin_memory=True)
+        self._host_position_ids = torch.empty((max_active, 1), dtype=torch.long, pin_memory=True)
+        self._host_seq_lens = torch.empty((max_active,), dtype=torch.int32, pin_memory=True)
+        self._host_block_tables = torch.empty(
+            (max_active, num_blocks), dtype=torch.int32, pin_memory=True
+        )
+        self._device_input_ids = torch.empty((max_active, 1), dtype=torch.long, device=device)
+        self._device_position_ids = torch.empty((max_active, 1), dtype=torch.long, device=device)
+        self._device_seq_lens = torch.empty((max_active,), dtype=torch.int32, device=device)
+        self._device_block_tables = torch.empty(
+            (max_active, num_blocks), dtype=torch.int32, device=device
+        )
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
@@ -165,6 +184,35 @@ class ContinuousBatchingEngine:
         # Register the batched attention fn once.
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         ALL_ATTENTION_FUNCTIONS[self.ATTN_NAME] = batched_decode_attention_forward
+
+    def _prepare_decode_metadata(
+        self, active: list[GenerationRequest]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stage one compact decode batch into persistent GPU metadata buffers."""
+        count = len(active)
+        if count > self.max_active:
+            raise ValueError("active batch exceeds max_active")
+        for row, request in enumerate(active):
+            allocation = request.allocation
+            if allocation is None or request.next_token_id is None:
+                raise RuntimeError("decode request is missing token or KV allocation")
+            self._host_input_ids[row, 0] = request.next_token_id
+            self._host_position_ids[row, 0] = allocation.sequence_length
+            self._host_seq_lens[row] = allocation.sequence_length
+            for column, physical_block in enumerate(request.block_table):
+                self._host_block_tables[row, column] = physical_block
+
+        input_ids = self._device_input_ids[:count]
+        position_ids = self._device_position_ids[:count]
+        seq_lens = self._device_seq_lens[:count]
+        # Keep the complete row width so this view is contiguous. The Triton kernel
+        # indexes only blocks covered by seq_lens; unused columns are never read.
+        block_tables = self._device_block_tables[:count]
+        input_ids.copy_(self._host_input_ids[:count], non_blocking=True)
+        position_ids.copy_(self._host_position_ids[:count], non_blocking=True)
+        seq_lens.copy_(self._host_seq_lens[:count], non_blocking=True)
+        block_tables.copy_(self._host_block_tables[:count], non_blocking=True)
+        return input_ids, position_ids, block_tables, seq_lens
 
     def reset(self) -> None:
         """Reinitialize the allocator (fresh free-block list) for a clean run.
@@ -239,27 +287,13 @@ class ContinuousBatchingEngine:
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = self.ATTN_NAME
 
-        # Build batched inputs
-        input_ids = torch.tensor([[s.next_token_id] for s in active], device=self.device)  # [N,1]
-        position_ids = torch.tensor(
-            [[s.allocation.sequence_length] for s in active], device=self.device
-        )  # [N,1]
-
         # Ensure each sequence has a block for its new token (grow if at a boundary)
         for s in active:
             target_length = s.allocation.sequence_length + 1
             if not self.block_manager.ensure_capacity(s.request_id, target_length):
                 raise RuntimeError(f"pool exhausted growing {s.request_id}")
 
-        # Build metadata once, after all possible block-table growth.
-        seq_lens = torch.tensor(
-            [s.allocation.sequence_length for s in active], dtype=torch.int32, device=self.device
-        )
-        max_blocks = max(len(s.block_table) for s in active)
-        block_tables = torch.zeros((N, max_blocks), dtype=torch.int32, device=self.device)
-        for i, s in enumerate(active):
-            for j, pb in enumerate(s.block_table):
-                block_tables[i, j] = pb
+        input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(active)
 
         # Stash context for the attention fn
         _set_batch_ctx(_BatchContext(
