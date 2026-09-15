@@ -966,7 +966,7 @@ throughput, or arbitrary production traffic.
 
 ## Phase 5 — T4 paged-decode attention regimes
 
-Status: `IN PROGRESS`
+Status: `COMPLETE — KEEP`
 
 ### Measured tile selection
 
