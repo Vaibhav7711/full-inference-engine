@@ -138,6 +138,11 @@ class ContinuousBatchingEngine:
         self.num_q_heads = cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
 
+        # Qwen uses RMSNorm for hidden states and for per-head Q/K normalization.
+        # Install one FP32-accumulating Triton kernel for both shapes before warmup.
+        from engine.kernels.rmsnorm import install_triton_rmsnorm
+        self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
+
         self.eos_ids = set()
         ce = model.generation_config.eos_token_id
         if isinstance(ce, int):
