@@ -1064,3 +1064,40 @@ Decision: `KEEP` the INT8 mode for its 49.2% KV-storage reduction and validated
 long-context kernel benefit. Do not claim an end-to-end throughput gain on this T4
 workload. Use it as an explicit capacity/long-context option; keep FP16 as the default
 latency-oriented mode.
+
+## Phase 7 — Fixed-width paged CUDA-Graph decode buckets
+
+Status: `COMPLETE — KEEP AS SATURATED-BATCH FAST PATH`
+
+CUDA Graphs require stable tensor addresses and launch shapes, but paged continuous
+decode already owns persistent device buffers for input IDs, positions, sequence lengths,
+and full-width block tables. A capture therefore remains valid when the *contents* of
+per-request page tables and lengths differ; only the active batch width and selected
+kernel regime must stay fixed.
+
+Implementation:
+
+- Added a graph capture helper around the real paged decode model forward, including
+  direct K/V writes and paged attention kernels.
+- `ContinuousBatchingEngine(cuda_graph_batch_size=16)` captures lazily on the first
+  full width-16 decode step and replays only that fixed bucket. Partial batches and all
+  other widths keep the normal dynamic model-forward path.
+- Capture writes the pending K/V slot once, then the immediate replay overwrites that
+  same slot before normal request-state advancement. Subsequent replays use fresh device
+  metadata copied by the existing scheduler path.
+
+Validation and measurement:
+
+- A fixed-width real-paged-forward microbenchmark measured 37.16 ms ordinary versus
+  9.65 ms graph replay (3.85x), with identical logits.
+- A deliberately mixed-length width-16 bucket measured 40.56 ms ordinary versus
+  9.46 ms replay (4.29x), again with identical logits. Variable per-row lengths are
+  graph-safe because they are device data; variable tensor addresses/shapes are not.
+- The end-to-end graph-bucket token-equivalence test passed.
+- On the 16-request, 32-token continuous-throughput gate, width 16 reached 962.4 tok/s
+  in 0.532 s, a 32.85x speedup over the same run's 29.3 tok/s sequential path.
+
+Decision: `KEEP`. Claim this result only for a stable saturated width-16 decode bucket
+on the measured T4 setup. Do not generalize it to partial batches, changing batch widths,
+capture construction cost, or arbitrary arrival/departure patterns; those continue on
+the ordinary dynamic path.
