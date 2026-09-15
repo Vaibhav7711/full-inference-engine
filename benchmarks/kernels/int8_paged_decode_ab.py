@@ -17,19 +17,33 @@ def _parse_ints(value: str) -> list[int]:
     return parsed
 
 
-def _median_ms(callable_, warmup: int, repeats: int) -> float:
-    for _ in range(warmup):
-        callable_()
+def _one_ms(callable_) -> float:
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    callable_()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end)
+
+
+def _paired_rounds(fp16_call, int8_call, warmup: int, repeats: int, rounds: int) -> tuple[list[float], list[float]]:
+    """Interleave variants so clocks or thermal drift cannot favor one side."""
+    for index in range(warmup):
+        (fp16_call if index % 2 == 0 else int8_call)()
     torch.cuda.synchronize()
-    samples = []
-    for _ in range(repeats):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        callable_()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end))
-    return statistics.median(samples)
+    fp16_rounds, int8_rounds = [], []
+    for _ in range(rounds):
+        fp16_samples, int8_samples = [], []
+        for index in range(repeats):
+            if index % 2 == 0:
+                fp16_samples.append(_one_ms(fp16_call))
+                int8_samples.append(_one_ms(int8_call))
+            else:
+                int8_samples.append(_one_ms(int8_call))
+                fp16_samples.append(_one_ms(fp16_call))
+        fp16_rounds.append(statistics.median(fp16_samples))
+        int8_rounds.append(statistics.median(int8_samples))
+    return fp16_rounds, int8_rounds
 
 
 def _case(batch: int, sequence_length: int, block_size: int = 16):
@@ -56,6 +70,7 @@ def main() -> None:
     parser.add_argument("--batches", default="1,16")
     parser.add_argument("--warmup", type=int, default=12)
     parser.add_argument("--repeats", type=int, default=40)
+    parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--output", default="results/int8_paged_decode_ab.json")
     args = parser.parse_args()
     if not torch.cuda.is_available():
@@ -66,7 +81,7 @@ def main() -> None:
 
     results: dict[str, object] = {"config": vars(args), "rows": []}
     print("\nINT8 paged decode A/B (Qwen3-0.6B geometry: H=16, KVH=8, D=128)")
-    print(f"{'context':>8} {'batch':>6} {'fp16 ms':>10} {'int8 ms':>10} {'speedup':>9} {'rel err':>9} {'KV save':>9}")
+    print(f"{'context':>8} {'batch':>6} {'fp16 ms':>10} {'int8 ms':>10} {'speedup':>9} {'range':>13} {'rel err':>9} {'KV save':>9}")
     for sequence_length in _parse_ints(args.seq_lens):
         for batch in _parse_ints(args.batches):
             tensors = _case(batch, sequence_length)
@@ -78,8 +93,11 @@ def main() -> None:
             fp16_output = fp16_call()
             int8_output = int8_call()
             torch.cuda.synchronize()
-            fp16_ms = _median_ms(fp16_call, args.warmup, args.repeats)
-            int8_ms = _median_ms(int8_call, args.warmup, args.repeats)
+            fp16_rounds, int8_rounds = _paired_rounds(
+                fp16_call, int8_call, args.warmup, args.repeats, args.rounds,
+            )
+            fp16_ms, int8_ms = statistics.median(fp16_rounds), statistics.median(int8_rounds)
+            round_speedups = [left / right for left, right in zip(fp16_rounds, int8_rounds)]
             relative_error = float(
                 (int8_output.float() - fp16_output.float()).abs().mean()
                 / fp16_output.float().abs().mean().clamp_min(1e-5)
@@ -90,13 +108,17 @@ def main() -> None:
                 "sequence_length": sequence_length, "batch": batch,
                 "fp16_median_ms": fp16_ms, "int8_median_ms": int8_ms,
                 "int8_over_fp16_speedup": fp16_ms / int8_ms,
+                "round_speedups": round_speedups,
+                "round_speedup_min": min(round_speedups),
+                "round_speedup_max": max(round_speedups),
                 "relative_output_error": relative_error,
                 "fp16_kv_bytes": fp16_bytes, "int8_kv_bytes_including_scales": int8_bytes,
                 "kv_storage_reduction_fraction": 1 - int8_bytes / fp16_bytes,
             }
             results["rows"].append(row)
             print(f"{sequence_length:>8} {batch:>6} {fp16_ms:>10.4f} {int8_ms:>10.4f} "
-                  f"{row['int8_over_fp16_speedup']:>8.2f}x {relative_error:>9.4f} "
+                  f"{row['int8_over_fp16_speedup']:>8.2f}x "
+                  f"{min(round_speedups):>5.2f}-{max(round_speedups):>5.2f}x {relative_error:>9.4f} "
                   f"{row['kv_storage_reduction_fraction']:>8.1%}")
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as handle:
