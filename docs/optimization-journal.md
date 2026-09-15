@@ -638,8 +638,6 @@ Gate:
 - End-to-end width-16 throughput must remain at least 248.7 tok/s (within 5% of the
   immediate 261.8 tok/s accepted baseline).
 
-Decision: `PENDING T4 MEASUREMENT`.
-
 First batched-prefill T4 gate attempt:
 
 - All 12 focused KV-write and fused-kernel tests passed.
@@ -948,4 +946,20 @@ First T4 gate and root-cause repair:
   preservation of the original shared mapping. The full T4 integration test remains the
   authoritative token-equivalence gate.
 
-Decision: `PENDING T4 MEASUREMENT`.
+Final repaired T4 gate:
+
+- The focused exact-prefix full-model test passed, including token-identical eight-token
+  greedy generation through copy-on-write decode.
+- The repeated prompt contained 871 tokens and occupied 55 physical cache blocks.
+- Same-engine warmed cache-miss TTFT was 343.70 ms.
+- Exact cache-hit median TTFT was 3.11 ms, a measured 110.42x improvement.
+- All 871 prompt tokens were reused. This exact-hit path also reuses the cached first
+  token decision; it is intentionally stronger than a general shared system prefix
+  followed by a new suffix, which still requires residual paged prefill.
+- Width-16 miss-only throughput was 406.0 tok/s with 16.65x scaling over the same run's
+  24.4 tok/s sequential path. This is 1.9% below the 413.8 tok/s pre-cache baseline and
+  above the 393.1 tok/s acceptance floor.
+
+Decision: `KEEP`. Claim 110.42x TTFT only for the measured warmed exact-prompt hit. Do
+not generalize it to partial-prefix hits, cold cache operation, multi-token decode
+throughput, or arbitrary production traffic.
