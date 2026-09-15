@@ -20,6 +20,9 @@ def _w8a16_linear_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
+    # One output-channel scale applies to every K tile; keep it in registers rather
+    # than reloading it inside the reduction loop.
+    scales = tl.load(scale_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float16)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for start_k in range(0, K, BLOCK_K):
         x = tl.load(
@@ -30,7 +33,6 @@ def _w8a16_linear_kernel(
             w_ptr + offs_n[None, :] * stride_wn + (start_k + offs_k[:, None]) * stride_wk,
             mask=(offs_n[None, :] < N) & (start_k + offs_k[:, None] < K), other=0,
         ).to(tl.float16)
-        scales = tl.load(scale_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float16)
         accumulator += tl.dot(x, weight * scales[None, :])
     if HAS_BIAS:
         accumulator += tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
@@ -57,7 +59,7 @@ def w8a16_linear(inputs: torch.Tensor, qweight: torch.Tensor, scales: torch.Tens
     if K % 32:
         raise ValueError("W8A16 kernel requires input width divisible by 32")
     output = torch.empty((M, N), dtype=inputs.dtype, device=inputs.device)
-    block_m, block_n, block_k = 16, 64, 32
+    block_m, block_n, block_k = 16, 128, 64
     _w8a16_linear_kernel[(triton.cdiv(M, block_m), triton.cdiv(N, block_n))](
         inputs, qweight, scales, bias if bias is not None else output, output,
         M, N, K, inputs.stride(0), inputs.stride(1), qweight.stride(0), qweight.stride(1),
