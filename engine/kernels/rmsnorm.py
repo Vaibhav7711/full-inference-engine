@@ -101,7 +101,9 @@ def install_triton_rmsnorm(model: torch.nn.Module) -> int:
         if hasattr(module, "_pre_triton_rmsnorm_forward"):
             installed += 1
             continue
-        module._pre_triton_rmsnorm_forward = module.forward
+        # Store the unbound function, not a bound method that references `module`
+        # from an attribute on itself and creates a GPU-model retention cycle.
+        module._pre_triton_rmsnorm_forward = module.forward.__func__
         module.forward = MethodType(_triton_rmsnorm_forward, module)
         installed += 1
     if installed == 0:
@@ -116,7 +118,7 @@ def uninstall_triton_rmsnorm(model: torch.nn.Module) -> int:
         original = getattr(module, "_pre_triton_rmsnorm_forward", None)
         if original is None:
             continue
-        module.forward = original
+        module.forward = MethodType(original, module)
         del module._pre_triton_rmsnorm_forward
         restored += 1
     return restored

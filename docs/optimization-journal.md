@@ -621,6 +621,9 @@ Architecture change:
   tests so production retains one authoritative prefill implementation.
 - Added mixed-length first-token equivalence, padding isolation, physical block mapping,
   and full generation coverage.
+- Changed reversible RMSNorm/SwiGLU installers to retain unbound original functions,
+  avoiding self-referential bound-method cycles that delayed GPU model reclamation in
+  multi-test Colab processes.
 
 Measurement:
 

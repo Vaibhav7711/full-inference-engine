@@ -49,7 +49,7 @@ def install_triton_qwen_swiglu(model: torch.nn.Module) -> int:
         if module.__class__.__name__.lower() != "qwen3mlp":
             continue
         if not hasattr(module, "_pre_triton_swiglu_forward"):
-            module._pre_triton_swiglu_forward = module.forward
+            module._pre_triton_swiglu_forward = module.forward.__func__
             module.forward = MethodType(_triton_qwen_mlp_forward, module)
         installed += 1
     if installed == 0:
@@ -63,7 +63,7 @@ def uninstall_triton_qwen_swiglu(model: torch.nn.Module) -> int:
         original = getattr(module, "_pre_triton_swiglu_forward", None)
         if original is None:
             continue
-        module.forward = original
+        module.forward = MethodType(original, module)
         del module._pre_triton_swiglu_forward
         restored += 1
     return restored
