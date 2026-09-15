@@ -1003,3 +1003,20 @@ Decision: `KEEP`. Attribute the 20--42% improvement only to the measured isolate
 long-context attention-kernel cases. Do not attribute the 483.1 tok/s short-prompt
 result to this policy: those prompts select the unchanged `64x4` regime and Colab
 end-to-end runs vary with runtime warm state.
+
+## Phase 6 — Kernel-native INT8 paged KV
+
+Status: `IN PROGRESS`
+
+The existing INT8 KV cache is a memory-and-quality reference only: it reconstructs the
+entire cache as FP16 before attention, so it cannot be used to claim serving throughput.
+Phase 6 starts with a separate decode-only Triton path. It quantizes each incoming K/V
+head vector directly into INT8 paged storage with one FP16 symmetric scale, then loads
+and dequantizes each vector inside the online paged-attention kernel. No full FP16 KV
+materialization is permitted in this path.
+
+The first gate covers writer agreement with the PyTorch per-vector quantization
+reference and attention error against the existing FP16 paged kernel at 64, 256, and
+1,024-token contexts. Integration with chunked prefill, copy-on-write prefix tails,
+and the online scheduler is explicitly deferred until this isolated CUDA gate and a
+long-context latency A/B measurement pass.
