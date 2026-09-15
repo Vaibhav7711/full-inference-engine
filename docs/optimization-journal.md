@@ -603,7 +603,7 @@ Final T4 result:
 Decision: `KEEP`. End the elementwise-fusion pass here and return to architectural work;
 the next phase is true batched/chunked prefill.
 
-### Mixed-length batched prefill — awaiting T4 gate
+### Mixed-length batched prefill — accepted
 
 Commit: `b728915` — `Batch mixed-length prompt prefill`
 
@@ -651,6 +651,22 @@ First batched-prefill T4 gate attempt:
   RoPE wrapper accepted only materialized `[B,S,D]` tables.
 - Repair: accept either leading dimension and expand `[1,S,D]` as a zero-batch-stride
   view. This preserves broadcasting without allocating or copying the tables.
+
+Final T4 result:
+
+- The affected fused-op and all five continuous-generation tests passed; the fail-fast
+  gate also completed the isolated prefill A/B without a token mismatch.
+- Sequential throughput was 24.7 tok/s.
+- Width-4 throughput reached 106.2 tok/s.
+- Width-8 throughput reached 214.2 tok/s, up 29.5% from 165.4 tok/s.
+- Width-16 throughput reached 413.8 tok/s, up 58.1% from 261.8 tok/s.
+- Width-16 end-to-end scaling reached 16.74x over the same run's sequential path.
+- The gain grows with concurrency because the previous engine executed every admitted
+  prompt as a separate full-model forward before entering batched decode. The new path
+  amortizes model-weight reads across prompt rows and removes that serial prefill region.
+
+Decision: `KEEP`. This is an architectural throughput improvement, not a profiler-only
+or micro-kernel claim.
 
 ### Persistent decode metadata — accepted
 
