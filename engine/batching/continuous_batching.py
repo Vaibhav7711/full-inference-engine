@@ -197,7 +197,8 @@ class ContinuousBatchingEngine:
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,
                  kv_cache_dtype: str = "fp16",
-                 cuda_graph_batch_size: int | None = None):
+                 cuda_graph_batch_size: int | None = None,
+                 cuda_graph_batch_sizes: tuple[int, ...] | None = None):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
@@ -205,8 +206,14 @@ class ContinuousBatchingEngine:
             raise ValueError("prefix_cache_blocks must be non-negative")
         if kv_cache_dtype not in {"fp16", "int8"}:
             raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
-        if cuda_graph_batch_size is not None and not 0 < cuda_graph_batch_size <= max_active:
-            raise ValueError("cuda_graph_batch_size must be within [1, max_active]")
+        if cuda_graph_batch_size is not None and cuda_graph_batch_sizes is not None:
+            raise ValueError("use cuda_graph_batch_size or cuda_graph_batch_sizes, not both")
+        if cuda_graph_batch_sizes is None and cuda_graph_batch_size is not None:
+            cuda_graph_batch_sizes = (cuda_graph_batch_size,)
+        if cuda_graph_batch_sizes is not None:
+            cuda_graph_batch_sizes = tuple(sorted(set(cuda_graph_batch_sizes)))
+            if not cuda_graph_batch_sizes or any(not 0 < size <= max_active for size in cuda_graph_batch_sizes):
+                raise ValueError("graph bucket sizes must be within [1, max_active]")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -217,7 +224,7 @@ class ContinuousBatchingEngine:
         self.max_waiting_requests = max_waiting_requests
         self.prefix_cache_blocks = prefix_cache_blocks
         self.kv_cache_dtype = kv_cache_dtype
-        self.cuda_graph_batch_size = cuda_graph_batch_size
+        self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or ()
         self._decode_graphs = {}
 
         cfg = model.config
@@ -277,6 +284,7 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
+        self._reserve_graph_dummy_blocks()
         self.prefix_cache = PrefixCache(self.block_manager, prefix_cache_blocks)
         self.scheduler = FCFSScheduler(
             self.block_manager, max_waiting_requests=max_waiting_requests,
@@ -288,13 +296,29 @@ class ContinuousBatchingEngine:
         ALL_ATTENTION_FUNCTIONS[self.ATTN_NAME] = batched_decode_attention_forward
         ALL_ATTENTION_FUNCTIONS[self.PREFILL_ATTN_NAME] = chunked_prefill_attention_forward
 
+    def _reserve_graph_dummy_blocks(self) -> None:
+        """Reserve permanent, non-customer pages for padded CUDA-Graph rows."""
+        self._graph_dummy_blocks: list[int] = []
+        if not self.cuda_graph_batch_sizes:
+            return
+        required = max(self.cuda_graph_batch_sizes) - 1
+        if required <= 0:
+            return
+        allocation = self.block_manager.reserve("__cuda_graph_dummy_rows__", required * self.block_size)
+        if allocation is None:
+            raise ValueError("insufficient KV blocks to reserve CUDA-Graph dummy rows")
+        self._graph_dummy_blocks = allocation.physical_block_ids
+
     def _prepare_decode_metadata(
-        self, active: list[GenerationRequest]
+        self, active: list[GenerationRequest], *, graph_bucket_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Stage one compact decode batch into persistent GPU metadata buffers."""
         count = len(active)
+        row_count = graph_bucket_size or count
         if count > self.max_active:
             raise ValueError("active batch exceeds max_active")
+        if row_count < count or row_count > self.max_active:
+            raise ValueError("invalid graph bucket size")
         for row, request in enumerate(active):
             allocation = request.allocation
             if allocation is None or request.next_token_id is None:
@@ -305,16 +329,28 @@ class ContinuousBatchingEngine:
             for column, physical_block in enumerate(request.block_table):
                 self._host_block_tables[row, column] = physical_block
 
-        input_ids = self._device_input_ids[:count]
-        position_ids = self._device_position_ids[:count]
-        seq_lens = self._device_seq_lens[:count]
+        if row_count > count:
+            if len(self._graph_dummy_blocks) < row_count:
+                raise RuntimeError("graph dummy blocks were not reserved for this bucket")
+            pad_token = self.tokenizer.pad_token_id
+            if pad_token is None:
+                pad_token = next(iter(self.eos_ids), 0)
+            for row in range(count, row_count):
+                self._host_input_ids[row, 0] = pad_token
+                self._host_position_ids[row, 0] = 0
+                self._host_seq_lens[row] = 0
+                self._host_block_tables[row, 0] = self._graph_dummy_blocks[row]
+
+        input_ids = self._device_input_ids[:row_count]
+        position_ids = self._device_position_ids[:row_count]
+        seq_lens = self._device_seq_lens[:row_count]
         # Keep the complete row width so this view is contiguous. The Triton kernel
         # indexes only blocks covered by seq_lens; unused columns are never read.
-        block_tables = self._device_block_tables[:count]
-        input_ids.copy_(self._host_input_ids[:count], non_blocking=True)
-        position_ids.copy_(self._host_position_ids[:count], non_blocking=True)
-        seq_lens.copy_(self._host_seq_lens[:count], non_blocking=True)
-        block_tables.copy_(self._host_block_tables[:count], non_blocking=True)
+        block_tables = self._device_block_tables[:row_count]
+        input_ids.copy_(self._host_input_ids[:row_count], non_blocking=True)
+        position_ids.copy_(self._host_position_ids[:row_count], non_blocking=True)
+        seq_lens.copy_(self._host_seq_lens[:row_count], non_blocking=True)
+        block_tables.copy_(self._host_block_tables[:row_count], non_blocking=True)
         return input_ids, position_ids, block_tables, seq_lens
 
     def reset(self) -> None:
@@ -327,6 +363,7 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=self.key_pool[0].shape[0], block_size_tokens=self.block_size,
         )
+        self._reserve_graph_dummy_blocks()
         self.prefix_cache = PrefixCache(self.block_manager, self.prefix_cache_blocks)
         self.scheduler = FCFSScheduler(
             self.block_manager, max_waiting_requests=self.max_waiting_requests,
@@ -643,12 +680,17 @@ class ContinuousBatchingEngine:
         if not active:
             return
 
-        input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(active)
         max_sequence_length = max(
             request.allocation.sequence_length + 1 for request in active
         )
         decode_block_n, decode_num_warps = select_paged_decode_config(
             max_sequence_length, len(active)
+        )
+        graph_bucket_size = next(
+            (size for size in self.cuda_graph_batch_sizes if size >= len(active)), None
+        )
+        input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(
+            active, graph_bucket_size=graph_bucket_size,
         )
 
         # Stash context for the attention fn
@@ -658,14 +700,14 @@ class ContinuousBatchingEngine:
             decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
         )
-        graph_key = (len(active), decode_block_n, decode_num_warps)
-        use_graph = self.cuda_graph_batch_size == len(active)
+        graph_key = (graph_bucket_size, decode_block_n, decode_num_warps)
+        use_graph = graph_bucket_size is not None
         if use_graph:
             graph = self._decode_graphs.get(graph_key)
             if graph is None:
                 from engine.graphs import capture_paged_decode_graph
                 graph = capture_paged_decode_graph(
-                    self, batch_size=len(active), block_n=decode_block_n,
+                    self, batch_size=graph_bucket_size, block_n=decode_block_n,
                     num_warps=decode_num_warps,
                 )
                 self._decode_graphs[graph_key] = graph
@@ -681,7 +723,7 @@ class ContinuousBatchingEngine:
                 _clear_batch_ctx()
 
         # Sample next token per sequence, advance state
-        next_tokens = logits[:, -1, :].argmax(dim=-1)   # [N]
+        next_tokens = logits[:len(active), -1, :].argmax(dim=-1)   # real rows only
         for i, s in enumerate(active):
             self.block_manager.append_tokens(s.request_id)
             tok = int(next_tokens[i].item())

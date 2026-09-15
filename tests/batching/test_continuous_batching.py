@@ -305,6 +305,25 @@ def test_fixed_width_cuda_graph_bucket_matches_reference():
 
 @cuda
 @requires_cuda
+def test_padded_cuda_graph_bucket_matches_reference():
+    """Three live rows may safely replay a width-four graph with one dummy KV page."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    prompts = ["The capital of France is", "2 + 2 =", "Water is composed of"]
+    refs = [_reference_greedy(model, tok, prompt, 3) for prompt in prompts]
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=512, max_active=4, prefix_cache_blocks=0,
+        cuda_graph_batch_sizes=(2, 4),
+    )
+    outputs = eng.generate(prompts, max_new_tokens=3)
+    assert outputs == refs
+    assert any(key[0] == 4 for key in eng._decode_graphs)
+    assert len(eng._graph_dummy_blocks) == 3
+
+
+@cuda
+@requires_cuda
 def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
     """A prompt spanning several resumable chunks remains token-identical."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
