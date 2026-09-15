@@ -74,13 +74,20 @@ def main() -> None:
     result = {
         "config": vars(args), "total_tokens": total_tokens, "elapsed_s": elapsed,
         "throughput_tok_s": total_tokens / elapsed,
-        "ttft_p50_ms": statistics.median(ttft), "ttft_p95_ms": _percentile(ttft, 0.95),
+        # Starlette TestClient buffers StreamingResponse bodies, so this is the time at
+        # which its first event becomes visible, not wire-level streaming TTFT.
+        "testclient_first_event_p50_ms": statistics.median(ttft),
+        "testclient_first_event_p95_ms": _percentile(ttft, 0.95),
         "completion_p50_ms": statistics.median(completion),
-        "completion_p95_ms": _percentile(completion, 0.95), "samples": samples,
+        "completion_p95_ms": _percentile(completion, 0.95), "streaming_ttft_valid": False,
+        "note": "TestClient buffers SSE; use a real uvicorn/http client for wire-level TTFT.",
+        "samples": samples,
     }
     print("\nContinuous API burst load")
     print(f"requests={args.requests} tokens={total_tokens} throughput={result['throughput_tok_s']:.1f} tok/s")
-    print(f"TTFT p50/p95: {result['ttft_p50_ms']:.2f}/{result['ttft_p95_ms']:.2f} ms")
+    print("TestClient first-event p50/p95 "
+          f"(buffered; not wire TTFT): {result['testclient_first_event_p50_ms']:.2f}/"
+          f"{result['testclient_first_event_p95_ms']:.2f} ms")
     print(f"completion p50/p95: {result['completion_p50_ms']:.2f}/{result['completion_p95_ms']:.2f} ms")
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as handle:

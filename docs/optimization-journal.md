@@ -1273,7 +1273,7 @@ work; they are not required to claim continuous HTTP batching correctness.
 
 ## Phase 14 — Server cancellation and burst-load observability
 
-Status: `IN PROGRESS — CUDA BURST-LOAD ACCEPTANCE REQUIRED`
+Status: `COMPLETE — KEEP CANCELLATION; THROUGHPUT BASELINE ONLY`
 
 The HTTP worker owns all GPU and scheduler state, so an async SSE handler must never
 call `engine.cancel()` directly on client disconnect. The service now routes cancellation
@@ -1288,10 +1288,17 @@ throughput plus client-observed TTFT and completion p50/p95. This is intentional
 service-level measure: it includes ingress, token streaming, scheduler queueing, graph
 bucket selection, and decode work rather than only model-forward time.
 
-Acceptance requirements:
+Acceptance results:
 
-- worker-routed cancellation test passes;
-- a 16-request, 32-token CUDA burst completes every request at length without server
-  errors; and
-- the resulting p50/p95 throughput and latency are recorded before choosing any timeout
-  or ingress-queue policy.
+- The worker-routed cancellation lifecycle test passed (2 tests).
+- A 16-request, 32-token CUDA burst completed all 512 requested tokens without server
+  errors at 944.2 tok/s.
+- The FastAPI `TestClient` first-event and completion p50/p95 values were both roughly
+  529/540 ms. This equality exposes a measurement limitation: TestClient buffers SSE
+  bodies, so those values are **not** wire-level TTFT and must not guide a latency,
+  timeout, or ingress policy.
+
+Decision: `KEEP` worker-routed cancellation and retain 944.2 tok/s as a same-process
+service-throughput baseline. Relabel the benchmark's first-event field accordingly. A
+real `uvicorn` plus network HTTP client load harness is required for valid streamed TTFT
+percentiles; defer that transport-level measurement rather than publishing false TTFT.
