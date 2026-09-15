@@ -103,6 +103,8 @@ def main():
     parser.add_argument("--concurrencies", default="1,2,4,8,16")
     parser.add_argument("--num-blocks", type=int, default=1024)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--cuda-graph-batch-size", type=int, default=None,
+                        help="enable paged CUDA-Graph replay only at this fixed active width")
     parser.add_argument("--warmup", action="store_true", help="run a small warmup first")
     parser.add_argument("--output", default="results/continuous_throughput.json")
     args = parser.parse_args()
@@ -129,7 +131,8 @@ def main():
 
     # ONE engine, reused across all concurrency levels (the pool is large; don't make many).
     engine = ContinuousBatchingEngine(model, tok, device,
-                                      num_blocks=args.num_blocks, block_size=args.block_size)
+                                      num_blocks=args.num_blocks, block_size=args.block_size,
+                                      cuda_graph_batch_size=args.cuda_graph_batch_size)
 
     # Warmup (compile kernels, warm caches)
     if args.warmup:
