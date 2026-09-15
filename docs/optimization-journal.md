@@ -468,7 +468,7 @@ T4 result:
 Decision: `REVERT`. Preserve this result so synchronization call count is not mistaken
 for latency saved in future profiling.
 
-### Fused Triton RMSNorm — awaiting T4 gate
+### Fused Triton RMSNorm — accepted
 
 Commit: `5282517` — `Fuse Qwen RMSNorm with Triton`
 
@@ -500,7 +500,35 @@ Gate:
 - If accepted, re-profile: `mean`, `pow`, and `rsqrt` counts attributable to RMSNorm
   should disappear, while the fused RMSNorm kernel should appear 3,503 times.
 
-Decision: `PENDING T4 MEASUREMENT`.
+T4 result:
+
+- All RMSNorm numerical/module and continuous-generation tests passed.
+- Width-16 throughput was 253.1 tok/s, 4.0% below the 263.5 tok/s immediate baseline
+  and above the 250.3 tok/s acceptance floor.
+- Width-8 throughput was 161.1 tok/s, above the prior 142.6 tok/s run, while lower
+  widths continued to show normal Colab run-to-run variance.
+- The decode profile confirmed 3,503 fused RMSNorm calls and removed stock `mean`,
+  `pow`, and `rsqrt` operators from the top results.
+- `cudaLaunchKernel` calls fell from 40,548 before fusion to 12,524 afterward.
+
+Decision: `KEEP`.
+
+### Decode `aten::cat` localization — awaiting T4 evidence
+
+Commit: `1c465fd` — `Add shape-aware continuous decode profiling`
+
+Purpose:
+
+The RMSNorm profile still contains 1,767 `aten::cat` calls, or 57 per decode step. This
+is now a meaningful allocation/copy target, but its origin must be identified by actual
+input shape before attempting a model-specific replacement.
+
+Change:
+
+- Added an optional shape-recording profiler mode that groups events by input shape and
+  prints the `aten::cat` groups separately.
+
+Decision: `DIAGNOSTIC PENDING`; shape profiling is not a throughput measurement.
 
 ### Persistent decode metadata — accepted
 
