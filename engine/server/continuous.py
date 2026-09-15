@@ -32,6 +32,7 @@ class ContinuousBatchingService:
             raise ValueError("max_pending_submissions must be positive")
         self.engine = engine
         self._inbox: Queue[RequestHandle] = Queue(maxsize=max_pending_submissions)
+        self._cancellations: Queue[tuple[str, str]] = Queue()
         self._active: dict[str, RequestHandle] = {}
         self._lock = Lock()
         self._wake = Event()
@@ -67,6 +68,13 @@ class ContinuousBatchingService:
         self._wake.set()
         return handle
 
+    def cancel(self, handle: RequestHandle, *, reason: str = "CLIENT_DISCONNECTED") -> None:
+        """Request cancellation without allowing a handler to mutate engine state."""
+        if handle.completed.is_set():
+            return
+        self._cancellations.put((handle.request.request_id, reason))
+        self._wake.set()
+
     def _drain_inbox(self) -> None:
         while True:
             try:
@@ -79,6 +87,19 @@ class ContinuousBatchingService:
                 continue
             with self._lock:
                 self._active[handle.request.request_id] = handle
+
+    def _apply_cancellations(self) -> None:
+        while True:
+            try:
+                request_id, reason = self._cancellations.get_nowait()
+            except Empty:
+                return
+            with self._lock:
+                handle = self._active.pop(request_id, None)
+            if handle is None or handle.request.done:
+                continue
+            self.engine.cancel(request_id, reason=reason)
+            handle.completed.set()
 
     def _publish_completed(self) -> None:
         with self._lock:
@@ -105,6 +126,7 @@ class ContinuousBatchingService:
         try:
             while not self._stopping.is_set():
                 self._drain_inbox()
+                self._apply_cancellations()
                 if self.engine.has_unfinished_requests:
                     self.engine.step()
                     self._publish_completed()

@@ -27,6 +27,14 @@ class _FakeEngine:
                 request.transition(RequestState.FINISHED, reason="LENGTH")
                 self.requests.remove(request)
 
+    def cancel(self, request_id, reason="CANCELLED") -> None:
+        for request in list(self.requests):
+            if request.request_id == request_id:
+                request.transition(RequestState.CANCELLED, reason=reason)
+                self.requests.remove(request)
+                return request
+        raise KeyError(request_id)
+
 
 def test_background_service_completes_request_without_handler_touching_engine() -> None:
     service = ContinuousBatchingService(_FakeEngine())
@@ -37,5 +45,19 @@ def test_background_service_completes_request_without_handler_touching_engine() 
         assert handle.error is None
         assert handle.request.output_token_ids == [7, 7, 7]
         assert handle.request.finish_reason == "LENGTH"
+    finally:
+        service.stop()
+
+
+def test_background_service_routes_cancellation_to_worker_owned_engine() -> None:
+    engine = _FakeEngine()
+    service = ContinuousBatchingService(engine)
+    handle = service.submit([1, 2, 3], max_new_tokens=3)
+    service.cancel(handle, reason="TEST_CANCEL")
+    service.start()
+    try:
+        assert handle.completed.wait(1)
+        assert handle.request.state is RequestState.CANCELLED
+        assert handle.request.finish_reason == "TEST_CANCEL"
     finally:
         service.stop()

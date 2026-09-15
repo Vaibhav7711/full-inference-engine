@@ -82,6 +82,7 @@ def create_app(
             sent = 0
             while not handle.completed.is_set():
                 if await request.is_disconnected():
+                    service.cancel(handle)
                     return
                 tokens = handle.request.output_token_ids
                 while sent < len(tokens):
