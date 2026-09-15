@@ -132,6 +132,7 @@ def paged_decode_batched(
     seq_lens: torch.Tensor,     # [S] int
     scale: float | None = None,
     block_n: int = 64,
+    num_warps: int = 4,
     length_offset: int = 0,
 ) -> torch.Tensor:
     """Batched paged decode attention: S sequences, 1 query each, one kernel launch.
@@ -147,6 +148,10 @@ def paged_decode_batched(
 
     if scale is None:
         scale = 1.0 / (D ** 0.5)
+    if block_n not in {16, 32, 64, 128}:
+        raise ValueError("block_n must be one of 16, 32, 64, or 128")
+    if num_warps not in {2, 4, 8}:
+        raise ValueError("num_warps must be one of 2, 4, or 8")
 
     query = query.contiguous()
     key_pages = key_pages.contiguous()
@@ -175,5 +180,6 @@ def paged_decode_batched(
         HEAD_DIM=D,
         BLOCK_N=block_n,
         LENGTH_OFFSET=length_offset,
+        num_warps=num_warps,
     )
     return out
