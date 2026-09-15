@@ -539,6 +539,41 @@ Commit: `6996116` — `Add stack grouped cat profiling`
 
 Decision: `DIAGNOSTIC PENDING`; shape profiling is not a throughput measurement.
 
+### Combined Triton RoPE and SwiGLU fusion — awaiting T4 gate
+
+Commit: `35a08f6` — `Fuse Qwen RoPE and SwiGLU with Triton`
+
+Hypothesis:
+
+Source inspection localized the remaining repeated operations without another isolated
+experiment. Qwen applies `rotate_half` separately to Q and K in every layer, and each
+call constructs its result with `torch.cat`; 2 × 28 layers × 31 steps explains 1,736 of
+the observed 1,767 cats exactly. Every layer also evaluates SiLU and the gate/up product
+as separate elementwise operations.
+
+Combined change:
+
+- Added one Triton RoPE launch over batch, token, and head that rotates and writes both
+  Q and K, supporting Qwen's different query and KV head counts.
+- Removed the materialized `rotate_half`, `neg`, two multiplies, add, and cat chain from
+  the Q/K RoPE path.
+- Added a Triton SwiGLU kernel for `silu(gate) * up` and patched all 28 Qwen MLP modules.
+- Kept gate/up/down projections on PyTorch's tuned CUTLASS GEMM path.
+- Added separate numerical tests for decode and prefill RoPE shapes, SwiGLU shapes, and
+  installer coverage, while retaining one end-to-end token-equivalence suite.
+
+Single Colab gate:
+
+- Run the fused-op numerical tests, RMSNorm tests, and staged continuous-generation
+  tests together.
+- Run one throughput sweep. Width-16 must remain at least 240.4 tok/s (within 5% of the
+  immediate 253.1 tok/s RMSNorm baseline).
+- Run one decode profile only after correctness. Expected changes: nearly all 1,767
+  `aten::cat` calls disappear, `aten::silu` disappears, and `_rope_qk_kernel` plus
+  `_swiglu_kernel` each appear 868 times.
+
+Decision: `PENDING T4 MEASUREMENT`.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
