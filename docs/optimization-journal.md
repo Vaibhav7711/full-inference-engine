@@ -425,6 +425,35 @@ Next order:
 
 Decision: `DIAGNOSTIC COMPLETE`; no performance claim is made from profiler timings.
 
+### Batched sampled-token materialization — awaiting T4 gate
+
+Commit: `f74c6ce` — `Batch decode token transfer to host`
+
+Hypothesis:
+
+The optimized width-16 decode profile reported 496 stream synchronizations, exactly one
+per request per decode step (16 × 31). The scheduler needs token IDs on the CPU, but it
+needs only one device/host dependency boundary for the complete batch.
+
+Change:
+
+- Added a persistent pinned-host token buffer sized to `max_active`.
+- Copy the complete GPU argmax result asynchronously into that buffer.
+- Synchronize the current CUDA stream once, then perform request lifecycle and EOS work
+  from host-resident values.
+- Removed per-request CUDA `.item()` calls from the decode loop. The prefill path remains
+  single-request and therefore unchanged.
+
+Gate:
+
+- All continuous-generation tests must remain token-exact, including mixed lengths and
+  early completion/reclamation.
+- Width-16 throughput must remain at least 250.3 tok/s (within 5% of 263.5 tok/s).
+- Re-run the decode profiler after the throughput gate. Expected synchronization count
+  is approximately 31 rather than 496 for this fixed 16 × 31 workload.
+
+Decision: `PENDING T4 MEASUREMENT`.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
