@@ -1150,3 +1150,48 @@ One width-16 A/B run measured separate projections at 961.5 tok/s and the fused 
 single pair is not sufficient to choose a default. The fusion remains enabled by default
 while a paired multi-round measurement is added. The existing Triton SwiGLU elementwise
 fusion remains enabled in either configuration.
+
+## Phase 10 — Weight-only and W8A8 decode-linear experiments
+
+Status: `COMPLETE — REJECT FOR T4 DECODE; DO NOT INTEGRATE`
+
+This phase tested whether reducing linear-layer weight bandwidth could improve the
+Qwen3-0.6B decode path. The result is negative for this model, GPU, and batch regime.
+
+First, the fused-scale W8A16 Triton linear kernel was compared against CUDA FP16 GEMM:
+
+| Shape | Batch | FP16 ms | W8A16 ms | FP16 / W8A16 |
+| --- | ---: | ---: | ---: | ---: |
+| attention 1024 | 1 | 0.0410 | 0.2252 | 0.18x |
+| attention 1024 | 16 | 0.0432 | 0.2228 | 0.19x |
+| MLP 3072 | 1 | 0.0618 | 0.5025 | 0.12x |
+| MLP 3072 | 16 | 0.0712 | 0.5059 | 0.14x |
+
+W8A16 dequantizes values in the custom kernel before a floating-point dot product. It
+does not use the T4's INT8 tensor cores, while the FP16 baseline dispatches optimized
+CUTLASS tensor-core GEMMs. It is therefore structurally the wrong optimization here.
+
+Second, a true W8A8 path was attempted. Triton 3.x could not lower signed INT8 MMA for
+the Colab T4's `sm75` target, so the final experiment used CUDA's native INT8xINT8 to
+INT32 GEMM through `torch._int_mm`. It prepacked the transposed INT8 weight once, then
+performed dynamic per-row activation quantization, the CUDA INT8 GEMM, and scale
+dequantization. For decode widths at or below 16, the CUDA API also requires padding to
+17 internal rows; that cost was included in the measurement.
+
+| Shape | Batch | FP16 ms | W8A8 ms | FP16 / W8A8 | Relative error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| attention 1024 | 1 | 0.0395 | 0.3463 | 0.11x | 1.22% |
+| attention 1024 | 16 | 0.0466 | 0.3886 | 0.12x | 1.11% |
+| MLP 3072 | 1 | 0.0589 | 0.3762 | 0.16x | 1.11% |
+| MLP 3072 | 16 | 0.0676 | 0.3858 | 0.18x | 1.11% |
+
+The first W8A8 implementation incorrectly repacked weights per invocation; correcting
+that reduced latency from 0.47--0.67 ms to 0.35--0.39 ms, but did not change the
+decision. The remaining cost is activation reduction/quantization, temporary INT8
+materialization, short-batch padding, dequantization, and extra launches. At these
+small decode GEMMs, optimized resident FP16 weights are substantially faster.
+
+Decision: retain the code only as an isolated benchmark/reference, with no model or
+engine integration. FP16 stays the decode-linear default. INT8 KV remains separately
+justified as an opt-in long-context capacity mode; it should not be conflated with
+weight quantization.
