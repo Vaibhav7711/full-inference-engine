@@ -29,6 +29,8 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--prompt-tokens", type=int, default=256)
+    parser.add_argument("--prompt-token-lengths", default=None,
+                        help="Optional comma-separated per-row prompt lengths; must contain batch-size entries")
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=40)
     parser.add_argument("--num-blocks", type=int, default=1024)
@@ -48,8 +50,18 @@ def main() -> None:
         num_blocks=args.num_blocks, prefix_cache_blocks=0,
     )
     fragment = loaded.tokenizer("CUDA graphs replay a stable paged decode bucket efficiently. ", return_tensors="pt").input_ids[0].tolist()
-    prompt_ids = (fragment * ((args.prompt_tokens + len(fragment) - 1) // len(fragment)))[:args.prompt_tokens]
-    requests = [GenerationRequest(f"r{i}", len(prompt_ids), 4, prompt_token_ids=prompt_ids) for i in range(args.batch_size)]
+    if args.prompt_token_lengths:
+        prompt_lengths = [int(value) for value in args.prompt_token_lengths.split(",") if value]
+        if len(prompt_lengths) != args.batch_size or any(value <= 0 for value in prompt_lengths):
+            parser.error("--prompt-token-lengths needs exactly batch-size positive entries")
+    else:
+        prompt_lengths = [args.prompt_tokens] * args.batch_size
+    prompts = [
+        (fragment * ((length + len(fragment) - 1) // len(fragment)))[:length]
+        for length in prompt_lengths
+    ]
+    requests = [GenerationRequest(f"r{i}", len(prompt), 4, prompt_token_ids=prompt)
+                for i, prompt in enumerate(prompts)]
     for request in requests:
         engine.scheduler.submit(request)
     active = engine.scheduler.admit_available(max_active_requests=args.batch_size)
@@ -85,7 +97,7 @@ def main() -> None:
         graph_logits = captured.replay()
         close = bool(torch.allclose(normal_logits, graph_logits, atol=1e-3, rtol=1e-3))
         record = {
-            "workload": {"batch_size": len(active), "prompt_tokens": len(prompt_ids), "block_n": block_n, "warps": warps},
+            "workload": {"batch_size": len(active), "prompt_tokens": prompt_lengths, "block_n": block_n, "warps": warps},
             "ordinary_median_ms": ordinary_ms, "graph_median_ms": graph_ms,
             "speedup": ordinary_ms / graph_ms, "logits_close": close,
             "note": "Fixed-width replay only; request state is intentionally not advanced during this capture experiment.",
