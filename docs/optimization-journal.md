@@ -468,6 +468,40 @@ T4 result:
 Decision: `REVERT`. Preserve this result so synchronization call count is not mistaken
 for latency saved in future profiling.
 
+### Fused Triton RMSNorm — awaiting T4 gate
+
+Commit: `5282517` — `Fuse Qwen RMSNorm with Triton`
+
+Hypothesis:
+
+The decode-only profile reported 3,503 RMSNorm reduction chains over 31 steps: 113 norm
+sites per forward. Each stock norm separately launches power, mean reduction, epsilon
+addition, reciprocal square root, and multiplication operations. A single row-wise
+Triton kernel should reduce GPU work and, more importantly at these small decode shapes,
+remove thousands of CPU-launched CUDA operations.
+
+Change:
+
+- Added a row-wise Triton RMSNorm supporting both `[N, hidden_size]` hidden states and
+  `[N, heads, 1, head_dim]` Q/K norm tensors.
+- Accumulates variance and normalization in FP32, then follows Qwen's reference ordering
+  by casting to the input dtype before applying the same-dtype weight.
+- Added a narrowly scoped installer for recognized RMSNorm modules with reversible
+  restoration support; the physical continuous engine enables it before warmup.
+- Added numerical tests at widths 128 and 1024 and an integration test covering all 113
+  RMSNorm modules in Qwen3-0.6B against their original forward implementations.
+- Existing staged generation tests remain the token-exact end-to-end gate.
+
+Gate:
+
+- Numerical kernel/module comparisons and all continuous-generation tests must pass.
+- Width-16 throughput must remain at least 250.3 tok/s (within 5% of the restored 263.5
+  tok/s accepted baseline).
+- If accepted, re-profile: `mean`, `pow`, and `rsqrt` counts attributable to RMSNorm
+  should disappear, while the fused RMSNorm kernel should appear 3,503 times.
+
+Decision: `PENDING T4 MEASUREMENT`.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
