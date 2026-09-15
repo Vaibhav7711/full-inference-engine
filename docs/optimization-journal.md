@@ -539,7 +539,7 @@ Commit: `6996116` — `Add stack grouped cat profiling`
 
 Decision: `DIAGNOSTIC PENDING`; shape profiling is not a throughput measurement.
 
-### Combined Triton RoPE and SwiGLU fusion — awaiting T4 gate
+### Combined Triton RoPE and SwiGLU fusion — accepted
 
 Commit: `35a08f6` — `Fuse Qwen RoPE and SwiGLU with Triton`
 
@@ -583,6 +583,25 @@ First T4 gate attempt:
   no benchmark or profile ran because the combined gate stopped at correctness.
 - Repair: promote gate and up values to FP32 for fused SiLU/product evaluation and let
   the output store cast back to the model's FP16 dtype.
+
+Final T4 result:
+
+- The fail-fast combined gate reached benchmarking, confirming fused-op, RMSNorm, and
+  staged continuous-generation test processes all passed.
+- Sequential throughput was 24.3 tok/s.
+- Width-8 throughput was 165.4 tok/s.
+- Width-16 throughput was 261.8 tok/s, up 3.4% from the immediate 253.1 tok/s RMSNorm
+  run and close to the earlier 263.5 tok/s peak.
+- `_rope_qk_kernel` and `_swiglu_kernel` each ran exactly 868 times (28 × 31).
+- `aten::cat`, `aten::neg`, and `aten::silu` disappeared from the top GPU operators.
+- The remaining 1,736 `aten::add` calls correspond to two residual additions per layer
+  per step, not the eliminated RoPE chain.
+- Summed launch API call counts fell materially: the main `cudaLaunchKernel` category
+  dropped from 12,524 after RMSNorm to 2,108, while 6,975 launches moved through
+  `cuLaunchKernelEx` for the fused/custom path.
+
+Decision: `KEEP`. End the elementwise-fusion pass here and return to architectural work;
+the next phase is true batched/chunked prefill.
 
 ### Persistent decode metadata — accepted
 
