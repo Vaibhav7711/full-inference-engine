@@ -603,6 +603,42 @@ Final T4 result:
 Decision: `KEEP`. End the elementwise-fusion pass here and return to architectural work;
 the next phase is true batched/chunked prefill.
 
+### Mixed-length batched prefill — awaiting T4 gate
+
+Commit: `b728915` — `Batch mixed-length prompt prefill`
+
+Architecture change:
+
+- Newly admitted requests now share one padded and attention-masked model prefill
+  instead of executing one complete model forward per request.
+- A new batched Triton K/V writer uses per-request sequence lengths and block tables to
+  write only real prompt tokens into the authoritative shared pool; padding is never
+  committed to KV storage.
+- First-token logits are selected at each request's real final prompt position rather
+  than the padded batch boundary.
+- The existing `prefill(request)` API delegates to the batch path with width one.
+- Removed the superseded single-request pool cache adapter, Triton writer, and duplicate
+  tests so production retains one authoritative prefill implementation.
+- Added mixed-length first-token equivalence, padding isolation, physical block mapping,
+  and full generation coverage.
+
+Measurement:
+
+- Added an alternating same-engine A/B benchmark comparing sequential width-one prefill
+  against one batched prefill for the same prompts and token outputs.
+- The combined Colab gate will run correctness, isolated prefill A/B, and the existing
+  end-to-end continuous throughput sweep once.
+
+Gate:
+
+- All K/V writer, fused-kernel, and staged continuous-generation tests must pass.
+- Batched and sequential prefill must produce identical first tokens.
+- Batched prefill must improve the isolated width-16 prompt-token throughput.
+- End-to-end width-16 throughput must remain at least 248.7 tok/s (within 5% of the
+  immediate 261.8 tok/s accepted baseline).
+
+Decision: `PENDING T4 MEASUREMENT`.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
