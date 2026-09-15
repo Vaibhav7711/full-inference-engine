@@ -33,6 +33,7 @@ def _rows(events, key) -> list[dict]:
             "self_gpu_us": round(_event_device_time_us(event), 1),
             "self_cpu_us": round(float(event.self_cpu_time_total), 1),
             "input_shapes": [list(shape) for shape in getattr(event, "input_shapes", [])],
+            "stack": list(getattr(event, "stack", [])),
         }
         for event in events
     ]
@@ -60,6 +61,11 @@ def main() -> None:
         "--record-shapes",
         action="store_true",
         help="group profiler events by input shape and print aten::cat diagnostics",
+    )
+    parser.add_argument(
+        "--record-stacks",
+        action="store_true",
+        help="group profiler events by Python stack and print aten::cat call sites",
     )
     parser.add_argument("--output", default="results/profile_continuous_decode.json")
     args = parser.parse_args()
@@ -116,6 +122,7 @@ def main() -> None:
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=args.record_shapes,
+        with_stack=args.record_stacks,
     ) as profiler:
         while True:
             active = [
@@ -128,19 +135,27 @@ def main() -> None:
             engine.decode_step(active)
     torch.cuda.synchronize()
 
-    events = list(profiler.key_averages(group_by_input_shape=args.record_shapes))
+    events = list(
+        profiler.key_averages(
+            group_by_input_shape=args.record_shapes,
+            group_by_stack_n=8 if args.record_stacks else 0,
+        )
+    )
     gpu_rows = _rows(events, key=lambda row: row["self_gpu_us"])
     cpu_rows = _rows(events, key=lambda row: row["self_cpu_us"])
     _print_rows("Top GPU operators", gpu_rows, "self_gpu_us", args.top)
     _print_rows("Top CPU operators", cpu_rows, "self_cpu_us", args.top)
-    if args.record_shapes:
+    if args.record_shapes or args.record_stacks:
         cat_rows = [row for row in gpu_rows if row["name"] == "aten::cat"]
-        print("\naten::cat shape groups")
+        print("\naten::cat diagnostic groups")
         for row in cat_rows:
             print(
                 f"calls={row['calls']} self_gpu_us={row['self_gpu_us']:.1f} "
                 f"input_shapes={row['input_shapes']}"
             )
+            if args.record_stacks:
+                for frame in row["stack"]:
+                    print(f"  {frame}")
 
     properties = torch.cuda.get_device_properties(0)
     result = {
