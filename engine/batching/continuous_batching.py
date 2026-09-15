@@ -196,7 +196,8 @@ class ContinuousBatchingEngine:
                  max_prefill_tokens_per_iteration: int = 512,
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,
-                 kv_cache_dtype: str = "fp16"):
+                 kv_cache_dtype: str = "fp16",
+                 cuda_graph_batch_size: int | None = None):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
@@ -204,6 +205,8 @@ class ContinuousBatchingEngine:
             raise ValueError("prefix_cache_blocks must be non-negative")
         if kv_cache_dtype not in {"fp16", "int8"}:
             raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
+        if cuda_graph_batch_size is not None and not 0 < cuda_graph_batch_size <= max_active:
+            raise ValueError("cuda_graph_batch_size must be within [1, max_active]")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -214,6 +217,8 @@ class ContinuousBatchingEngine:
         self.max_waiting_requests = max_waiting_requests
         self.prefix_cache_blocks = prefix_cache_blocks
         self.kv_cache_dtype = kv_cache_dtype
+        self.cuda_graph_batch_size = cuda_graph_batch_size
+        self._decode_graphs = {}
 
         cfg = model.config
         self.num_layers = cfg.num_hidden_layers
@@ -647,20 +652,36 @@ class ContinuousBatchingEngine:
         )
 
         # Stash context for the attention fn
-        _set_batch_ctx(_BatchContext(
+        context = _BatchContext(
             key_pool=self.key_pool, value_pool=self.value_pool,
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
             decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
-        ))
-        try:
-            out = self.model(input_ids=input_ids, position_ids=position_ids,
-                             use_cache=False, return_dict=True)
-        finally:
-            _clear_batch_ctx()
+        )
+        graph_key = (len(active), decode_block_n, decode_num_warps)
+        use_graph = self.cuda_graph_batch_size == len(active)
+        if use_graph:
+            graph = self._decode_graphs.get(graph_key)
+            if graph is None:
+                from engine.graphs import capture_paged_decode_graph
+                graph = capture_paged_decode_graph(
+                    self, batch_size=len(active), block_n=decode_block_n,
+                    num_warps=decode_num_warps,
+                )
+                self._decode_graphs[graph_key] = graph
+            logits = graph.replay()
+        else:
+            _set_batch_ctx(context)
+            try:
+                logits = self.model(
+                    input_ids=input_ids, position_ids=position_ids,
+                    use_cache=False, return_dict=True,
+                ).logits
+            finally:
+                _clear_batch_ctx()
 
         # Sample next token per sequence, advance state
-        next_tokens = out.logits[:, -1, :].argmax(dim=-1)   # [N]
+        next_tokens = logits[:, -1, :].argmax(dim=-1)   # [N]
         for i, s in enumerate(active):
             self.block_manager.append_tokens(s.request_id)
             tok = int(next_tokens[i].item())

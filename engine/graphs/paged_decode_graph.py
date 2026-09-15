@@ -30,7 +30,7 @@ def capture_paged_decode_graph(engine, *, batch_size: int, block_n: int, num_war
     regime as capture.  The capture forward writes the pending K/V slot once; replaying
     immediately afterwards overwrites that same slot before request state is advanced.
     """
-    if not torch.cuda.is_available() or engine.device != "cuda":
+    if not torch.cuda.is_available() or torch.device(engine.device).type != "cuda":
         raise ValueError("paged decode graph capture requires a CUDA engine")
     if not 0 < batch_size <= engine.max_active:
         raise ValueError("batch_size must be within the engine's active-batch limit")

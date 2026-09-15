@@ -287,6 +287,24 @@ def test_int8_kv_mode_runs_chunked_prefill_then_decode():
 
 @cuda
 @requires_cuda
+def test_fixed_width_cuda_graph_bucket_matches_reference():
+    """A captured paged-decode bucket remains token-identical through real state updates."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    prompts = ["The capital of France is", "2 + 2 ="]
+    refs = [_reference_greedy(model, tok, prompt, 3) for prompt in prompts]
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=512, max_active=2, prefix_cache_blocks=0,
+        cuda_graph_batch_size=2,
+    )
+    outputs = eng.generate(prompts, max_new_tokens=3)
+    assert outputs == refs
+    assert eng._decode_graphs
+
+
+@cuda
+@requires_cuda
 def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
     """A prompt spanning several resumable chunks remains token-identical."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
