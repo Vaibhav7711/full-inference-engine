@@ -1270,3 +1270,28 @@ Decision: `KEEP`. The serving API now exercises the production continuous engine
 than the obsolete one-request reference runner. Request cancellation on disconnect,
 timeout policy, and load-generator percentile testing remain the next service hardening
 work; they are not required to claim continuous HTTP batching correctness.
+
+## Phase 14 — Server cancellation and burst-load observability
+
+Status: `IN PROGRESS — CUDA BURST-LOAD ACCEPTANCE REQUIRED`
+
+The HTTP worker owns all GPU and scheduler state, so an async SSE handler must never
+call `engine.cancel()` directly on client disconnect. The service now routes cancellation
+through a control queue consumed by that same worker. It handles both requests already
+admitted to the scheduler and requests still waiting in the bounded ingress queue. The
+worker alone performs the state transition and KV release, then signals the caller's
+completion handle. A CPU lifecycle test verifies this ownership boundary.
+
+The phase also adds a concurrent SSE burst-load benchmark. It warms the service, starts
+a configurable burst of streaming requests at once, and records aggregate output
+throughput plus client-observed TTFT and completion p50/p95. This is intentionally a
+service-level measure: it includes ingress, token streaming, scheduler queueing, graph
+bucket selection, and decode work rather than only model-forward time.
+
+Acceptance requirements:
+
+- worker-routed cancellation test passes;
+- a 16-request, 32-token CUDA burst completes every request at length without server
+  errors; and
+- the resulting p50/p95 throughput and latency are recorded before choosing any timeout
+  or ingress-queue policy.
