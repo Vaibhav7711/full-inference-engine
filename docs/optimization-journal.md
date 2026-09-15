@@ -180,7 +180,7 @@ Decision: `KEEP` block size 16 as the current baseline candidate.
 
 ## Phase 2 — Unified scheduling and persistent batch metadata
 
-Status: `IN PROGRESS`
+Status: `COMPLETE — KEEP`
 
 Entry gate:
 
@@ -990,3 +990,16 @@ The policy remains deliberately conservative: a `16x2` result was slightly faste
 the narrow 64-token, width-16 microbenchmark, but not across the rest of the measured
 space. It is not a safe engine-wide default. Acceptance still requires CUDA correctness
 for both live tile variants plus an end-to-end short-prompt regression gate.
+
+T4 acceptance gate:
+
+- The full CUDA paged-decode correctness suite passed, including both `64x4` and
+  `128x4` tile variants, plus the continuous-batching integration suite.
+- The 16-request short-prompt regression run reached 483.1 tok/s at width 16, with
+  16.90x scaling over its 28.6 tok/s sequential measurement. This is above the Phase 4
+  393.1 tok/s acceptance floor.
+
+Decision: `KEEP`. Attribute the 20--42% improvement only to the measured isolated
+long-context attention-kernel cases. Do not attribute the 483.1 tok/s short-prompt
+result to this policy: those prompts select the unchanged `64x4` regime and Colab
+end-to-end runs vary with runtime warm state.
