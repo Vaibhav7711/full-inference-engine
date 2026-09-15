@@ -44,8 +44,16 @@ def _write_decode_int8_kv_kernel(
                + head * stride_kph + dims * stride_kpd)
     value_dst = (value_pool_ptr + physical_block * stride_vpb + block_offset * stride_vps
                  + head * stride_vph + dims * stride_vpd)
-    tl.store(key_dst, (key / key_scale).to(tl.int8))
-    tl.store(value_dst, (value / value_scale).to(tl.int8))
+    # Triton's float-to-int cast truncates.  Make round-to-nearest explicit so this
+    # kernel has the same quantization contract as torch.round in the reference path.
+    key_quantized = key / key_scale
+    value_quantized = value / value_scale
+    key_quantized = tl.where(key_quantized >= 0.0, key_quantized + 0.5, key_quantized - 0.5)
+    value_quantized = tl.where(value_quantized >= 0.0, value_quantized + 0.5, value_quantized - 0.5)
+    key_quantized = tl.maximum(tl.minimum(key_quantized, 127.0), -127.0)
+    value_quantized = tl.maximum(tl.minimum(value_quantized, 127.0), -127.0)
+    tl.store(key_dst, key_quantized.to(tl.int8))
+    tl.store(value_dst, value_quantized.to(tl.int8))
     tl.store(key_scale_ptr + physical_block * stride_ksb + block_offset * stride_kss + head * stride_ksh, key_scale)
     tl.store(value_scale_ptr + physical_block * stride_vsb + block_offset * stride_vss + head * stride_vsh, value_scale)
 
