@@ -1132,5 +1132,6 @@ Validation and measurement:
 Decision: `KEEP`. Configured buckets now provide flexible graph replay across the tested
 occupancies while preserving safety and token equivalence. Capture construction remains
 excluded from these steady-state measurements, and capacity consumed by dummy blocks is
-an explicit small reservation. Test width 32 separately before enabling a 32-row bucket
-on the constrained T4 runtime.
+an explicit small reservation. Width 32 is registered as an optional benchmark bucket;
+it remains unvalidated on the constrained T4 runtime until separately measured with
+`max_active=32` and enough KV blocks.

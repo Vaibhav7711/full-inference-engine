@@ -23,7 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--occupancies", default="1,2,3,4,8,16")
-    parser.add_argument("--graph-buckets", default="2,4,8,16")
+    parser.add_argument("--graph-buckets", default="2,4,8,16,32")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--num-blocks", type=int, default=1024)
     parser.add_argument("--output", default="results/padded_graph_occupancy_ab.json")
