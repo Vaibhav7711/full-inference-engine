@@ -1328,7 +1328,7 @@ engine.
 
 ## Phase 15 — Final P0/P1 optimization closure
 
-Status: `IN PROGRESS — CUDA AND REAL-TRANSPORT ACCEPTANCE REQUIRED`
+Status: `COMPLETE — KEEP; OPTIMIZATION FREEZE`
 
 This is the final optimization phase before the project switches to broad correctness,
 stress, and failure testing. Its scope is deliberately limited to both P0 audit items
@@ -1360,3 +1360,23 @@ Acceptance gates:
 - batched token transfer reduces width-16 host-transfer latency;
 - real `uvicorn` disconnect cancellation passes; and
 - all 16 burst requests return their requested token count with valid wire-level TTFT.
+
+Acceptance results on the Colab T4:
+
+- All three server lifecycle/cancellation/backpressure tests passed.
+- All 11 integrated continuous-batching CUDA tests passed, covering prefill, batched
+  decode, mixed/staggered generation, FP16 and INT8 KV, exact and padded graphs,
+  chunked-prefill cancellation, block release, and prefix reuse.
+- Batched host transfer remained neutral at width 1 and improved monotonically with
+  width: 1.55x at 2, 2.72x at 4, 5.04x at 8, and 9.35x at 16. Width-16 latency fell
+  from 0.20600 ms for repeated scalar reads to 0.02203 ms for one batched transfer.
+- The real loopback `uvicorn` burst completed 512 tokens across 16 requests at
+  666.1 tok/s. Wire-level TTFT was 210.44/270.15/277.91 ms p50/p95/p99; completion
+  was 754.62/759.95/762.41 ms p50/p95/p99.
+- Deliberately closing an SSE socket after its first token advanced the worker's
+  cancellation counter, proving disconnect cleanup reached the scheduler owner.
+
+Decision: `KEEP` every Phase 15 change. Freeze performance optimization at this commit.
+Subsequent work moves to comprehensive correctness, stress, failure-recovery, and API
+contract testing. Performance changes after this point require a failing test or a new
+profile-backed bottleneck, not speculative tuning.
