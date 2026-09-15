@@ -330,7 +330,7 @@ class ContinuousBatchingEngine:
                 self._host_block_tables[row, column] = physical_block
 
         if row_count > count:
-            if len(self._graph_dummy_blocks) < row_count:
+            if len(self._graph_dummy_blocks) < row_count - count:
                 raise RuntimeError("graph dummy blocks were not reserved for this bucket")
             pad_token = self.tokenizer.pad_token_id
             if pad_token is None:
