@@ -572,8 +572,6 @@ Single Colab gate:
   `aten::cat` calls disappear, `aten::silu` disappears, and `_rope_qk_kernel` plus
   `_swiglu_kernel` each appear 868 times.
 
-Decision: `PENDING T4 MEASUREMENT`.
-
 First T4 gate attempt:
 
 - All three fused Q/K RoPE numerical cases passed.
@@ -828,4 +826,26 @@ First T4 gate:
   that chunking helped. Only the latency benchmark must be rerun; correctness and the
   short-prompt throughput gate are already accepted.
 
-Decision: `PENDING T4 MEASUREMENT`.
+Final warmed T4 latency result at chunk size 64 with a 1,001-token prompt:
+
+| Mode | ITL p50 | ITL p95 | ITL max | Long-prompt TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| Unchunked | 34.90 ms | 39.55 ms | 308.19 ms | 360.63 ms |
+| Chunked (64) | 70.92 ms | 91.68 ms | 96.64 ms | 1,229.79 ms |
+
+Interpretation:
+
+- Chunking reduced worst-case decoder ITL by 68.6%, from 308.19 to 96.64 ms.
+- It increased median ITL by 103.2% and p95 ITL by 131.8%, because a prompt chunk now
+  executes between successive decode iterations instead of causing one isolated stall.
+- Long-prompt TTFT increased by 241.0%, from 360.63 to 1,229.79 ms, because the prompt
+  was deliberately spread over multiple scheduling iterations.
+- This is latency isolation, not a throughput optimization. Chunk size remains a
+  workload policy: smaller chunks favor decoder responsiveness, while larger chunks
+  favor prompt TTFT and prefill efficiency.
+- Alongside the already accepted 407.4 tok/s short-prompt result and complete correctness
+  gate, the implementation satisfies its stated purpose without regressing the fast path.
+
+Decision: `KEEP` chunked prefill and decode-first scheduling. Do not claim lower typical
+ITL or better long-prompt TTFT; claim a measured 68.6% reduction in the worst decoder
+stall for this concurrent 1,001-token-prompt workload.
