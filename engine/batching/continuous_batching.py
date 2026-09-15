@@ -233,8 +233,18 @@ class ContinuousBatchingEngine:
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def prefill(self, request: GenerationRequest) -> None:
-        """Run stock prefill while K/V is written directly into the shared pool."""
-        from engine.cache.pool_cache import PoolBackedPrefillCache
+        """Compatibility wrapper for a one-request batched prefill."""
+        self.prefill_batch([request])
+
+    @torch.inference_mode()
+    def prefill_batch(self, requests: list[GenerationRequest]) -> None:
+        """Prefill newly admitted requests in one padded, masked model forward."""
+        from engine.cache.pool_cache import BatchedPoolBackedPrefillCache
+
+        if not requests:
+            return
+        if len(requests) > self.max_active:
+            raise ValueError("prefill batch exceeds max_active")
 
         # Stock SDPA computes prefill attention; the cache adapter writes the already
         # RoPE-rotated K/V directly into this engine's authoritative shared pool.
@@ -242,26 +252,51 @@ class ContinuousBatchingEngine:
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = "sdpa"
 
-        if request.state is not RequestState.PREFILLING or request.allocation is None:
-            raise RuntimeError("request must be admitted before prefill")
-        if not request.prompt_token_ids:
-            raise ValueError("prefill requires prompt_token_ids")
-        ids = torch.tensor([request.prompt_token_ids], device=self.device)
+        for request in requests:
+            if request.state is not RequestState.PREFILLING or request.allocation is None:
+                raise RuntimeError("every request must be admitted before prefill")
+            if not request.prompt_token_ids:
+                raise ValueError("prefill requires prompt_token_ids")
 
-        block_table = torch.tensor(
-            request.block_table, dtype=torch.int32, device=self.device
+        lengths_list = [len(request.prompt_token_ids) for request in requests]
+        padded_length = max(lengths_list)
+        max_blocks = max(len(request.block_table) for request in requests)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = next(iter(self.eos_ids), 0)
+        padded_ids = [
+            request.prompt_token_ids + [pad_token_id] * (padded_length - length)
+            for request, length in zip(requests, lengths_list)
+        ]
+        masks = [
+            [1] * length + [0] * (padded_length - length) for length in lengths_list
+        ]
+        padded_tables = [
+            request.block_table + [-1] * (max_blocks - len(request.block_table))
+            for request in requests
+        ]
+        ids = torch.tensor(padded_ids, dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor(masks, dtype=torch.long, device=self.device)
+        block_tables = torch.tensor(padded_tables, dtype=torch.int32, device=self.device)
+        seq_lens = torch.tensor(lengths_list, dtype=torch.int32, device=self.device)
+        cache = BatchedPoolBackedPrefillCache(
+            self.key_pool, self.value_pool, block_tables, seq_lens, padded_length
         )
-        cache = PoolBackedPrefillCache(self.key_pool, self.value_pool, block_table)
         out = self.model(
-            input_ids=ids, past_key_values=cache, use_cache=True, return_dict=True
+            input_ids=ids, attention_mask=attention_mask,
+            past_key_values=cache, use_cache=True, return_dict=True,
         )
+        rows = torch.arange(len(requests), device=self.device)
+        last_positions = seq_lens.to(dtype=torch.long) - 1
+        next_tokens = out.logits[rows, last_positions].argmax(dim=-1).tolist()
 
-        request.next_token_id = int(out.logits[0, -1, :].argmax().item())
-        self.scheduler.mark_decoding(request.request_id)
-        request.append_token(request.next_token_id)
-        if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
-            reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
-            self.scheduler.finish(request.request_id, reason=reason)
+        for request, token in zip(requests, next_tokens):
+            request.next_token_id = int(token)
+            self.scheduler.mark_decoding(request.request_id)
+            request.append_token(request.next_token_id)
+            if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
+                reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
+                self.scheduler.finish(request.request_id, reason=reason)
 
     # ------------------------------------------------------------------
     # D2: one batched decode step over all active sequences
@@ -328,8 +363,7 @@ class ContinuousBatchingEngine:
 
         while self.scheduler.waiting or self.scheduler.active:
             admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
-            for request in admitted:
-                self.prefill(request)
+            self.prefill_batch(admitted)
             active = [
                 request
                 for request in self.scheduler.active.values()

@@ -105,6 +105,37 @@ def test_d1_prefill_stores_correct_kv():
             assert torch.equal(got_v, ref_v[pos]), f"layer {layer_idx} pos {pos} V mismatch"
 
 
+@cuda
+@requires_cuda
+def test_d1_batched_prefill_matches_individual_reference():
+    """Mixed prompt lengths share one prefill forward without changing first tokens."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    eng = ContinuousBatchingEngine(model, tok, "cuda", num_blocks=1024, block_size=16)
+    prompts = [
+        "Hi",
+        "The capital of France is",
+        "Explain why continuous batching improves inference throughput in one sentence.",
+    ]
+    refs = [_reference_greedy(model, tok, prompt, 1)[0] for prompt in prompts]
+    requests = []
+    for index, prompt in enumerate(prompts):
+        token_ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
+        request = GenerationRequest(
+            f"batch-{index}", len(token_ids), 8, prompt_token_ids=token_ids
+        )
+        eng.scheduler.submit(request)
+        requests.append(request)
+    admitted = eng.scheduler.admit_available(max_active_requests=eng.max_active)
+    assert admitted == requests
+
+    eng.prefill_batch(admitted)
+
+    assert [request.output_token_ids[0] for request in requests] == refs
+    assert all(request.state.name == "DECODING" for request in requests)
+
+
 # ---------------------------------------------------------------------------
 # D2: one batched decode step matches per-sequence decode
 # ---------------------------------------------------------------------------

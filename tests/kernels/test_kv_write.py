@@ -6,48 +6,6 @@ import torch
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("sequence_length", [1, 15, 16, 17, 41, 64])
-def test_fused_kv_write_matches_reference_scatter(sequence_length: int) -> None:
-    from engine.kernels.kv_write import write_paged_kv
-
-    torch.manual_seed(7)
-    heads, head_dim, block_size, physical_blocks = 8, 128, 16, 12
-    key = torch.randn(
-        1, heads, sequence_length, head_dim, device="cuda", dtype=torch.float16
-    )
-    value = torch.randn_like(key)
-    blocks_needed = (sequence_length + block_size - 1) // block_size
-    block_table = torch.tensor(
-        [9, 2, 11, 4][:blocks_needed], dtype=torch.int32, device="cuda"
-    )
-    key_pool = torch.zeros(
-        physical_blocks, block_size, heads, head_dim, device="cuda", dtype=torch.float16
-    )
-    value_pool = torch.zeros_like(key_pool)
-
-    write_paged_kv(key, value, key_pool, value_pool, block_table)
-    torch.cuda.synchronize()
-
-    for token in range(sequence_length):
-        logical_block, offset = divmod(token, block_size)
-        physical_block = int(block_table[logical_block].item())
-        assert torch.equal(key_pool[physical_block, offset], key[0, :, token])
-        assert torch.equal(value_pool[physical_block, offset], value[0, :, token])
-
-
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_kv_write_rejects_short_block_table() -> None:
-    from engine.kernels.kv_write import write_paged_kv
-
-    key = torch.zeros(1, 2, 17, 8, device="cuda", dtype=torch.float16)
-    pool = torch.zeros(4, 16, 2, 8, device="cuda", dtype=torch.float16)
-    with pytest.raises(ValueError, match="does not cover"):
-        write_paged_kv(key, key, pool, pool.clone(), torch.tensor([0], device="cuda"))
-
-
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_batched_decode_kv_write_matches_reference() -> None:
     from engine.kernels.kv_write import write_decode_kv
 
@@ -86,3 +44,40 @@ def test_batched_decode_kv_write_matches_reference() -> None:
         physical_block = int(block_tables[batch, logical_block].item())
         assert torch.equal(key_pool[physical_block, offset], key[batch, :, 0])
         assert torch.equal(value_pool[physical_block, offset], value[batch, :, 0])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_prefill_write_ignores_padding_and_maps_each_request() -> None:
+    from engine.kernels.kv_write import write_prefill_kv_batched
+
+    torch.manual_seed(41)
+    batch, heads, padded_length, head_dim = 3, 8, 33, 128
+    block_size, physical_blocks = 16, 20
+    lengths = torch.tensor([7, 16, 33], dtype=torch.int32, device="cuda")
+    tables = torch.tensor(
+        [[9, -1, -1], [2, -1, -1], [11, 4, 17]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    key = torch.randn(
+        batch, heads, padded_length, head_dim, device="cuda", dtype=torch.float16
+    )
+    value = torch.randn_like(key)
+    key_pool = torch.zeros(
+        physical_blocks, block_size, heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    value_pool = torch.zeros_like(key_pool)
+
+    write_prefill_kv_batched(key, value, key_pool, value_pool, tables, lengths)
+    torch.cuda.synchronize()
+
+    for row, length in enumerate(lengths.tolist()):
+        for token in range(length):
+            logical_block, offset = divmod(token, block_size)
+            physical_block = int(tables[row, logical_block].item())
+            assert torch.equal(key_pool[physical_block, offset], key[row, :, token])
+            assert torch.equal(value_pool[physical_block, offset], value[row, :, token])
+    # Padding for the short rows must never be written through their -1 sentinels.
+    assert torch.count_nonzero(key_pool[-1]) == 0
+    assert torch.count_nonzero(value_pool[-1]) == 0

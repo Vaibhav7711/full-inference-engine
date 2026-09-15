@@ -5,57 +5,42 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import DynamicCache
 
-from engine.kernels.kv_write import write_paged_kv
+from engine.kernels.kv_write import write_prefill_kv_batched
 
 
-class PoolBackedPrefillCache(DynamicCache):
-    """DynamicCache-compatible prefill writer without temporary KV ownership.
+class BatchedPoolBackedPrefillCache(DynamicCache):
+    """Cache adapter for padded multi-request prefill into shared physical blocks."""
 
-    Qwen attention passes already-rotated K/V to ``update``. This adapter writes them
-    directly to the request's physical blocks and returns the original tensors for the
-    current prefill attention operation. It is intentionally single-request/prefill
-    only; continuous decode reads the shared pool through the K4 kernel.
-    """
-
-    def __init__(
-        self,
-        key_pool: list[torch.Tensor],
-        value_pool: list[torch.Tensor],
-        block_table: torch.Tensor,
-    ):
+    def __init__(self, key_pool, value_pool, block_tables, seq_lens, padded_length):
         if not key_pool or len(key_pool) != len(value_pool):
             raise ValueError("matching non-empty per-layer K/V pools are required")
         self.key_pool = key_pool
         self.value_pool = value_pool
-        self.block_table = block_table
+        self.block_tables = block_tables
+        self.seq_lens = seq_lens
+        self.padded_length = padded_length
         self._layer_lengths = [0] * len(key_pool)
         self.layer_class_to_replicate = None
         try:
             super().__init__()
         except Exception:
-            # Transformers cache initialization has changed across supported releases;
-            # all model-facing methods used by this adapter are overridden below.
             pass
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         if self._layer_lengths[layer_idx] != 0:
-            raise RuntimeError("PoolBackedPrefillCache supports exactly one prefill write")
-        write_paged_kv(
-            key_states,
-            value_states,
-            self.key_pool[layer_idx],
-            self.value_pool[layer_idx],
-            self.block_table,
+            raise RuntimeError("batched prefill cache supports exactly one write per layer")
+        write_prefill_kv_batched(
+            key_states, value_states, self.key_pool[layer_idx], self.value_pool[layer_idx],
+            self.block_tables, self.seq_lens,
         )
-        self._layer_lengths[layer_idx] = key_states.shape[2]
+        self._layer_lengths[layer_idx] = self.padded_length
         return key_states, value_states
 
     def get_seq_length(self, layer_idx: int = 0, *args, **kwargs) -> int:
         return self._layer_lengths[layer_idx]
 
     def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
-        past_seen = self._layer_lengths[layer_idx]
-        return past_seen + query_length, 0
+        return self._layer_lengths[layer_idx] + query_length, 0
 
     def get_max_cache_shape(self, *args, **kwargs):
         return None
