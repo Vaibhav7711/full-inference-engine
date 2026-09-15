@@ -141,7 +141,11 @@ class ContinuousBatchingEngine:
         # Qwen uses RMSNorm for hidden states and for per-head Q/K normalization.
         # Install one FP32-accumulating Triton kernel for both shapes before warmup.
         from engine.kernels.rmsnorm import install_triton_rmsnorm
+        from engine.kernels.rope import install_triton_qwen_rope
+        from engine.kernels.swiglu import install_triton_qwen_swiglu
         self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
+        install_triton_qwen_rope()
+        self.triton_swiglu_modules = install_triton_qwen_swiglu(model)
 
         self.eos_ids = set()
         ce = model.generation_config.eos_token_id
