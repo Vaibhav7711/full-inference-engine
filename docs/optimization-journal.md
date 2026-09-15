@@ -1201,3 +1201,28 @@ Decision: retain the code only as an isolated benchmark/reference, with no model
 engine integration. FP16 stays the decode-linear default. INT8 KV remains separately
 justified as an opt-in long-context capacity mode; it should not be conflated with
 weight quantization.
+
+## Phase 11 — Mixed-arrival scheduler prefill budget
+
+Status: `COMPLETE — KEEP 128-TOKEN DEFAULT`
+
+Earlier scheduler work established a decode-first loop with chunked prefill, but its
+default prefill iteration budget was 512 tokens. The mixed-arrival workload introduces
+short, medium, and long requests over scheduler iterations and measures queue time,
+TTFT, and ITL under the real graph-bucket path. Its initial 256-token run showed typical
+ITL near 10 ms but approximately 125 ms p95 stalls while prefill work shares the loop.
+
+An interleaved five-round sweep kept the 64-token chunk size fixed and rotated the
+64/128/256-token budget order every round. Reported values are per-policy medians:
+
+| Prefill budget | Throughput | Short p95 ITL | Medium p95 ITL | Long p50 TTFT |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 295.2 tok/s | 50.44 ms | 45.78 ms | 898.13 ms |
+| 128 | 430.0 tok/s | 63.39 ms | 63.39 ms | 530.70 ms |
+| 256 | 424.0 tok/s | 62.59 ms | 62.56 ms | 543.79 ms |
+
+Decision: set `max_prefill_tokens_per_iteration=128` as the engine default. It is the
+highest-throughput and lowest-long-TTFT setting in the interleaved workload. The roughly
+0.8 ms p95 ITL difference versus 256 is not enough to offset 256's lower throughput and
+higher long TTFT. A 64-token budget is available for an explicit latency-priority mode,
+but is not a reasonable general default because it increases long TTFT by about 69%.

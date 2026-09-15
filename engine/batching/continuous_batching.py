@@ -193,7 +193,7 @@ class ContinuousBatchingEngine:
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
-                 max_prefill_tokens_per_iteration: int = 512,
+                 max_prefill_tokens_per_iteration: int = 128,
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,
                  kv_cache_dtype: str = "fp16",

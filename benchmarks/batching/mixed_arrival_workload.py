@@ -105,7 +105,7 @@ def main() -> None:
     parser.add_argument("--max-active", type=int, default=16)
     parser.add_argument("--num-blocks", type=int, default=1024)
     parser.add_argument("--prefill-chunk-size", type=int, default=64)
-    parser.add_argument("--prefill-token-budget", type=int, default=256)
+    parser.add_argument("--prefill-token-budget", type=int, default=128)
     parser.add_argument("--graph-buckets", default="2,4,8,16")
     parser.add_argument("--output", default="results/mixed_arrival_phase11_baseline.json")
     args = parser.parse_args()
