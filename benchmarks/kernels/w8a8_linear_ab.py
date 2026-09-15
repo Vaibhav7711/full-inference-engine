@@ -33,7 +33,7 @@ def main() -> None:
         raise SystemExit("Requires CUDA")
 
     from engine.kernels.w8a16_linear import quantize_weight_per_channel
-    from engine.kernels.w8a8_linear import w8a8_linear
+    from engine.kernels.w8a8_linear import pack_w8a8_weight, w8a8_linear
 
     hidden = 1024
     shapes = {"attention_1024": 1024, "mlp_3072": 3072}
@@ -45,8 +45,9 @@ def main() -> None:
             inputs = torch.randn(batch, hidden, device="cuda", dtype=torch.float16)
             weight = torch.randn(output_width, hidden, device="cuda", dtype=torch.float16)
             qweight, scales = quantize_weight_per_channel(weight)
+            packed_weight = pack_w8a8_weight(qweight)
             fp16 = lambda: torch.nn.functional.linear(inputs, weight)
-            w8a8 = lambda: w8a8_linear(inputs, qweight, scales)
+            w8a8 = lambda: w8a8_linear(inputs, packed_weight, scales)
             fp16_output, w8a8_output = fp16(), w8a8()
             fp16_ms = _median(fp16, args.warmup, args.repeats)
             w8a8_ms = _median(w8a8, args.warmup, args.repeats)

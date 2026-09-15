@@ -11,7 +11,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 @requires_cuda
 def test_w8a8_linear_matches_per_row_quantization_reference() -> None:
     from engine.kernels.w8a16_linear import quantize_weight_per_channel
-    from engine.kernels.w8a8_linear import w8a8_linear
+    from engine.kernels.w8a8_linear import pack_w8a8_weight, w8a8_linear
 
     torch.manual_seed(91)
     x = torch.randn(16, 1024, device="cuda", dtype=torch.float16)
@@ -23,5 +23,5 @@ def test_w8a8_linear_matches_per_row_quantization_reference() -> None:
     # signed INT8 accumulation is 16,516,096 (< 2**24), so FP32 represents this
     # integer reference exactly on the T4.
     reference = (qx.float() @ qweight.t().float()) * scale * wscale.float()[None, :]
-    actual = w8a8_linear(x, qweight, wscale)
+    actual = w8a8_linear(x, pack_w8a8_weight(qweight), wscale)
     torch.testing.assert_close(actual, reference.to(torch.float16), rtol=4e-3, atol=4e-3)
