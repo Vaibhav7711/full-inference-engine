@@ -1252,7 +1252,7 @@ the dynamic path.
 
 ## Phase 13 — HTTP API integration with continuous batching
 
-Status: `IN PROGRESS — CUDA API SMOKE TEST REQUIRED`
+Status: `COMPLETE — KEEP`
 
 The previous FastAPI surface called `ExplicitDecodeRunner` directly, which serialized
 each HTTP request and bypassed the scheduler, paged KV, prefix cache, and graph work.
@@ -1261,6 +1261,12 @@ queue. HTTP and SSE handlers submit tokenized requests and only observe lifecycl
 the worker alone drains submissions, calls continuous scheduler steps, and publishes
 completion. This removes concurrent handler access to mutable GPU/scheduler state.
 
-The first CPU lifecycle test passes. Acceptance requires a CUDA FastAPI smoke test with
-concurrent `/generate` requests and token-equivalent SSE completion before this phase is
-marked complete.
+The CPU lifecycle test passes. The CUDA FastAPI smoke test loaded one service instance,
+completed four concurrent `/generate` requests through its shared worker, and then
+verified that `/generate/stream` emitted the identical greedy token sequence for the
+same request. The service enables recommended graph buckets `(2, 4, 8, 16)` by default.
+
+Decision: `KEEP`. The serving API now exercises the production continuous engine rather
+than the obsolete one-request reference runner. Request cancellation on disconnect,
+timeout policy, and load-generator percentile testing remain the next service hardening
+work; they are not required to claim continuous HTTP batching correctness.
