@@ -1175,8 +1175,8 @@ Second, a true W8A8 path was attempted. Triton 3.x could not lower signed INT8 M
 the Colab T4's `sm75` target, so the final experiment used CUDA's native INT8xINT8 to
 INT32 GEMM through `torch._int_mm`. It prepacked the transposed INT8 weight once, then
 performed dynamic per-row activation quantization, the CUDA INT8 GEMM, and scale
-dequantization. For decode widths at or below 16, the CUDA API also requires padding to
-17 internal rows; that cost was included in the measurement.
+dequantization. For decode widths at or below 16, PyTorch's `torch._int_mm` wrapper
+also requires padding to 17 internal rows; that cost was included in the measurement.
 
 | Shape | Batch | FP16 ms | W8A8 ms | FP16 / W8A8 | Relative error |
 | --- | ---: | ---: | ---: | ---: | ---: |
