@@ -105,6 +105,8 @@ def main():
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--cuda-graph-batch-size", type=int, default=None,
                         help="enable paged CUDA-Graph replay only at this fixed active width")
+    parser.add_argument("--disable-mlp-gate-up-fusion", action="store_true",
+                        help="retain separate Qwen MLP gate/up projections for an A/B baseline")
     parser.add_argument("--warmup", action="store_true", help="run a small warmup first")
     parser.add_argument("--output", default="results/continuous_throughput.json")
     args = parser.parse_args()
@@ -132,7 +134,8 @@ def main():
     # ONE engine, reused across all concurrency levels (the pool is large; don't make many).
     engine = ContinuousBatchingEngine(model, tok, device,
                                       num_blocks=args.num_blocks, block_size=args.block_size,
-                                      cuda_graph_batch_size=args.cuda_graph_batch_size)
+                                      cuda_graph_batch_size=args.cuda_graph_batch_size,
+                                      fuse_mlp_gate_up=not args.disable_mlp_gate_up_fusion)
 
     # Warmup (compile kernels, warm caches)
     if args.warmup:
