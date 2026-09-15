@@ -1020,3 +1020,28 @@ reference and attention error against the existing FP16 paged kernel at 64, 256,
 1,024-token contexts. Integration with chunked prefill, copy-on-write prefix tails,
 and the online scheduler is explicitly deferred until this isolated CUDA gate and a
 long-context latency A/B measurement pass.
+
+### Phase 6A acceptance — isolated decode kernel
+
+The CUDA writer-reference test and the 64/256/1,024-token attention-error tests passed.
+A paired, interleaved T4 benchmark was used for the latency decision; it alternates FP16
+and INT8 launches every sample and reports independent round medians, preventing clock
+or thermal drift from favoring either variant.
+
+| Context | Batch | INT8 / FP16 latency | Interpretation |
+| ---: | ---: | ---: | --- |
+| 256 | 1 | 0.92x | Do not use INT8 for a single short stream. |
+| 256 | 16 | 1.05x | Marginal; not an integration trigger. |
+| 1,024 | 1 | 0.99x | Neutral. |
+| 1,024 | 16 | 1.22x | Accepted long-context saturated regime. |
+| 2,048 | 1 | 1.05x | Small and not a serving claim. |
+| 2,048 | 16 | 1.37x | Accepted long-context saturated regime. |
+
+Across all six cases, relative attention-output error was 0.87--0.96% and INT8 pages
+plus FP16 scales reduced K/V storage by 49.2%. The 1,024-token width-16 paired-round
+speedup range was 1.21--1.36x; the 2,048-token width-16 range was 1.36--1.38x.
+
+Decision: `KEEP Phase 6A`. The result justifies an opt-in INT8 KV storage mode for
+long-context saturated batches, not a global replacement for FP16. Phase 6B must add
+INT8 chunk-prefill writes/reads, prefix-tail copy-on-write for both data and scales, and
+an end-to-end long-context continuous-batching gate before it is exposed by the engine.
