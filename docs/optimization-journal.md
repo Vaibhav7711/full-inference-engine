@@ -1226,3 +1226,41 @@ highest-throughput and lowest-long-TTFT setting in the interleaved workload. The
 0.8 ms p95 ITL difference versus 256 is not enough to offset 256's lower throughput and
 higher long TTFT. A 64-token budget is available for an explicit latency-priority mode,
 but is not a reasonable general default because it increases long TTFT by about 69%.
+
+## Phase 12 — Mixed-arrival padded CUDA-Graph serving path
+
+Status: `COMPLETE — KEEP AS RECOMMENDED SERVER CONFIGURATION`
+
+The mixed-arrival workload compared ordinary dynamic decode against padded graph buckets
+`(2, 4, 8, 16)` while using the selected 128-token prefill budget. Both paths generated
+identical greedy token sequences.
+
+| Path | Throughput | Elapsed | Relative throughput |
+| --- | ---: | ---: | ---: |
+| Ordinary | 150.2 tok/s | 2.557 s | 1.00x |
+| Padded graphs | 279.6 tok/s | 1.374 s | 1.86x |
+
+Graph replay improved medium p95 TTFT from 208.71 to 107.36 ms and long p95 TTFT from
+913.46 to 817.44 ms. It also improved long p95 ITL from 100.68 to 89.06 ms. Short p95
+ITL regressed from 123.25 to 156.91 ms, a known interaction between padded graph work
+and the shared prefill/decode scheduling loop.
+
+Decision: recommend graph buckets `(2, 4, 8, 16)` for throughput-oriented serving, but
+do not make graphs an unconditional base-engine default. The service layer enables them
+by default; callers requiring the best short-request tail latency can explicitly choose
+the dynamic path.
+
+## Phase 13 — HTTP API integration with continuous batching
+
+Status: `IN PROGRESS — CUDA API SMOKE TEST REQUIRED`
+
+The previous FastAPI surface called `ExplicitDecodeRunner` directly, which serialized
+each HTTP request and bypassed the scheduler, paged KV, prefix cache, and graph work.
+The new service layer introduces a single GPU-owning worker thread with a bounded ingress
+queue. HTTP and SSE handlers submit tokenized requests and only observe lifecycle state;
+the worker alone drains submissions, calls continuous scheduler steps, and publishes
+completion. This removes concurrent handler access to mutable GPU/scheduler state.
+
+The first CPU lifecycle test passes. Acceptance requires a CUDA FastAPI smoke test with
+concurrent `/generate` requests and token-equivalent SSE completion before this phase is
+marked complete.

@@ -91,10 +91,15 @@ workload, TTFT, prefill, per-token decode, p50/p95/p99, throughput, and peak mem
 uvicorn 'engine.server.api:create_app' --factory --host 0.0.0.0 --port 8000
 ```
 
-`POST /generate` returns a completed response. `POST /generate/stream` emits SSE
-events with token ID, text, index, and EOS/LENGTH termination. It is deliberately a
-single-request reference stream; scheduler-integrated streaming requires physical
-continuous batching first.
+`POST /generate` and `POST /generate/stream` submit work to one background
+`ContinuousBatchingEngine` worker. The worker owns all GPU/scheduler state, batches
+requests arriving from concurrent HTTP handlers, and exposes paged KV, decode-first
+scheduling, and the recommended padded CUDA-Graph buckets (`2,4,8,16`) through the
+serving API. SSE emits token ID, text, index, and EOS/LENGTH termination.
+
+The service has a bounded ingress queue and returns HTTP 429 when it is full. Client
+disconnect cancellation is still a remaining service-layer feature; disconnected work
+currently completes in the worker to preserve engine-state safety.
 
 ### Static batching
 
@@ -299,11 +304,10 @@ remaining work should be justified by measurement:
    timeline evidence warrants it.
 2. Bind page tables to a real paged-attention execution path and compare memory benefit
    against gather/attention overhead.
-3. Connect continuous-batching plans to physical batched KV execution.
-4. Add server load generation: steady, bursty, randomized arrivals; TTFT p50/p95/p99,
+3. Add server load generation: steady, bursty, randomized arrivals; TTFT p50/p95/p99,
    queue/service time, occupancy, throughput, and GPU utilization.
-5. Add failure tests for OOM, cache exhaustion, cancellation, disconnect, malformed
+4. Add failure tests for OOM, cache exhaustion, cancellation, disconnect, malformed
    requests, model errors, and partial batch failures.
-6. Choose a Triton/CUDA target only after profiling establishes a bottleneck.
+5. Choose a Triton/CUDA target only after profiling establishes a bottleneck.
 
 Honest measured failures and clear limits are part of the engineering evidence.
