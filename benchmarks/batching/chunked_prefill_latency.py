@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import statistics
+import time
 
 import torch
 
@@ -55,6 +56,24 @@ def _scenario(engine, tokenizer, long_prompt: str, chunk_size: int) -> dict:
     }
 
 
+def _warm_chunked_path(engine, tokenizer, long_prompt: str, chunk_size: int) -> float:
+    """Compile the real paged-prefill path without contaminating measured state."""
+    engine.reset()
+    engine.prefill_chunk_size = chunk_size
+    engine.max_prefill_tokens_per_iteration = chunk_size
+    request = _request(tokenizer, "chunk-warmup", long_prompt, 1)
+    engine.submit(request)
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    engine.step()
+    torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if request.request_id in engine.scheduler.active:
+        engine.cancel(request.request_id, reason="WARMUP_COMPLETE")
+    engine.reset()
+    return elapsed_ms
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
@@ -80,7 +99,7 @@ def main() -> None:
         max_prefill_tokens_per_iteration=args.chunk_size,
     )
 
-    # Compile both the normal and chunked paths before measuring.
+    # Warm the short SDPA/decode path, then explicitly compile the paged chunk path.
     engine.generate(["Warm up the inference engine."], max_new_tokens=4)
     long_prompt = (
         "Describe a robust GPU inference runtime including scheduling, paged memory, "
@@ -88,9 +107,17 @@ def main() -> None:
         * args.long_prompt_repeats
     )
     long_tokens = len(tokenizer(long_prompt, return_tensors="pt").input_ids[0])
+    chunk_compile_warmup_ms = _warm_chunked_path(
+        engine, tokenizer, long_prompt, args.chunk_size
+    )
     unchunked = _scenario(engine, tokenizer, long_prompt, long_tokens)
     chunked = _scenario(engine, tokenizer, long_prompt, args.chunk_size)
-    result = {"config": vars(args), "unchunked": unchunked, "chunked": chunked}
+    result = {
+        "config": vars(args),
+        "chunk_compile_warmup_ms": chunk_compile_warmup_ms,
+        "unchunked": unchunked,
+        "chunked": chunked,
+    }
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as handle:
         json.dump(result, handle, indent=2)
@@ -104,7 +131,17 @@ def main() -> None:
             f"{row['long_prompt_ttft_ms']:>11.2f}"
         )
     print(f"\nSaved -> {args.output}")
-    print("Interpretation: chunking bounds decode stalls; long-prompt TTFT may increase.")
+    if chunked["anchor_itl_max_ms"] < unchunked["anchor_itl_max_ms"]:
+        reduction = 100 * (
+            1 - chunked["anchor_itl_max_ms"] / unchunked["anchor_itl_max_ms"]
+        )
+        print(f"Interpretation: chunking reduced worst-case decode ITL by {reduction:.1f}%.")
+    else:
+        regression = 100 * (
+            chunked["anchor_itl_max_ms"] / unchunked["anchor_itl_max_ms"] - 1
+        )
+        print(f"Interpretation: chunking regressed worst-case decode ITL by {regression:.1f}%.")
+    print("Long-prompt TTFT and typical decoder ITL are explicit tradeoffs above.")
 
 
 if __name__ == "__main__":

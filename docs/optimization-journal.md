@@ -812,4 +812,20 @@ T4 acceptance gate:
 - The established 16-request, 32-token short-prompt throughput remains at least
   393.1 tok/s (within 5% of the accepted 413.8 tok/s baseline).
 
+First T4 gate:
+
+- All 15 lifecycle/scheduler/allocator tests, all four focused Triton tests, and all
+  seven full-model continuous/chunked tests passed.
+- Width-16 short-prompt throughput was 407.4 tok/s, only 1.5% below the accepted
+  413.8 tok/s baseline and above the 393.1 tok/s floor. The fast path is retained.
+- The first latency output reported unchunked/chunked worst ITL of 313.92/513.15 ms.
+  This cannot support the latency claim.
+- Audit found the benchmark warmed only a short prompt, which selected SDPA and never
+  invoked the new paged-prefill kernel. The first measured chunk therefore included
+  Triton compilation even though the benchmark comment claimed both paths were warm.
+- The benchmark now explicitly executes and synchronizes one real partial chunk before
+  either measured scenario and prints a conditional result instead of always claiming
+  that chunking helped. Only the latency benchmark must be rerun; correctness and the
+  short-prompt throughput gate are already accepted.
+
 Decision: `PENDING T4 MEASUREMENT`.
