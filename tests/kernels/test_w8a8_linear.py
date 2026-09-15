@@ -19,6 +19,6 @@ def test_w8a8_linear_matches_per_row_quantization_reference() -> None:
     qweight, wscale = quantize_weight_per_channel(weight)
     scale = x.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127
     qx = torch.round(x.float() / scale).clamp(-127, 127).to(torch.int8)
-    reference = torch._int_mm(qx, qweight.t().contiguous()).float() * scale * wscale.float()[None, :]
+    reference = (qx.to(torch.int32) @ qweight.t().to(torch.int32)).float() * scale * wscale.float()[None, :]
     actual = w8a8_linear(x, qweight, wscale)
     torch.testing.assert_close(actual, reference.to(torch.float16), rtol=4e-3, atol=4e-3)
