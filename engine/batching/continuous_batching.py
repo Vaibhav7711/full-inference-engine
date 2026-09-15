@@ -339,7 +339,7 @@ class ContinuousBatchingEngine:
                 self._host_input_ids[row, 0] = pad_token
                 self._host_position_ids[row, 0] = 0
                 self._host_seq_lens[row] = 0
-                self._host_block_tables[row, 0] = self._graph_dummy_blocks[row]
+                self._host_block_tables[row, 0] = self._graph_dummy_blocks[row - count]
 
         input_ids = self._device_input_ids[:row_count]
         position_ids = self._device_position_ids[:row_count]
