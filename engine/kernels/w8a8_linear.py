@@ -23,7 +23,11 @@ def _w8a8_kernel(x_ptr, w_ptr, ws_ptr, out_ptr, M, N, K,
         xq = tl.maximum(tl.minimum(xq, 127.0), -127.0).to(tl.int8)
         wq = tl.load(w_ptr + on[None, :] * swn + (start + ok[:, None]) * swk,
                      mask=(on[None, :] < N) & (start + ok[:, None] < K), other=0)
-        acc += tl.dot(xq, wq).to(tl.float32) * (xscale[:, None] * wscale[None, :])
+        # Turing exposes INT8 tensor cores, but Triton's default dot output type
+        # is floating point.  Make the integer MMA accumulation explicit before
+        # applying the two quantization scales.
+        dot_i32 = tl.dot(xq, wq, out_dtype=tl.int32)
+        acc += dot_i32.to(tl.float32) * (xscale[:, None] * wscale[None, :])
     tl.store(out_ptr + om[:, None] * som + on[None, :] * son, acc.to(out_ptr.dtype.element_ty),
              mask=(om[:, None] < M) & (on[None, :] < N))
 
