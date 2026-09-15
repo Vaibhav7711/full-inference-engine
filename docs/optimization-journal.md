@@ -879,9 +879,13 @@ Lookup and eviction:
 
 - Added a block-radix tree keyed by `(parent, complete token block)`. Lookup walks the
   longest matching token path and returns the existing physical block IDs directly.
-- Lookup always leaves at least one prompt token uncached. KV alone does not contain the
-  final-token logits, so residual prefill is required to produce the first generated
-  token without duplicating the last cached position.
+- A general shared-prefix lookup leaves at least one prompt token uncached. KV alone
+  does not contain final-token logits, so residual prefill is required for a prefix that
+  belongs to a different prompt.
+- Exact prompt entries additionally retain every prompt block and the first-token
+  decision produced by that KV state. Exact hits can therefore bypass residual prefill.
+  A shared partial tail is copied to a private physical block before decode writes into
+  it, preserving both the cached entry and token-identical repeated generation.
 - Residual tokens use the Phase 3 paged-prefill kernel with absolute positions, naturally
   continuing from shared blocks into newly allocated private blocks.
 - Cache capacity is expressed in physical blocks. Eviction removes least-recently-used
@@ -912,9 +916,10 @@ Validation and measurement:
 - Updated leak assertions to distinguish intentional cache residency from live request
   ownership.
 - Added a same-engine TTFT benchmark. It warms the long SDPA shape, records one true
-  miss, excludes the first compiling prefix hit, then measures five warmed hits while
-  requiring identical greedy output tokens.
-- Local gate: 100 passed, 94 CUDA tests skipped; compilation and diff checks passed.
+  miss, excludes the first cache lookup, then measures five steady-state exact hits
+  while requiring identical greedy output tokens.
+- Local gate after exact-hit repair: 102 passed, 94 CUDA tests skipped; compilation and
+  diff checks passed.
 
 T4 acceptance gate:
 
@@ -925,5 +930,22 @@ T4 acceptance gate:
   speedup without generalizing beyond the measured shared-prefix workload.
 - The established 16-request short-prompt throughput remains at least 393.1 tok/s,
   confirming that miss-only workloads retain the accepted fast path.
+
+First T4 gate and root-cause repair:
+
+- All 20 ownership/scheduler tests and all four residual-prefill kernel tests passed.
+- Seven existing full-model tests passed. The new repeated-prompt test produced the same
+  first token but diverged on later greedy tokens, so benchmarking correctly stopped.
+- The original design reused complete blocks but recomputed the uncached prompt suffix
+  with a different kernel and GEMM shape. Its numerically valid FP16 differences were
+  sufficient to change later greedy choices for the selected prompt. Refcounting and
+  physical addressing were not the failing invariants.
+- The repair adds exact-prompt entries containing all prompt block IDs and the cached
+  first-token decision. Exact hits now attach the original KV state without residual
+  recomputation. If the last prompt block is partial, decode performs allocator-level
+  copy-on-write and copies that K/V page across every layer before modifying it.
+- Added direct tests for exact lookup metadata, partial-tail ownership replacement, and
+  preservation of the original shared mapping. The full T4 integration test remains the
+  authoritative token-equivalence gate.
 
 Decision: `PENDING T4 MEASUREMENT`.

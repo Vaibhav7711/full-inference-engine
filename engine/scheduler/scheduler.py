@@ -66,6 +66,7 @@ class FCFSScheduler:
                 )
                 request.prefilled_token_count = match.token_count
                 request.cached_prefix_tokens = match.token_count
+                request.cached_next_token_id = match.next_token_id
             else:
                 allocation = self.block_manager.reserve(
                     request.request_id,

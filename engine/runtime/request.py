@@ -48,6 +48,7 @@ class GenerationRequest:
     last_token_ns: int | None = None
     token_timestamps_ns: list[int] = field(default_factory=list)
     cached_prefix_tokens: int = 0
+    cached_next_token_id: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:

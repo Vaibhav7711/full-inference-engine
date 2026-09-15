@@ -43,3 +43,25 @@ def test_prefix_cache_evicts_lru_leaves_to_its_block_budget() -> None:
     assert cache.snapshot()["cached_blocks"] == 2
     assert cache.snapshot()["evictions"] == 1
     assert cache.lookup(list(range(13))).token_count == 8
+
+
+def test_exact_prompt_hit_reuses_partial_tail_and_first_token() -> None:
+    manager = KVBlockManager(num_blocks=8, block_size_tokens=4)
+    cache = PrefixCache(manager, max_blocks=4)
+    source = manager.reserve("source", 6, sequence_length=6)
+    assert source is not None
+    cache.publish(list(range(6)), source, next_token_id=42)
+    source_blocks = tuple(source.physical_block_ids)
+    manager.release("source")
+
+    match = cache.lookup(list(range(6)))
+    assert match.exact
+    assert match.token_count == 6
+    assert match.next_token_id == 42
+    assert match.physical_block_ids == source_blocks
+    attached = manager.attach_prefix("hit", list(match.physical_block_ids), 6)
+    old_tail = attached.physical_block_ids[-1]
+    copied = manager.copy_on_write_tail("hit")
+    assert copied is not None and copied[0] == old_tail
+    assert attached.physical_block_ids[-1] != old_tail
+    assert manager.allocator.refcount(old_tail) >= 1

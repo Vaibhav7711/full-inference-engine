@@ -12,6 +12,11 @@ class _CacheOwner:
     node_id: int
 
 
+@dataclass(frozen=True)
+class _ExactOwner:
+    entry_id: int
+
+
 @dataclass
 class _PrefixNode:
     node_id: int
@@ -23,10 +28,22 @@ class _PrefixNode:
     last_access: int = 0
 
 
+@dataclass
+class _ExactEntry:
+    entry_id: int
+    token_ids: tuple[int, ...]
+    physical_block_ids: tuple[int, ...]
+    next_token_id: int
+    owner: _ExactOwner
+    last_access: int = 0
+
+
 @dataclass(frozen=True)
 class PrefixMatch:
     physical_block_ids: tuple[int, ...] = ()
     token_count: int = 0
+    next_token_id: int | None = None
+    exact: bool = False
 
 
 class PrefixCache:
@@ -39,7 +56,9 @@ class PrefixCache:
         self.max_blocks = max_blocks
         self._nodes: dict[int, _PrefixNode] = {}
         self._edges: dict[tuple[int | None, tuple[int, ...]], int] = {}
+        self._exact: dict[tuple[int, ...], _ExactEntry] = {}
         self._next_node_id = 0
+        self._next_entry_id = 0
         self._clock = 0
         self.lookups = 0
         self.hits = 0
@@ -49,6 +68,14 @@ class PrefixCache:
     def lookup(self, token_ids: list[int]) -> PrefixMatch:
         """Return the longest complete-block prefix, always leaving one prompt token."""
         self.lookups += 1
+        exact = self._exact.get(tuple(token_ids))
+        if exact is not None:
+            self._touch(exact)
+            self.hits += 1
+            self.hit_tokens += len(token_ids)
+            return PrefixMatch(
+                exact.physical_block_ids, len(token_ids), exact.next_token_id, True
+            )
         reusable_tokens = max(0, len(token_ids) - 1)
         complete_blocks = reusable_tokens // self.block_manager.block_size_tokens
         parent_id = None
@@ -71,7 +98,12 @@ class PrefixCache:
             self.hit_tokens += token_count
         return PrefixMatch(tuple(physical_blocks), token_count)
 
-    def publish(self, token_ids: list[int], allocation: KVBlockAllocation) -> int:
+    def publish(
+        self,
+        token_ids: list[int],
+        allocation: KVBlockAllocation,
+        next_token_id: int | None = None,
+    ) -> int:
         """Retain newly computed complete blocks and return the number published."""
         if self.max_blocks == 0:
             return 0
@@ -108,6 +140,27 @@ class PrefixCache:
                 self._nodes[parent_id].children.add(node_id)
             parent_id = node_id
             published += 1
+        # Exact hits can bypass residual prefill only when the cache owns every prompt
+        # block plus the first-token decision produced by that exact KV state.
+        exact_key = tuple(token_ids)
+        prompt_blocks = (
+            len(token_ids) + self.block_manager.block_size_tokens - 1
+        ) // self.block_manager.block_size_tokens
+        if (
+            next_token_id is not None
+            and prompt_blocks <= self.max_blocks
+            and exact_key not in self._exact
+        ):
+            block_ids = tuple(allocation.physical_block_ids[:prompt_blocks])
+            entry_id = self._next_entry_id
+            self._next_entry_id += 1
+            owner = _ExactOwner(entry_id)
+            self.block_manager.allocator.attach(owner, block_ids)
+            entry = _ExactEntry(
+                entry_id, exact_key, block_ids, int(next_token_id), owner
+            )
+            self._touch(entry)
+            self._exact[exact_key] = entry
         self._evict_to_limit()
         return published
 
@@ -118,19 +171,21 @@ class PrefixCache:
         before = self.block_manager.allocator.free_block_count
         while (
             self.block_manager.allocator.free_block_count < required_free_blocks
-            and self._evict_one_leaf()
+            and self._evict_one()
         ):
             pass
         return self.block_manager.allocator.free_block_count - before
 
     def clear(self) -> None:
-        while self._evict_one_leaf():
+        while self._evict_one():
             pass
 
     def snapshot(self) -> dict[str, int | float]:
         return {
             "max_blocks": self.max_blocks,
-            "cached_blocks": len(self._nodes),
+            "cached_blocks": len(self._cached_physical_blocks()),
+            "radix_nodes": len(self._nodes),
+            "exact_entries": len(self._exact),
             "lookups": self.lookups,
             "hits": self.hits,
             "hit_tokens": self.hit_tokens,
@@ -138,23 +193,39 @@ class PrefixCache:
             "evictions": self.evictions,
         }
 
-    def _touch(self, node: _PrefixNode) -> None:
+    def _touch(self, node: _PrefixNode | _ExactEntry) -> None:
         self._clock += 1
         node.last_access = self._clock
 
     def _evict_to_limit(self) -> None:
-        while len(self._nodes) > self.max_blocks and self._evict_one_leaf():
+        while len(self._cached_physical_blocks()) > self.max_blocks and self._evict_one():
             pass
 
-    def _evict_one_leaf(self) -> bool:
+    def _cached_physical_blocks(self) -> set[int]:
+        blocks = {node.physical_block_id for node in self._nodes.values()}
+        for entry in self._exact.values():
+            blocks.update(entry.physical_block_ids)
+        return blocks
+
+    def _evict_one(self) -> bool:
         leaves = [node for node in self._nodes.values() if not node.children]
-        if not leaves:
+        candidates: list[_PrefixNode | _ExactEntry] = leaves + list(self._exact.values())
+        if not candidates:
             return False
-        victim = min(leaves, key=lambda node: (node.last_access, node.node_id))
+        victim = min(
+            candidates,
+            key=lambda item: (
+                item.last_access,
+                item.node_id if isinstance(item, _PrefixNode) else item.entry_id,
+            ),
+        )
         self.block_manager.allocator.release(victim.owner)
-        self._edges.pop((victim.parent_id, victim.token_block))
-        self._nodes.pop(victim.node_id)
-        if victim.parent_id is not None and victim.parent_id in self._nodes:
-            self._nodes[victim.parent_id].children.discard(victim.node_id)
+        if isinstance(victim, _ExactEntry):
+            self._exact.pop(victim.token_ids)
+        else:
+            self._edges.pop((victim.parent_id, victim.token_block))
+            self._nodes.pop(victim.node_id)
+            if victim.parent_id is not None and victim.parent_id in self._nodes:
+                self._nodes[victim.parent_id].children.discard(victim.node_id)
         self.evictions += 1
         return True

@@ -292,9 +292,32 @@ class ContinuousBatchingEngine:
             prefix_cache=self.prefix_cache,
         )
 
+    def _ensure_writable_tail(self, request: GenerationRequest) -> bool:
+        """Copy a shared partial tail before decode writes into its unused slots."""
+        allocation = request.allocation
+        if allocation is None or not allocation.sequence_length % self.block_size:
+            return True
+        tail = allocation.physical_block_ids[-1]
+        if self.block_manager.allocator.refcount(tail) <= 1:
+            return True
+        if self.block_manager.allocator.free_block_count == 0:
+            self.prefix_cache.evict_until_free(1)
+        if self.block_manager.allocator.refcount(tail) <= 1:
+            return True
+        copied = self.block_manager.copy_on_write_tail(request.request_id)
+        if copied is None:
+            return False
+        old_block, new_block = copied
+        for key_pool, value_pool in zip(self.key_pool, self.value_pool):
+            key_pool[new_block].copy_(key_pool[old_block])
+            value_pool[new_block].copy_(value_pool[old_block])
+        return True
+
     def _ensure_kv_capacity(self, request: GenerationRequest, target_length: int) -> bool:
         allocation = request.allocation
         if allocation is None:
+            return False
+        if target_length > allocation.sequence_length and not self._ensure_writable_tail(request):
             return False
         blocks_needed = (target_length + self.block_size - 1) // self.block_size
         extra_blocks = max(0, blocks_needed - len(allocation.physical_block_ids))
@@ -302,9 +325,11 @@ class ContinuousBatchingEngine:
             self.prefix_cache.evict_until_free(extra_blocks)
         return self.block_manager.ensure_capacity(request.request_id, target_length)
 
-    def _publish_prefix(self, request: GenerationRequest) -> None:
+    def _publish_prefix(self, request: GenerationRequest, next_token_id: int) -> None:
         if request.allocation is not None and request.prompt_token_ids:
-            self.prefix_cache.publish(request.prompt_token_ids, request.allocation)
+            self.prefix_cache.publish(
+                request.prompt_token_ids, request.allocation, next_token_id
+            )
 
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
@@ -387,8 +412,8 @@ class ContinuousBatchingEngine:
                 self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
                 continue
             request.advance_prefill(request.remaining_prefill_tokens)
-            self._publish_prefix(request)
             request.next_token_id = int(token)
+            self._publish_prefix(request, request.next_token_id)
             self.scheduler.mark_decoding(request.request_id)
             request.append_token(request.next_token_id)
             if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
@@ -480,7 +505,6 @@ class ContinuousBatchingEngine:
                 continue
             request.advance_prefill(count)
             if request.remaining_prefill_tokens == 0:
-                self._publish_prefix(request)
                 completed_rows.append((row, request))
 
         # Only the final prompt token produces the first generated token. Keeping this
@@ -493,6 +517,7 @@ class ContinuousBatchingEngine:
             tokens = out.logits[rows, positions].argmax(dim=-1).tolist()
             for (_, request), token in zip(completed_rows, tokens):
                 request.next_token_id = int(token)
+                self._publish_prefix(request, request.next_token_id)
                 self.scheduler.mark_decoding(request.request_id)
                 request.append_token(request.next_token_id)
                 if (request.next_token_id in self.eos_ids
@@ -527,7 +552,19 @@ class ContinuousBatchingEngine:
         ]
         if decoding:
             self.decode_step(decoding)
-        self.scheduler.admit_available(max_active_requests=self.max_active)
+        admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
+        for request in admitted:
+            if request.remaining_prefill_tokens == 0:
+                if request.cached_next_token_id is None:
+                    self.scheduler.fail(request.request_id, "INVALID_PREFIX_ENTRY")
+                    continue
+                request.next_token_id = request.cached_next_token_id
+                self.scheduler.mark_decoding(request.request_id)
+                request.append_token(request.next_token_id)
+                if (request.next_token_id in self.eos_ids
+                        or len(request.output_token_ids) >= request.max_new_tokens):
+                    reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
+                    self.scheduler.finish(request.request_id, reason=reason)
         plans = self._plan_prefill_chunks()
         if plans:
             self.prefill_chunks(plans)

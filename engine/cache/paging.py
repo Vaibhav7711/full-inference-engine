@@ -63,14 +63,25 @@ class KVBlockManager:
         if not physical_block_ids or sequence_length <= 0:
             raise ValueError("a shared prefix requires blocks and a positive length")
         capacity = len(physical_block_ids) * self.block_size_tokens
-        if sequence_length != capacity:
-            raise ValueError("only complete blocks may be shared")
+        if not capacity - self.block_size_tokens < sequence_length <= capacity:
+            raise ValueError("prefix blocks must exactly cover the shared sequence")
         self.allocator.attach(request_id, physical_block_ids)
         allocation = KVBlockAllocation(
             request_id, self.block_size_tokens, list(physical_block_ids), sequence_length
         )
         self.requests[request_id] = allocation
         return allocation
+
+    def copy_on_write_tail(self, request_id: str) -> tuple[int, int] | None:
+        """Give a request a private last block before writing past a shared prefix."""
+        allocation = self.requests[request_id]
+        if not allocation.sequence_length % self.block_size_tokens:
+            raise ValueError("an aligned sequence has no partial tail to copy")
+        result = self.allocator.replace_shared(request_id, -1)
+        if result is not None:
+            _, new_block = result
+            allocation.physical_block_ids[-1] = new_block
+        return result
 
     def set_sequence_length(self, request_id: str, sequence_length: int) -> None:
         allocation = self.requests[request_id]

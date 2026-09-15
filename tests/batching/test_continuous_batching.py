@@ -318,4 +318,5 @@ def test_d5_repeated_prompt_reuses_prefix_without_changing_tokens():
     assert second == first
     assert after["hits"] == before["hits"] + 1
     assert after["hit_tokens"] > before["hit_tokens"]
+    assert after["exact_entries"] >= 1
     assert eng.block_manager.snapshot()["active_requests"] == 0

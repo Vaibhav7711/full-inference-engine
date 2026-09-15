@@ -56,7 +56,7 @@ def main() -> None:
     _timed_generate(engine, warm_prompt)
     engine.reset()
     miss_ms, reference = _timed_generate(engine, prompt)
-    # First hit compiles the residual paged-prefill shape and is excluded from timing.
+    # Exclude the first lookup so the reported hit distribution measures steady state.
     _, warm_hit = _timed_generate(engine, prompt)
     if warm_hit != reference:
         raise RuntimeError("prefix hit changed greedy output tokens")

@@ -171,6 +171,26 @@ class BlockAllocator:
             self._refcounts[block_id] = 1
         return new_blocks
 
+    def replace_shared(self, request_id: object, index: int) -> tuple[int, int] | None:
+        """Replace one shared owner slot with a new private physical block."""
+        if request_id not in self._allocations:
+            raise KeyError(f"request {request_id!r} has no block allocation")
+        blocks = list(self._allocations[request_id])
+        if not -len(blocks) <= index < len(blocks):
+            raise IndexError("allocation block index out of range")
+        index %= len(blocks)
+        old_block = blocks[index]
+        if self._refcounts[old_block] <= 1:
+            raise ValueError("copy-on-write requires a shared source block")
+        if not self._free_blocks:
+            return None
+        new_block = self._free_blocks.pop()
+        self._refcounts[new_block] = 1
+        self._refcounts[old_block] -= 1
+        blocks[index] = new_block
+        self._allocations[request_id] = tuple(blocks)
+        return old_block, new_block
+
     def refcount(self, block_id: int) -> int:
         if not 0 <= block_id < self.num_blocks:
             raise IndexError("block id out of range")

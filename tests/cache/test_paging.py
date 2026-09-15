@@ -62,3 +62,16 @@ def test_shared_block_is_freed_only_after_last_owner_releases() -> None:
     assert manager.snapshot()["used_blocks"] == 1
     manager.release("second")
     assert manager.snapshot()["free_blocks"] == 2
+
+
+def test_copy_on_write_replaces_only_shared_partial_tail() -> None:
+    manager = KVBlockManager(num_blocks=4, block_size_tokens=4)
+    first = manager.reserve("first", 6, sequence_length=6)
+    assert first is not None
+    second = manager.attach_prefix("second", first.physical_block_ids, sequence_length=6)
+    shared_head, shared_tail = second.physical_block_ids
+    result = manager.copy_on_write_tail("second")
+    assert result is not None and result[0] == shared_tail
+    assert second.physical_block_ids[0] == shared_head
+    assert second.physical_block_ids[1] == result[1]
+    assert first.physical_block_ids == [shared_head, shared_tail]
