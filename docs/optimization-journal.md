@@ -737,7 +737,7 @@ Decision: `KEEP`.
 
 ## Phase 3 — Latency-aware online scheduling
 
-Status: `PENDING T4 GATE`
+Status: `COMPLETE — KEEP`
 
 ### Chunked paged prefill and production lifecycle controls
 
@@ -850,7 +850,7 @@ stall for this concurrent 1,001-token-prompt workload.
 
 ## Phase 4 — Refcounted paged prefix caching
 
-Status: `PENDING T4 GATE`
+Status: `COMPLETE — KEEP`
 
 ### Block-radix reuse, copy-on-write continuation, and pressure eviction
 
