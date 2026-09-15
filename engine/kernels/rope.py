@@ -79,12 +79,24 @@ def triton_rope_qk(
         raise ValueError("query and key batch/sequence/head dimensions must match")
     if head_dim % 2 or head_dim > 256:
         raise ValueError("RoPE head dimension must be even and at most 256")
-    if cos.shape != (batch, sequence, head_dim) or sin.shape != cos.shape:
-        raise ValueError("cos and sin must have [B,S,D] shapes")
+    expected_tail = (sequence, head_dim)
+    if (
+        cos.ndim != 3
+        or sin.shape != cos.shape
+        or cos.shape[1:] != expected_tail
+        or cos.shape[0] not in (1, batch)
+    ):
+        raise ValueError("cos and sin must have [1|B,S,D] shapes")
     if not all(t.device == query.device for t in (key, cos, sin)):
         raise ValueError("Q/K/cos/sin must share a device")
     if query.device.type != "cuda" or key.dtype != query.dtype:
         raise ValueError("Q/K must share a CUDA dtype")
+
+    # Transformers emits [1,S,D] RoPE tables when every batch row shares positions.
+    # An expanded view gives the kernel a zero batch stride without allocating/copying.
+    if cos.shape[0] == 1 and batch != 1:
+        cos = cos.expand(batch, -1, -1)
+        sin = sin.expand(batch, -1, -1)
 
     query_out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
     key_out = torch.empty(key.shape, dtype=key.dtype, device=key.device)

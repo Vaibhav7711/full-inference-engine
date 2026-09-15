@@ -11,14 +11,16 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 @cuda
 @requires_cuda
 @pytest.mark.parametrize("sequence", [1, 7, 33])
-def test_fused_qk_rope_matches_reference(sequence: int) -> None:
+@pytest.mark.parametrize("broadcast_tables", [False, True])
+def test_fused_qk_rope_matches_reference(sequence: int, broadcast_tables: bool) -> None:
     from engine.kernels.rope import triton_rope_qk
 
     torch.manual_seed(31)
     batch, q_heads, k_heads, head_dim = 3, 16, 8, 128
     query = torch.randn(batch, q_heads, sequence, head_dim, device="cuda", dtype=torch.float16)
     key = torch.randn(batch, k_heads, sequence, head_dim, device="cuda", dtype=torch.float16)
-    cos = torch.randn(batch, sequence, head_dim, device="cuda", dtype=torch.float16)
+    table_batch = 1 if broadcast_tables else batch
+    cos = torch.randn(table_batch, sequence, head_dim, device="cuda", dtype=torch.float16)
     sin = torch.randn_like(cos)
 
     def reference(tensor):

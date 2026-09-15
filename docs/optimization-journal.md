@@ -642,6 +642,16 @@ Gate:
 
 Decision: `PENDING T4 MEASUREMENT`.
 
+First batched-prefill T4 gate attempt:
+
+- All 12 focused KV-write and fused-kernel tests passed.
+- Width-one prefill and decode tests passed.
+- Mixed-width prefill stopped before benchmarking because Transformers represents
+  shared batch positions as broadcastable `[1,S,D]` cos/sin tables, while the fused
+  RoPE wrapper accepted only materialized `[B,S,D]` tables.
+- Repair: accept either leading dimension and expand `[1,S,D]` as a zero-batch-stride
+  view. This preserves broadcasting without allocating or copying the tables.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
