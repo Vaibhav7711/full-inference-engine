@@ -1101,3 +1101,36 @@ Decision: `KEEP`. Claim this result only for a stable saturated width-16 decode 
 on the measured T4 setup. Do not generalize it to partial batches, changing batch widths,
 capture construction cost, or arbitrary arrival/departure patterns; those continue on
 the ordinary dynamic path.
+
+## Phase 8 — Padded power-of-two CUDA-Graph buckets
+
+Status: `COMPLETE — KEEP`
+
+Phase 7 replayed only exact-width batches. Phase 8 adds safe padding so a live occupancy
+can use the smallest configured graph bucket that contains it, for example three real
+requests in a width-four graph. The engine permanently reserves one physical KV block
+per potential dummy row under a non-customer allocator owner. Padded rows use those
+private blocks at length zero, so their K/V writes cannot alias a real request or a
+prefix-cache page. Only logits for real rows are sampled and advanced.
+
+Validation and measurement:
+
+- The CUDA correctness test compared three real requests replayed in a width-four graph
+  against ordinary greedy generation and passed token-identically.
+- The end-to-end occupancy A/B warmed/captured each bucket before measurement and failed
+  on any output difference. All rows were token-identical.
+
+| Live requests | Ordinary tok/s | Padded graph tok/s | Speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 30.0 | 103.9 | 3.46x |
+| 2 | 62.0 | 252.6 | 4.08x |
+| 3 | 92.5 | 376.3 | 4.07x |
+| 4 | 122.3 | 504.8 | 4.13x |
+| 8 | 243.5 | 966.9 | 3.97x |
+| 16 | 480.2 | 1,627.4 | 3.39x |
+
+Decision: `KEEP`. Configured buckets now provide flexible graph replay across the tested
+occupancies while preserving safety and token equivalence. Capture construction remains
+excluded from these steady-state measurements, and capacity consumed by dummy blocks is
+an explicit small reservation. Test width 32 separately before enabling a 32-row bucket
+on the constrained T4 runtime.
