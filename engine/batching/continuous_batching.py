@@ -691,7 +691,11 @@ class ContinuousBatchingEngine:
             max_sequence_length, len(active)
         )
         graph_bucket_size = next(
-            (size for size in self.cuda_graph_batch_sizes if size >= len(active)), None
+            (
+                size for size in self.cuda_graph_batch_sizes
+                if len(active) <= size <= self.max_active
+            ),
+            None,
         )
         input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(
             active, graph_bucket_size=graph_bucket_size,
