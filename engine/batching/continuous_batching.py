@@ -36,7 +36,10 @@ import torch
 
 from engine.cache import KVBlockManager, PrefixCache
 from engine.kernels.kv_write import write_decode_kv
-from engine.kernels.paged_decode_batched import paged_decode_batched
+from engine.kernels.paged_decode_batched import (
+    paged_decode_batched,
+)
+from engine.kernels.paged_decode_config import select_paged_decode_config
 from engine.kernels.paged_prefill import paged_prefill
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
@@ -54,6 +57,8 @@ class _BatchContext:
     block_tables: torch.Tensor   # [N, max_blocks] int32, per-sequence
     seq_lens: torch.Tensor       # [N] int32, KV length BEFORE this step's new token
     block_size: int
+    decode_block_n: int
+    decode_num_warps: int
 
 
 _BATCH_CTX: Optional[_BatchContext] = None
@@ -126,7 +131,8 @@ def batched_decode_attention_forward(
         ctx.block_tables,      # [N, max_blocks]
         ctx.seq_lens,          # [N] lengths before the just-written token
         scale=scaling,
-        block_n=64,
+        block_n=ctx.decode_block_n,
+        num_warps=ctx.decode_num_warps,
         length_offset=1,
     )   # -> [N, num_q_heads, 1, D]
 
@@ -597,11 +603,18 @@ class ContinuousBatchingEngine:
             return
 
         input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(active)
+        max_sequence_length = max(
+            request.allocation.sequence_length + 1 for request in active
+        )
+        decode_block_n, decode_num_warps = select_paged_decode_config(
+            max_sequence_length, len(active)
+        )
 
         # Stash context for the attention fn
         _set_batch_ctx(_BatchContext(
             key_pool=self.key_pool, value_pool=self.value_pool,
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
+            decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
         ))
         try:
             out = self.model(input_ids=input_ids, position_ids=position_ids,

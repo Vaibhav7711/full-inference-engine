@@ -34,7 +34,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def _paged_decode_batched_kernel(
     q_ptr, kp_ptr, vp_ptr, out_ptr, bt_ptr, sl_ptr,

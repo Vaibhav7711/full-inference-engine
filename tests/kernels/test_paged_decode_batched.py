@@ -76,12 +76,15 @@ def _build_shared_pool(seqs_kv, block_size, kv_heads, D, device, dtype, seed=7):
 @cuda
 @requires_cuda
 @pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("block_n", [64, 128])
 @pytest.mark.parametrize("num_q_heads,kv_heads,D", [
     (8, 8, 128),    # no GQA
     (16, 8, 128),   # GQA 2:1 (Qwen3-0.6B)
     (8, 2, 64),     # GQA 4:1, smaller dim
 ])
-def test_batched_decode_matches_per_sequence(block_size, num_q_heads, kv_heads, D):
+def test_batched_decode_matches_per_sequence(
+    block_size, block_n, num_q_heads, kv_heads, D,
+):
     from engine.kernels.paged_decode_batched import paged_decode_batched
 
     torch.manual_seed(0)
@@ -112,7 +115,7 @@ def test_batched_decode_matches_per_sequence(block_size, num_q_heads, kv_heads, 
 
     # --- K4 batched: one launch ---
     out = paged_decode_batched(query_batched, key_pages, value_pages,
-                               block_tables, seq_lens_t, block_n=64)
+                               block_tables, seq_lens_t, block_n=block_n)
 
     # --- Reference: each sequence separately via SDPA (with GQA expansion) ---
     def repeat_kv(x, n_rep):
@@ -170,6 +173,17 @@ def test_batched_decode_fp32_tight():
         assert max_diff < 1e-3, (
             f"FP32 sequence {s} max diff {max_diff:.4e} — addressing/length error"
         )
+
+
+def test_t4_regime_selector_boundaries() -> None:
+    from engine.kernels.paged_decode_config import select_paged_decode_config
+
+    assert select_paged_decode_config(1, 1) == (64, 4)
+    assert select_paged_decode_config(127, 16) == (64, 4)
+    assert select_paged_decode_config(128, 1) == (128, 4)
+    assert select_paged_decode_config(2048, 16) == (128, 4)
+    with pytest.raises(ValueError):
+        select_paged_decode_config(0, 1)
 
 
 @cuda

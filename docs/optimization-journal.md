@@ -963,3 +963,30 @@ Final repaired T4 gate:
 Decision: `KEEP`. Claim 110.42x TTFT only for the measured warmed exact-prompt hit. Do
 not generalize it to partial-prefix hits, cold cache operation, multi-token decode
 throughput, or arbitrary production traffic.
+
+## Phase 5 — T4 paged-decode attention regimes
+
+Status: `IN PROGRESS`
+
+### Measured tile selection
+
+The Phase 2 batched decode kernel originally used one fixed `BLOCK_N=64`, four-warp
+configuration for every context length. A T4 calibration sweep of the live kernel at
+batch widths 1, 8, and 16 found a stable regime boundary:
+
+- Below 128 context tokens, retain `64x4`. At 64 tokens it is the lowest-latency
+  conservative setting across the measured widths.
+- At 128 tokens and above, use `128x4`. At 256--2048 tokens it reduced isolated
+  attention-kernel median latency by roughly 20--42% versus `64x4`, depending on
+  width and context length.
+
+The scheduler selects this compile-time kernel configuration from the longest active
+sequence before the model call and passes it through the decode attention context. This
+keeps a mixed batch on one valid kernel variant and avoids any scalar device read or
+synchronization inside the hot kernel wrapper. The public kernel wrapper retains its
+old `64x4` default for direct callers.
+
+The policy remains deliberately conservative: a `16x2` result was slightly faster for
+the narrow 64-token, width-16 microbenchmark, but not across the rest of the measured
+space. It is not a safe engine-wide default. Acceptance still requires CUDA correctness
+for both live tile variants plus an end-to-end short-prompt regression gate.
