@@ -7,6 +7,8 @@ from types import MethodType
 import torch
 import triton
 import triton.language as tl
+from torch import nn
+from torch.nn import functional as F
 
 
 @triton.jit
@@ -37,9 +39,33 @@ def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def _triton_qwen_mlp_forward(module, hidden_states: torch.Tensor) -> torch.Tensor:
-    gate = module.gate_proj(hidden_states)
-    up = module.up_proj(hidden_states)
+    fused_projection = getattr(module, "fused_gate_up_proj", None)
+    if fused_projection is None:
+        gate = module.gate_proj(hidden_states)
+        up = module.up_proj(hidden_states)
+    else:
+        gate, up = fused_projection(hidden_states)
     return module.down_proj(triton_swiglu(gate, up))
+
+
+class FusedGateUpProjection(nn.Module):
+    """One linear projection that returns the gate and up halves for Qwen SwiGLU."""
+
+    def __init__(self, gate: nn.Linear, up: nn.Linear):
+        super().__init__()
+        if (gate.in_features != up.in_features or gate.out_features != up.out_features
+                or (gate.bias is None) != (up.bias is None)):
+            raise ValueError("gate/up projections must have matching geometry and bias layout")
+        self.gate_features = gate.out_features
+        self.register_buffer("weight", torch.cat((gate.weight.detach(), up.weight.detach()), dim=0))
+        if gate.bias is None:
+            self.register_buffer("bias", None)
+        else:
+            self.register_buffer("bias", torch.cat((gate.bias.detach(), up.bias.detach()), dim=0))
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output = F.linear(hidden_states, self.weight, self.bias)
+        return output.split(self.gate_features, dim=-1)
 
 
 def install_triton_qwen_swiglu(model: torch.nn.Module) -> int:
@@ -51,6 +77,16 @@ def install_triton_qwen_swiglu(model: torch.nn.Module) -> int:
         if not hasattr(module, "_pre_triton_swiglu_forward"):
             module._pre_triton_swiglu_forward = module.forward.__func__
             module.forward = MethodType(_triton_qwen_mlp_forward, module)
+            gate, up = module.gate_proj, module.up_proj
+            fused = FusedGateUpProjection(gate, up)
+            # Keep originals outside Module registration so fusion actually removes
+            # their duplicate parameters from the active inference model, while still
+            # allowing an exact uninstall for tests/debugging.
+            module.__dict__["_pre_triton_gate_proj"] = gate
+            module.__dict__["_pre_triton_up_proj"] = up
+            module.gate_proj = None
+            module.up_proj = None
+            module.fused_gate_up_proj = fused
         installed += 1
     if installed == 0:
         raise RuntimeError("model contains no Qwen3MLP modules")
@@ -65,5 +101,11 @@ def uninstall_triton_qwen_swiglu(model: torch.nn.Module) -> int:
             continue
         module.forward = MethodType(original, module)
         del module._pre_triton_swiglu_forward
+        original_gate = module.__dict__.pop("_pre_triton_gate_proj", None)
+        original_up = module.__dict__.pop("_pre_triton_up_proj", None)
+        if original_gate is not None and original_up is not None:
+            module.gate_proj = original_gate
+            module.up_proj = original_up
+            module.fused_gate_up_proj = None
         restored += 1
     return restored
