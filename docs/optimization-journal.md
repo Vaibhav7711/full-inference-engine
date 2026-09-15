@@ -738,3 +738,78 @@ T4 result:
   reinforcing that small comparisons need same-session A/B measurement.
 
 Decision: `KEEP`.
+
+## Phase 3 — Latency-aware online scheduling
+
+Status: `PENDING T4 GATE`
+
+### Chunked paged prefill and production lifecycle controls
+
+Commit: `24e7621` — `Add chunked prefill scheduling and attention`
+
+Problem:
+
+- A long prompt previously ran as one indivisible forward and could delay every active
+  decoder for the full prefill duration.
+- Admission allocated the full prompt KV capacity immediately, reducing useful
+  concurrency even though most admitted prompt tokens had not executed yet.
+- The engine had no online `submit`/`step` surface, no partial-prefill lifecycle, no
+  bounded waiting queue, and no graceful per-request response to KV growth failure.
+
+Architecture:
+
+- Requests now track committed prefill progress separately from prompt length and cannot
+  enter decode until the complete prompt is present in paged KV.
+- Admission allocates one initial KV block. Prefill and decode grow the physical block
+  table just before the corresponding GPU work, while sequence length commits only
+  after that work succeeds.
+- The scheduler owns a rotating prefill queue. Each iteration plans at most one chunk
+  per request under both a per-request chunk limit and a global prompt-token budget.
+- Every online step runs existing decoders first, then admission, then one fair prefill
+  plan. This preserves decoder priority while bounding the following scheduling gap.
+- Optional waiting-queue capacity rejects overload explicitly with `QUEUE_FULL`.
+- Cancellation works for waiting, partially-prefilled, and decoding requests and
+  immediately returns their blocks. KV growth failure marks only the affected request
+  `FAILED/KV_POOL_EXHAUSTED`; unrelated requests continue.
+- Requests record queue time, TTFT, and per-token timestamps for latency analysis.
+
+Kernel path:
+
+- Generalized the Triton prefill K/V writer to accept a per-row absolute start position,
+  so later chunks write directly into their final physical paged locations.
+- Added a causal Triton paged-prefill attention kernel. Each valid query token reads its
+  request's previously committed prefix plus the current chunk through the block table,
+  using online FP32 softmax and GQA head mapping without materializing contiguous KV.
+- Current-chunk K/V is written before attention on the same CUDA stream. Later model
+  layers therefore receive correct chunk hidden states while historical tokens are not
+  recomputed.
+- Complete fresh short prompts retain the accepted padded SDPA prefill fast path. This
+  prevents the 413.8 tok/s short-prompt workload from paying for resumability it does
+  not need; only prompts exceeding the configured chunk/budget use paged chunk attention.
+
+Correctness and measurement:
+
+- Added physical-location tests for K/V chunks beginning inside and across page
+  boundaries.
+- Added a materialized causal-attention oracle covering mixed prefix lengths, mixed
+  chunk lengths, GQA, and padded queries.
+- Added full-model token-equivalence coverage for a prompt spanning multiple chunks and
+  cancellation coverage after a partial prefill.
+- Added scheduler tests for prefill transition invariants, round-robin budget fairness,
+  queue backpressure, cancellation cleanup, and failure cleanup.
+- Added an interleaved latency benchmark comparing one full long prefill against bounded
+  chunks while a previously admitted request decodes. It reports decoder ITL p50/p95/max
+  and the long request's TTFT, making the throughput/latency tradeoff explicit.
+- Local CPU gate: 95 passed, 93 CUDA tests skipped; compilation and diff checks passed.
+  The shared CUDA fixture now skips cleanly when CUDA is unavailable.
+
+T4 acceptance gate:
+
+- All focused kernel, runtime, scheduler, and continuous-generation tests pass.
+- Chunked full-model generation is token-identical to stock greedy generation.
+- The chunked latency run reduces the long-prefill-induced decoder ITL maximum or p95;
+  long-request TTFT is reported as the expected tradeoff, not hidden.
+- The established 16-request, 32-token short-prompt throughput remains at least
+  393.1 tok/s (within 5% of the accepted 413.8 tok/s baseline).
+
+Decision: `PENDING T4 MEASUREMENT`.
