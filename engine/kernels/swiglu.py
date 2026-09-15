@@ -68,7 +68,7 @@ class FusedGateUpProjection(nn.Module):
         return output.split(self.gate_features, dim=-1)
 
 
-def install_triton_qwen_swiglu(model: torch.nn.Module, *, fuse_gate_up: bool = True) -> int:
+def install_triton_qwen_swiglu(model: torch.nn.Module, *, fuse_gate_up: bool = False) -> int:
     """Patch Qwen3 MLP modules and return the number installed."""
     installed = 0
     for module in model.modules():
