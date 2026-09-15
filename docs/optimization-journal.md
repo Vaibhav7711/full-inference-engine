@@ -1006,7 +1006,7 @@ end-to-end runs vary with runtime warm state.
 
 ## Phase 6 — Kernel-native INT8 paged KV
 
-Status: `IN PROGRESS`
+Status: `COMPLETE — KEEP AS OPT-IN MEMORY MODE`
 
 The existing INT8 KV cache is a memory-and-quality reference only: it reconstructs the
 entire cache as FP16 before attention, so it cannot be used to claim serving throughput.
@@ -1045,3 +1045,22 @@ Decision: `KEEP Phase 6A`. The result justifies an opt-in INT8 KV storage mode f
 long-context saturated batches, not a global replacement for FP16. Phase 6B must add
 INT8 chunk-prefill writes/reads, prefix-tail copy-on-write for both data and scales, and
 an end-to-end long-context continuous-batching gate before it is exposed by the engine.
+
+### Phase 6B acceptance — engine integration
+
+`ContinuousBatchingEngine(kv_cache_dtype="int8")` now stores complete prefills and
+resumable paged-prefill chunks as INT8 K/V plus FP16 per-vector scales, dispatches fused
+INT8 paged decode attention, and copies scales with K/V bytes during prefix-tail
+copy-on-write. FP16 remains the default and has no changed dispatch path.
+
+All six isolated INT8 CUDA kernel tests passed, followed by the full-engine chunked
+prefill/decode test. The end-to-end 16-request, 1,024-token-prompt, 32-token-decode A/B
+reported 100% greedy token agreement between FP16 and INT8. Its end-to-end throughput
+was effectively the same, despite the isolated attention gain. This is expected: at this
+model size, the attention read is only one part of a complete decode step, which is also
+dominated by projection/MLP GEMMs, norms, and kernel-launch overhead.
+
+Decision: `KEEP` the INT8 mode for its 49.2% KV-storage reduction and validated
+long-context kernel benefit. Do not claim an end-to-end throughput gain on this T4
+workload. Use it as an explicit capacity/long-context option; keep FP16 as the default
+latency-oriented mode.
