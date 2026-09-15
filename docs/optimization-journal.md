@@ -1138,7 +1138,7 @@ it remains unvalidated on the constrained T4 runtime until separately measured w
 
 ## Phase 9 — Fused Qwen MLP gate/up projection experiment
 
-Status: `IN PROGRESS — REPEAT MEASUREMENT REQUIRED`
+Status: `COMPLETE — REJECT AS DEFAULT; RETAIN AS EXPERIMENT`
 
 Each Qwen MLP normally launches separate gate and up FP16 projections before SwiGLU.
 The experiment concatenated their output weights into one projection, split the result,
@@ -1146,10 +1146,16 @@ then used the existing fused Triton SwiGLU kernel. CUDA correctness passed and t
 fusion remains available as an explicit experiment.
 
 One width-16 A/B run measured separate projections at 961.5 tok/s and the fused path at
-915.5 tok/s. Earlier warmed Colab runs produced substantially higher throughput, so this
-single pair is not sufficient to choose a default. The fusion remains enabled by default
-while a paired multi-round measurement is added. The existing Triton SwiGLU elementwise
-fusion remains enabled in either configuration.
+915.5 tok/s. A later paired, interleaved seven-round graph-enabled A/B warmed and
+captured both variants before timing. It reported median end-to-end times of 318.079 ms
+unfused and 310.904 ms fused (1.023x), but the individual-round range was 0.957--1.053x
+and five of seven rounds were neutral or slower for fusion. Greedy output tokens were
+identical throughout.
+
+Decision: the 2.3% median difference is below the observed Colab runtime variation, so
+fusion is not a defensible default. Keep the existing Triton SwiGLU elementwise fusion;
+keep gate/up projection fusion available only as an explicit experiment. Separate
+PyTorch/CUTLASS projections are the engine default.
 
 ## Phase 10 — Weight-only and W8A8 decode-linear experiments
 
