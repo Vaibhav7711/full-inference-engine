@@ -38,7 +38,7 @@ def main() -> None:
     hidden = 1024
     shapes = {"attention_1024": 1024, "mlp_3072": 3072}
     rows = []
-    print(f"\nW8A8 decode linear A/B (input width {hidden}; dynamic per-32 activation scales)")
+    print(f"\nW8A8 decode linear A/B (input width {hidden}; dynamic per-row activation scales)")
     print(f"{'shape':>18} {'batch':>6} {'fp16 ms':>10} {'w8a8 ms':>10} {'speedup':>9} {'rel err':>9}")
     for name, output_width in shapes.items():
         for batch in [int(item) for item in args.batches.split(",") if item]:

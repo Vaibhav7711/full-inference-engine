@@ -1,48 +1,26 @@
-"""Experimental W8A8 decode linear using INT8 tensor-core dot products."""
+"""Experimental true W8A8 decode linear for Turing through CUDA INT8 GEMM.
+
+Triton 3.x cannot lower signed INT8 MMA for sm75 reliably. ``torch._int_mm``
+dispatches to CUDA's native INT8 GEMM implementation instead, so this remains
+a genuine INT8-times-INT8 accumulation experiment on a T4.
+"""
 
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _w8a8_kernel(x_ptr, w_ptr, ws_ptr, out_ptr, M, N, K,
-                 sxm, sxk, swn, swk, som, son,
-                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pm, pn = tl.program_id(0), tl.program_id(1)
-    om, on, ok = pm * BM + tl.arange(0, BM), pn * BN + tl.arange(0, BN), tl.arange(0, BK)
-    wscale = tl.load(ws_ptr + on, mask=on < N, other=0.0).to(tl.float32)
-    acc = tl.zeros((BM, BN), tl.float32)
-    for start in range(0, K, BK):
-        x = tl.load(x_ptr + om[:, None] * sxm + (start + ok[None, :]) * sxk,
-                    mask=(om[:, None] < M) & (start + ok[None, :] < K), other=0.0).to(tl.float32)
-        xscale = tl.maximum(tl.max(tl.abs(x), axis=1) / 127.0, 1e-8)
-        xq = tl.where(x / xscale[:, None] >= 0, x / xscale[:, None] + 0.5, x / xscale[:, None] - 0.5)
-        xq = tl.maximum(tl.minimum(xq, 127.0), -127.0).to(tl.int8)
-        wq = tl.load(w_ptr + on[None, :] * swn + (start + ok[:, None]) * swk,
-                     mask=(on[None, :] < N) & (start + ok[:, None] < K), other=0)
-        # Turing exposes INT8 tensor cores, but Triton's default dot output type
-        # is floating point.  Make the integer MMA accumulation explicit before
-        # applying the two quantization scales.
-        dot_i32 = tl.dot(xq, wq, out_dtype=tl.int32)
-        acc += dot_i32.to(tl.float32) * (xscale[:, None] * wscale[None, :])
-    tl.store(out_ptr + om[:, None] * som + on[None, :] * son, acc.to(out_ptr.dtype.element_ty),
-             mask=(om[:, None] < M) & (on[None, :] < N))
-
-
 def w8a8_linear(inputs: torch.Tensor, qweight: torch.Tensor, weight_scales: torch.Tensor) -> torch.Tensor:
-    """Per-K-tile activation quantization plus INT8 tensor-core dot accumulation."""
+    """Dynamically quantize each input row, execute CUDA INT8 GEMM, dequantize."""
     if inputs.ndim != 2 or qweight.dtype is not torch.int8 or qweight.ndim != 2:
         raise ValueError("inputs must be 2D and qweight must be 2D INT8")
-    M, K = inputs.shape; N, wk = qweight.shape
-    if wk != K or weight_scales.shape != (N,) or K % 32:
-        raise ValueError("invalid W8A8 geometry; K must be divisible by 32")
-    output = torch.empty((M, N), device=inputs.device, dtype=inputs.dtype)
-    _w8a8_kernel[(triton.cdiv(M, 16), triton.cdiv(N, 128))](
-        inputs, qweight, weight_scales, output, M, N, K,
-        inputs.stride(0), inputs.stride(1), qweight.stride(0), qweight.stride(1), output.stride(0), output.stride(1),
-        BM=16, BN=128, BK=32, num_warps=4,
-    )
-    return output
+    _, width = inputs.shape
+    output_width, weight_width = qweight.shape
+    if weight_width != width or weight_scales.shape != (output_width,):
+        raise ValueError("invalid W8A8 geometry")
+    if inputs.device.type != "cuda" or qweight.device != inputs.device or weight_scales.device != inputs.device:
+        raise ValueError("all W8A8 tensors must be on the same CUDA device")
+    activation_scales = inputs.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127.0
+    qinputs = torch.round(inputs.float() / activation_scales).clamp(-127, 127).to(torch.int8).contiguous()
+    # torch._int_mm is CUDA's INT8 x INT8 -> INT32 GEMM. qweight is output-major
+    # for a regular linear layer, hence the transpose for GEMM.
+    accumulators = torch._int_mm(qinputs, qweight.t().contiguous())
+    return (accumulators.float() * activation_scales * weight_scales.float()[None, :]).to(inputs.dtype)
