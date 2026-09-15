@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import asyncio
 from contextlib import asynccontextmanager
+from time import monotonic
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,7 +25,13 @@ class GenerateRequest(BaseModel):
 def create_app(
     model_name: str = "Qwen/Qwen3-0.6B", *, max_active: int = 16,
     num_blocks: int = 1024, graph_buckets: tuple[int, ...] = (2, 4, 8, 16),
+    max_pending_requests: int = 256, max_prompt_tokens: int = 4096,
+    request_timeout_s: float = 120.0,
 ) -> FastAPI:
+    if min(max_active, num_blocks, max_pending_requests, max_prompt_tokens) <= 0:
+        raise ValueError("server capacity limits must be positive")
+    if request_timeout_s <= 0:
+        raise ValueError("request_timeout_s must be positive")
     service: ContinuousBatchingService | None = None
 
     @asynccontextmanager
@@ -35,8 +42,11 @@ def create_app(
         engine = ContinuousBatchingEngine(
             loaded.model, loaded.tokenizer, loaded.device, max_active=max_active,
             num_blocks=num_blocks, cuda_graph_batch_sizes=buckets or None,
+            max_waiting_requests=max_pending_requests,
         )
-        service = ContinuousBatchingService(engine)
+        service = ContinuousBatchingService(
+            engine, max_pending_submissions=max_pending_requests,
+        )
         service.start()
         yield
         service.stop()
@@ -52,6 +62,11 @@ def create_app(
     def submit(payload: GenerateRequest) -> tuple[ContinuousBatchingService, RequestHandle]:
         current = require_service()
         token_ids = current.engine.tokenizer(payload.prompt, return_tensors="pt").input_ids[0].tolist()
+        if len(token_ids) > max_prompt_tokens:
+            raise HTTPException(
+                status_code=413,
+                detail=f"prompt exceeds the {max_prompt_tokens}-token server limit",
+            )
         try:
             return current, current.submit(token_ids, payload.max_new_tokens)
         except RuntimeError as error:
@@ -68,21 +83,45 @@ def create_app(
     @app.post("/generate")
     async def generate(payload: GenerateRequest) -> dict[str, object]:
         service, handle = submit(payload)
-        await asyncio.to_thread(handle.completed.wait)
+        completed = await asyncio.to_thread(handle.completed.wait, request_timeout_s)
+        if not completed:
+            service.cancel(handle, reason="TIMEOUT")
+            raise HTTPException(status_code=504, detail="generation deadline exceeded")
         if handle.error is not None:
             raise HTTPException(status_code=500, detail=str(handle.error))
         tokens = handle.request.output_token_ids
         return {"text": service.engine.tokenizer.decode(tokens, skip_special_tokens=True),
                 "token_ids": tokens, "metrics": metrics(handle)}
 
+    @app.get("/health")
+    async def health() -> dict[str, object]:
+        return {"status": "ready", **require_service().snapshot()}
+
     @app.post("/generate/stream")
     async def generate_stream(payload: GenerateRequest, request: Request) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
             service, handle = submit(payload)
             sent = 0
-            while not handle.completed.is_set():
-                if await request.is_disconnected():
-                    service.cancel(handle)
+            started = monotonic()
+            try:
+                while not handle.completed.is_set():
+                    if await request.is_disconnected():
+                        return
+                    if monotonic() - started >= request_timeout_s:
+                        service.cancel(handle, reason="TIMEOUT")
+                        yield f"data: {json.dumps({'error': 'generation deadline exceeded', 'finish_reason': 'TIMEOUT'})}\n\n"
+                        return
+                    tokens = handle.request.output_token_ids
+                    while sent < len(tokens):
+                        token_id = tokens[sent]
+                        data = {"token_id": token_id,
+                                "text": service.engine.tokenizer.decode([token_id], skip_special_tokens=True),
+                                "index": sent, "finish_reason": None}
+                        sent += 1
+                        yield f"data: {json.dumps(data)}\n\n"
+                    await asyncio.sleep(0.005)
+                if handle.error is not None:
+                    yield f"data: {json.dumps({'error': str(handle.error)})}\n\n"
                     return
                 tokens = handle.request.output_token_ids
                 while sent < len(tokens):
@@ -92,19 +131,13 @@ def create_app(
                             "index": sent, "finish_reason": None}
                     sent += 1
                     yield f"data: {json.dumps(data)}\n\n"
-                await asyncio.sleep(0.005)
-            if handle.error is not None:
-                yield f"data: {json.dumps({'error': str(handle.error)})}\n\n"
-                return
-            tokens = handle.request.output_token_ids
-            while sent < len(tokens):
-                token_id = tokens[sent]
-                data = {"token_id": token_id,
-                        "text": service.engine.tokenizer.decode([token_id], skip_special_tokens=True),
-                        "index": sent, "finish_reason": None}
-                sent += 1
-                yield f"data: {json.dumps(data)}\n\n"
-            yield f"data: {json.dumps({'token_id': None, 'text': '', 'index': None, 'finish_reason': handle.request.finish_reason})}\n\n"
+                yield f"data: {json.dumps({'token_id': None, 'text': '', 'index': None, 'finish_reason': handle.request.finish_reason})}\n\n"
+            finally:
+                # Starlette cancels the generator when a socket disappears, which may
+                # bypass the explicit is_disconnected branch. Always reclaim unfinished
+                # scheduler/KV state through the worker-owned cancellation queue.
+                if not handle.completed.is_set():
+                    service.cancel(handle)
         return StreamingResponse(events(), media_type="text/event-stream")
 
     return app

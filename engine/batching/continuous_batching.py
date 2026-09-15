@@ -731,10 +731,12 @@ class ContinuousBatchingEngine:
                 _clear_batch_ctx()
 
         # Sample next token per sequence, advance state
-        next_tokens = logits[:len(active), -1, :].argmax(dim=-1)   # real rows only
-        for i, s in enumerate(active):
+        # One device-to-host synchronization for the complete batch. Calling `.item()`
+        # per row serializes N scalar copies and N Python-visible CUDA waits.
+        next_tokens = logits[:len(active), -1, :].argmax(dim=-1).tolist()
+        for s, token in zip(active, next_tokens):
             self.block_manager.append_tokens(s.request_id)
-            tok = int(next_tokens[i].item())
+            tok = int(token)
             s.next_token_id = tok
             s.append_token(tok)
             if tok in self.eos_ids or len(s.output_token_ids) >= s.max_new_tokens:

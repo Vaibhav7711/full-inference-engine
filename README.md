@@ -97,9 +97,10 @@ requests arriving from concurrent HTTP handlers, and exposes paged KV, decode-fi
 scheduling, and the recommended padded CUDA-Graph buckets (`2,4,8,16`) through the
 serving API. SSE emits token ID, text, index, and EOS/LENGTH termination.
 
-The service has a bounded ingress queue and returns HTTP 429 when it is full. Client
-disconnect cancellation is still a remaining service-layer feature; disconnected work
-currently completes in the worker to preserve engine-state safety.
+The service has a bounded ingress/scheduler queue and returns HTTP 429 when it is full.
+It enforces a prompt-token limit and request deadline. SSE disconnects and timeouts are
+routed through the GPU worker's cancellation queue so KV state is released without an
+HTTP handler mutating scheduler state.
 
 ### Static batching
 

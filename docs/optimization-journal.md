@@ -1325,3 +1325,38 @@ Documentation is also stale in places: the README still describes several pre-pa
 pre-continuous milestones. Reconcile it with the journal after the P0/P1 runtime work so
 the public architecture description does not understate or contradict the implemented
 engine.
+
+## Phase 15 — Final P0/P1 optimization closure
+
+Status: `IN PROGRESS — CUDA AND REAL-TRANSPORT ACCEPTANCE REQUIRED`
+
+This is the final optimization phase before the project switches to broad correctness,
+stress, and failure testing. Its scope is deliberately limited to both P0 audit items
+and the first P1 item.
+
+Decode state advancement now transfers the complete argmax token vector to the host with
+one `.tolist()` operation. The previous loop called `.item()` once per active row,
+creating one Python-visible CUDA synchronization per request. Request lifecycle updates
+remain on the CPU, so this removes repeated scalar transfers without redesigning the
+scheduler. Acceptance requires token-identical CUDA correctness plus the isolated
+width-1/2/4/8/16 transfer A/B.
+
+The FastAPI server now enforces three bounded-admission controls: a finite ingress and
+scheduler waiting limit, a maximum prompt-token count, and a request deadline. Complete
+and streaming timeouts enqueue cancellation through the worker. SSE generation uses a
+`finally` guard because an ASGI server may cancel the response generator immediately on
+socket loss before `Request.is_disconnected()` returns true.
+
+A real transport harness launches `uvicorn`, opens loopback HTTP connections, reads SSE
+incrementally from the socket, and reports TTFT and completion p50/p95/p99. It also drops
+one stream after its first token and requires the worker's cancellation counter to
+advance before running the measured burst. Unlike TestClient, these TTFT values are
+wire-visible and are valid for local transport comparisons.
+
+Acceptance gates:
+
+- server lifecycle, cancellation, and queue-backpressure tests pass;
+- continuous-batching CUDA correctness remains token-identical;
+- batched token transfer reduces width-16 host-transfer latency;
+- real `uvicorn` disconnect cancellation passes; and
+- all 16 burst requests return their requested token count with valid wire-level TTFT.

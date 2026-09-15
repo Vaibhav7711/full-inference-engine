@@ -39,6 +39,8 @@ class ContinuousBatchingService:
         self._stopping = Event()
         self._thread: Thread | None = None
         self._fatal_error: BaseException | None = None
+        self._completed_count = 0
+        self._cancelled_count = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -99,6 +101,8 @@ class ContinuousBatchingService:
             if handle is None or handle.request.done:
                 continue
             self.engine.cancel(request_id, reason=reason)
+            with self._lock:
+                self._cancelled_count += 1
             handle.completed.set()
 
     def _publish_completed(self) -> None:
@@ -106,7 +110,19 @@ class ContinuousBatchingService:
             completed = [request_id for request_id, handle in self._active.items() if handle.request.done]
             for request_id in completed:
                 handle = self._active.pop(request_id)
+                self._completed_count += 1
                 handle.completed.set()
+
+    def snapshot(self) -> dict[str, int | bool]:
+        """Return thread-safe service counters without touching GPU engine state."""
+        with self._lock:
+            return {
+                "active_handles": len(self._active),
+                "pending_submissions": self._inbox.qsize(),
+                "completed_requests": self._completed_count,
+                "cancelled_requests": self._cancelled_count,
+                "worker_failed": self._fatal_error is not None,
+            }
 
     def _fail_all(self, error: BaseException) -> None:
         self._fatal_error = error

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from engine.runtime import RequestState
 from engine.server.continuous import ContinuousBatchingService
 
@@ -59,5 +61,13 @@ def test_background_service_routes_cancellation_to_worker_owned_engine() -> None
         assert handle.completed.wait(1)
         assert handle.request.state is RequestState.CANCELLED
         assert handle.request.finish_reason == "TEST_CANCEL"
+        assert service.snapshot()["cancelled_requests"] == 1
     finally:
         service.stop()
+
+
+def test_submission_queue_applies_backpressure_before_worker_start() -> None:
+    service = ContinuousBatchingService(_FakeEngine(), max_pending_submissions=1)
+    service.submit([1], max_new_tokens=1)
+    with pytest.raises(RuntimeError, match="submission queue is full"):
+        service.submit([2], max_new_tokens=1)
