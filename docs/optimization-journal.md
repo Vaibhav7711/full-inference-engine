@@ -528,6 +528,15 @@ Change:
 - Added an optional shape-recording profiler mode that groups events by input shape and
   prints the `aten::cat` groups separately.
 
+T4 result:
+
+- The `aten::cat` tensor-list signature reported only `[[], []]`, which does not expose
+  its member tensors. This is a profiler representation limitation, not evidence that
+  the cat is harmless or shape-free.
+- Added an opt-in stack-grouped mode to identify the source call site directly.
+
+Commit: `6996116` — `Add stack grouped cat profiling`
+
 Decision: `DIAGNOSTIC PENDING`; shape profiling is not a throughput measurement.
 
 ### Persistent decode metadata — accepted
