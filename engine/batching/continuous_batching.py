@@ -199,7 +199,7 @@ class ContinuousBatchingEngine:
                  kv_cache_dtype: str = "fp16",
                  cuda_graph_batch_size: int | None = None,
                  cuda_graph_batch_sizes: tuple[int, ...] | None = None,
-                 fuse_mlp_gate_up: bool = False):
+                 fuse_mlp_gate_up: bool = True):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")

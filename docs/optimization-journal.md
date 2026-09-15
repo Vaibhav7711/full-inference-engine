@@ -1138,18 +1138,15 @@ it remains unvalidated on the constrained T4 runtime until separately measured w
 
 ## Phase 9 — Fused Qwen MLP gate/up projection experiment
 
-Status: `COMPLETE — REJECTED AS DEFAULT`
+Status: `IN PROGRESS — REPEAT MEASUREMENT REQUIRED`
 
 Each Qwen MLP normally launches separate gate and up FP16 projections before SwiGLU.
 The experiment concatenated their output weights into one projection, split the result,
 then used the existing fused Triton SwiGLU kernel. CUDA correctness passed and the
 fusion remains available as an explicit experiment.
 
-The end-to-end width-16 graph-bucket A/B rejected it: separate projections reached
-961.5 tok/s, while the fused projection reached 915.5 tok/s (4.8% slower). It was also
-slower at widths 1, 2, 4, and 8. On this T4 and these decode GEMM shapes, cuBLAS/CUTLASS
-selects better kernels for the original pair than for one larger concatenated projection.
-
-Decision: `REJECT` as the serving default. `fuse_mlp_gate_up=False` is now the default;
-retain the implementation only as a reproducible negative result. The existing Triton
-SwiGLU elementwise fusion remains enabled.
+One width-16 A/B run measured separate projections at 961.5 tok/s and the fused path at
+915.5 tok/s. Earlier warmed Colab runs produced substantially higher throughput, so this
+single pair is not sufficient to choose a default. The fusion remains enabled by default
+while a paired multi-round measurement is added. The existing Triton SwiGLU elementwise
+fusion remains enabled in either configuration.
