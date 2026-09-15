@@ -213,7 +213,7 @@ def test_d3_full_generation_matches_ref():
 
     snapshot = eng.block_manager.snapshot()
     assert snapshot["active_requests"] == 0
-    assert snapshot["free_blocks"] == snapshot["num_blocks"]
+    assert snapshot["used_blocks"] == eng.prefix_cache.snapshot()["cached_blocks"]
 
     for i, (out, ref) in enumerate(zip(outs, refs)):
         assert out == ref, (
@@ -245,7 +245,7 @@ def test_d3_mixed_lengths_and_staggered():
 
     snapshot = eng.block_manager.snapshot()
     assert snapshot["active_requests"] == 0
-    assert snapshot["free_blocks"] == snapshot["num_blocks"]
+    assert snapshot["used_blocks"] == eng.prefix_cache.snapshot()["cached_blocks"]
 
     for i, (out, ref) in enumerate(zip(outs, refs)):
         assert out == ref, (
@@ -273,7 +273,7 @@ def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
     )
     actual = eng.generate([prompt], max_new_tokens=max_new)[0]
     assert actual == reference
-    assert eng.block_manager.snapshot()["used_blocks"] == 0
+    assert eng.block_manager.snapshot()["used_blocks"] == eng.prefix_cache.snapshot()["cached_blocks"]
 
 
 @cuda
@@ -294,3 +294,28 @@ def test_d4_partial_prefill_can_be_cancelled():
     eng.cancel(request.request_id)
     assert request.state.name == "CANCELLED"
     assert eng.block_manager.snapshot()["used_blocks"] == 0
+
+
+@cuda
+@requires_cuda
+def test_d5_repeated_prompt_reuses_prefix_without_changing_tokens():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    prompt = (
+        "You are a careful inference-engine reviewer. Discuss correctness, scheduling, "
+        "paged KV ownership, kernel numerical accuracy, and production reliability. "
+        "Answer the following request precisely: explain prefix caching."
+    )
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=512, block_size=16,
+        prefix_cache_blocks=128,
+    )
+    first = eng.generate([prompt], max_new_tokens=8)[0]
+    before = eng.prefix_cache.snapshot()
+    second = eng.generate([prompt], max_new_tokens=8)[0]
+    after = eng.prefix_cache.snapshot()
+    assert second == first
+    assert after["hits"] == before["hits"] + 1
+    assert after["hit_tokens"] > before["hit_tokens"]
+    assert eng.block_manager.snapshot()["active_requests"] == 0

@@ -50,3 +50,15 @@ def test_failed_growth_does_not_change_request_ownership() -> None:
     assert not manager.ensure_capacity("request", 12)
     assert allocation.physical_block_ids == original_blocks
     assert allocation.sequence_length == 4
+
+
+def test_shared_block_is_freed_only_after_last_owner_releases() -> None:
+    manager = KVBlockManager(num_blocks=2, block_size_tokens=4)
+    first = manager.reserve("first", 4, sequence_length=4)
+    assert first is not None
+    manager.attach_prefix("second", first.physical_block_ids, sequence_length=4)
+    assert manager.snapshot()["shared_blocks"] == 1
+    manager.release("first")
+    assert manager.snapshot()["used_blocks"] == 1
+    manager.release("second")
+    assert manager.snapshot()["free_blocks"] == 2

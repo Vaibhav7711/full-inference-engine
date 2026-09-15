@@ -34,7 +34,7 @@ from typing import Optional
 
 import torch
 
-from engine.cache.paging import KVBlockManager
+from engine.cache import KVBlockManager, PrefixCache
 from engine.kernels.kv_write import write_decode_kv
 from engine.kernels.paged_decode_batched import paged_decode_batched
 from engine.kernels.paged_prefill import paged_prefill
@@ -170,10 +170,13 @@ class ContinuousBatchingEngine:
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
                  max_prefill_tokens_per_iteration: int = 512,
-                 max_waiting_requests: int | None = None):
+                 max_waiting_requests: int | None = None,
+                 prefix_cache_blocks: int = 256):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
+        if prefix_cache_blocks < 0:
+            raise ValueError("prefix_cache_blocks must be non-negative")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -182,6 +185,7 @@ class ContinuousBatchingEngine:
         self.prefill_chunk_size = prefill_chunk_size
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
         self.max_waiting_requests = max_waiting_requests
+        self.prefix_cache_blocks = prefix_cache_blocks
 
         cfg = model.config
         self.num_layers = cfg.num_hidden_layers
@@ -232,8 +236,10 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
+        self.prefix_cache = PrefixCache(self.block_manager, prefix_cache_blocks)
         self.scheduler = FCFSScheduler(
-            self.block_manager, max_waiting_requests=max_waiting_requests
+            self.block_manager, max_waiting_requests=max_waiting_requests,
+            prefix_cache=self.prefix_cache,
         )
 
         # Register the batched attention fn once.
@@ -280,17 +286,33 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=self.key_pool[0].shape[0], block_size_tokens=self.block_size,
         )
+        self.prefix_cache = PrefixCache(self.block_manager, self.prefix_cache_blocks)
         self.scheduler = FCFSScheduler(
-            self.block_manager, max_waiting_requests=self.max_waiting_requests
+            self.block_manager, max_waiting_requests=self.max_waiting_requests,
+            prefix_cache=self.prefix_cache,
         )
+
+    def _ensure_kv_capacity(self, request: GenerationRequest, target_length: int) -> bool:
+        allocation = request.allocation
+        if allocation is None:
+            return False
+        blocks_needed = (target_length + self.block_size - 1) // self.block_size
+        extra_blocks = max(0, blocks_needed - len(allocation.physical_block_ids))
+        if extra_blocks > self.block_manager.allocator.free_block_count:
+            self.prefix_cache.evict_until_free(extra_blocks)
+        return self.block_manager.ensure_capacity(request.request_id, target_length)
+
+    def _publish_prefix(self, request: GenerationRequest) -> None:
+        if request.allocation is not None and request.prompt_token_ids:
+            self.prefix_cache.publish(request.prompt_token_ids, request.allocation)
 
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def prefill(self, request: GenerationRequest) -> None:
-        """Compatibility wrapper for a one-request batched prefill."""
-        self.prefill_batch([request])
+        """Compatibility wrapper supporting both fresh and prefix-hit requests."""
+        self.prefill_chunks([(request, request.remaining_prefill_tokens)])
 
     @torch.inference_mode()
     def prefill_batch(self, requests: list[GenerationRequest]) -> None:
@@ -313,12 +335,12 @@ class ContinuousBatchingEngine:
                 raise RuntimeError("every request must be admitted before prefill")
             if not request.prompt_token_ids:
                 raise ValueError("prefill requires prompt_token_ids")
+            if request.prefilled_token_count:
+                raise ValueError("partially-prefilled requests must use prefill_chunks")
 
         viable = []
         for request in requests:
-            if self.block_manager.ensure_capacity(
-                request.request_id, request.prompt_token_count
-            ):
+            if self._ensure_kv_capacity(request, request.prompt_token_count):
                 viable.append(request)
             else:
                 self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
@@ -365,6 +387,7 @@ class ContinuousBatchingEngine:
                 self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
                 continue
             request.advance_prefill(request.remaining_prefill_tokens)
+            self._publish_prefix(request)
             request.next_token_id = int(token)
             self.scheduler.mark_decoding(request.request_id)
             request.append_token(request.next_token_id)
@@ -400,7 +423,7 @@ class ContinuousBatchingEngine:
         viable_plans = []
         for request, count in plans:
             target = request.prefilled_token_count + count
-            if self.block_manager.ensure_capacity(request.request_id, target):
+            if self._ensure_kv_capacity(request, target):
                 viable_plans.append((request, count))
             else:
                 self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
@@ -457,6 +480,7 @@ class ContinuousBatchingEngine:
                 continue
             request.advance_prefill(count)
             if request.remaining_prefill_tokens == 0:
+                self._publish_prefix(request)
                 completed_rows.append((row, request))
 
         # Only the final prompt token produces the first generated token. Keeping this
@@ -527,7 +551,7 @@ class ContinuousBatchingEngine:
         viable = []
         for s in active:
             target_length = s.allocation.sequence_length + 1
-            if not self.block_manager.ensure_capacity(s.request_id, target_length):
+            if not self._ensure_kv_capacity(s, target_length):
                 self.scheduler.fail(s.request_id, "KV_POOL_EXHAUSTED")
             else:
                 viable.append(s)

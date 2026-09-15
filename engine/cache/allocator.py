@@ -102,7 +102,7 @@ class ContiguousKVAllocator:
 
 
 class BlockAllocator:
-    """Fixed-size physical KV block allocator used by the paged-cache manager."""
+    """Refcounted physical-block allocator supporting shared immutable prefixes."""
 
     def __init__(self, num_blocks: int, block_size_tokens: int):
         if num_blocks <= 0 or block_size_tokens <= 0:
@@ -110,9 +110,10 @@ class BlockAllocator:
         self.num_blocks = num_blocks
         self.block_size_tokens = block_size_tokens
         self._free_blocks: list[int] = list(range(num_blocks))
-        self._allocations: dict[str, tuple[int, ...]] = {}
+        self._allocations: dict[object, tuple[int, ...]] = {}
+        self._refcounts: list[int] = [0] * num_blocks
 
-    def allocate(self, request_id: str, count: int) -> tuple[int, ...] | None:
+    def allocate(self, request_id: object, count: int) -> tuple[int, ...] | None:
         if not request_id or count <= 0:
             raise ValueError("request_id and count must be positive")
         if request_id in self._allocations:
@@ -121,18 +122,42 @@ class BlockAllocator:
             return None
         block_ids = tuple(self._free_blocks.pop() for _ in range(count))
         self._allocations[request_id] = block_ids
+        for block_id in block_ids:
+            self._refcounts[block_id] = 1
         return block_ids
 
-    def release(self, request_id: str) -> tuple[int, ...]:
+    def attach(self, request_id: object, block_ids: list[int] | tuple[int, ...]) -> tuple[int, ...]:
+        """Create an owner referencing already-live immutable blocks."""
+        if not request_id or not block_ids:
+            raise ValueError("request_id and block_ids are required")
+        if request_id in self._allocations:
+            raise ValueError(f"request {request_id!r} already owns blocks")
+        attached = tuple(block_ids)
+        if len(set(attached)) != len(attached):
+            raise ValueError("an owner cannot attach the same block twice")
+        for block_id in attached:
+            if not 0 <= block_id < self.num_blocks or self._refcounts[block_id] == 0:
+                raise ValueError(f"block {block_id} is not live")
+        self._allocations[request_id] = attached
+        for block_id in attached:
+            self._refcounts[block_id] += 1
+        return attached
+
+    def release(self, request_id: object) -> tuple[int, ...]:
         try:
             block_ids = self._allocations.pop(request_id)
         except KeyError as error:
             raise KeyError(f"request {request_id!r} has no block allocation") from error
-        self._free_blocks.extend(block_ids)
+        freed = []
+        for block_id in block_ids:
+            self._refcounts[block_id] -= 1
+            if self._refcounts[block_id] == 0:
+                freed.append(block_id)
+        self._free_blocks.extend(freed)
         self._free_blocks.sort()
         return block_ids
 
-    def extend(self, request_id: str, count: int) -> tuple[int, ...] | None:
+    def extend(self, request_id: object, count: int) -> tuple[int, ...] | None:
         """Append blocks to an existing allocation without requiring contiguity."""
         if count <= 0:
             raise ValueError("count must be positive")
@@ -142,7 +167,14 @@ class BlockAllocator:
             return None
         new_blocks = tuple(self._free_blocks.pop() for _ in range(count))
         self._allocations[request_id] += new_blocks
+        for block_id in new_blocks:
+            self._refcounts[block_id] = 1
         return new_blocks
+
+    def refcount(self, block_id: int) -> int:
+        if not 0 <= block_id < self.num_blocks:
+            raise IndexError("block id out of range")
+        return self._refcounts[block_id]
 
     @property
     def free_block_count(self) -> int:
@@ -151,3 +183,11 @@ class BlockAllocator:
     @property
     def used_block_count(self) -> int:
         return self.num_blocks - self.free_block_count
+
+    @property
+    def shared_block_count(self) -> int:
+        return sum(refcount > 1 for refcount in self._refcounts)
+
+    @property
+    def total_references(self) -> int:
+        return sum(self._refcounts)

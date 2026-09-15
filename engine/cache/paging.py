@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 
 from .allocator import BlockAllocator
+
+
 @dataclass
 class KVBlockAllocation:
     """Mutable logical-to-physical mapping owned by exactly one request."""
@@ -48,6 +50,24 @@ class KVBlockManager:
             return None
         allocation = KVBlockAllocation(
             request_id, self.block_size_tokens, list(block_ids), sequence_length
+        )
+        self.requests[request_id] = allocation
+        return allocation
+
+    def attach_prefix(
+        self, request_id: str, physical_block_ids: list[int], sequence_length: int
+    ) -> KVBlockAllocation:
+        """Attach a request to immutable full prefix blocks already in the pool."""
+        if request_id in self.requests:
+            raise ValueError(f"request {request_id!r} already owns KV blocks")
+        if not physical_block_ids or sequence_length <= 0:
+            raise ValueError("a shared prefix requires blocks and a positive length")
+        capacity = len(physical_block_ids) * self.block_size_tokens
+        if sequence_length != capacity:
+            raise ValueError("only complete blocks may be shared")
+        self.allocator.attach(request_id, physical_block_ids)
+        allocation = KVBlockAllocation(
+            request_id, self.block_size_tokens, list(physical_block_ids), sequence_length
         )
         self.requests[request_id] = allocation
         return allocation
@@ -97,6 +117,8 @@ class KVBlockManager:
             "block_size_tokens": self.block_size_tokens,
             "free_blocks": self.allocator.free_block_count,
             "used_blocks": self.allocator.used_block_count,
+            "shared_blocks": self.allocator.shared_block_count,
+            "block_references": self.allocator.total_references,
             "active_requests": len(self.requests),
             "allocated_capacity_tokens": allocated_capacity,
             "used_sequence_tokens": used_tokens,

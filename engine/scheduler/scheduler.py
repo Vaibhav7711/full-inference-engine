@@ -4,18 +4,23 @@ from __future__ import annotations
 
 from collections import deque
 
-from engine.cache import KVBlockManager
+from engine.cache import KVBlockManager, PrefixCache
 from engine.runtime import GenerationRequest, RequestState
 
 
 class FCFSScheduler:
     def __init__(
-        self, block_manager: KVBlockManager, *, max_waiting_requests: int | None = None
+        self,
+        block_manager: KVBlockManager,
+        *,
+        max_waiting_requests: int | None = None,
+        prefix_cache: PrefixCache | None = None,
     ):
         if max_waiting_requests is not None and max_waiting_requests <= 0:
             raise ValueError("max_waiting_requests must be positive when provided")
         self.block_manager = block_manager
         self.max_waiting_requests = max_waiting_requests
+        self.prefix_cache = prefix_cache
         self.waiting: deque[GenerationRequest] = deque()
         self.active: dict[str, GenerationRequest] = {}
         self._prefill_order: deque[str] = deque()
@@ -50,11 +55,30 @@ class FCFSScheduler:
                 request.transition(RequestState.REJECTED, reason="KV_CAPACITY_EXCEEDED")
                 self.rejected_count += 1
                 continue
-            allocation = self.block_manager.reserve(
-                request.request_id,
-                min(request.prompt_token_count, self.block_manager.block_size_tokens),
-                sequence_length=0,
+            match = (
+                self.prefix_cache.lookup(request.prompt_token_ids)
+                if self.prefix_cache is not None and request.prompt_token_ids
+                else None
             )
+            if match is not None and match.token_count:
+                allocation = self.block_manager.attach_prefix(
+                    request.request_id, list(match.physical_block_ids), match.token_count
+                )
+                request.prefilled_token_count = match.token_count
+                request.cached_prefix_tokens = match.token_count
+            else:
+                allocation = self.block_manager.reserve(
+                    request.request_id,
+                    min(request.prompt_token_count, self.block_manager.block_size_tokens),
+                    sequence_length=0,
+                )
+                if allocation is None and self.prefix_cache is not None:
+                    self.prefix_cache.evict_until_free(1)
+                    allocation = self.block_manager.reserve(
+                        request.request_id,
+                        min(request.prompt_token_count, self.block_manager.block_size_tokens),
+                        sequence_length=0,
+                    )
             if allocation is None:
                 break
             self.waiting.popleft()
@@ -135,4 +159,7 @@ class FCFSScheduler:
             "rejected_count": self.rejected_count,
             "head_request_id": self.waiting[0].request_id if self.waiting else None,
             "block_manager": self.block_manager.snapshot(),
+            "prefix_cache": (
+                self.prefix_cache.snapshot() if self.prefix_cache is not None else None
+            ),
         }

@@ -47,6 +47,7 @@ class GenerationRequest:
     first_token_ns: int | None = None
     last_token_ns: int | None = None
     token_timestamps_ns: list[int] = field(default_factory=list)
+    cached_prefix_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -59,6 +60,8 @@ class GenerationRequest:
             raise ValueError("prompt_token_ids length must equal prompt_token_count")
         if not 0 <= self.prefilled_token_count <= self.prompt_token_count:
             raise ValueError("prefilled_token_count must be within the prompt")
+        if not 0 <= self.cached_prefix_tokens <= self.prefilled_token_count:
+            raise ValueError("cached_prefix_tokens must be committed prefill tokens")
 
     @property
     def reserved_tokens(self) -> int:

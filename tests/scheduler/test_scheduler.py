@@ -1,4 +1,4 @@
-from engine.cache import KVBlockManager
+from engine.cache import KVBlockManager, PrefixCache
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
 
@@ -84,3 +84,24 @@ def test_prefill_planner_is_token_bounded_and_round_robin() -> None:
     assert [(request.request_id, count) for request, count in second] == [
         ("r2", 3), ("r0", 1)
     ]
+
+
+def test_admission_attaches_longest_cached_prefix() -> None:
+    manager = KVBlockManager(num_blocks=12, block_size_tokens=4)
+    cache = PrefixCache(manager, max_blocks=8)
+    source = manager.reserve("source", 8, sequence_length=8)
+    assert source is not None
+    source_blocks = list(source.physical_block_ids)
+    cache.publish(list(range(8)), source)
+    manager.release("source")
+    scheduler = FCFSScheduler(manager, prefix_cache=cache)
+    request = GenerationRequest(
+        "hit", 9, 2, prompt_token_ids=list(range(9))
+    )
+    scheduler.submit(request)
+    assert scheduler.admit_available() == [request]
+    assert request.prefilled_token_count == 8
+    assert request.cached_prefix_tokens == 8
+    assert request.block_table == source_blocks
+    scheduler.cancel(request.request_id)
+    assert manager.snapshot()["used_blocks"] == cache.snapshot()["cached_blocks"]
