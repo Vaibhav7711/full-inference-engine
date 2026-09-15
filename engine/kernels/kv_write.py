@@ -76,7 +76,8 @@ def _write_decode_kv_kernel(
 
 @triton.jit
 def _write_prefill_kv_batched_kernel(
-    key_ptr, value_ptr, key_pool_ptr, value_pool_ptr, block_tables_ptr, seq_lens_ptr,
+    key_ptr, value_ptr, key_pool_ptr, value_pool_ptr, block_tables_ptr,
+    start_positions_ptr, chunk_lens_ptr,
     stride_kb, stride_kh, stride_kt, stride_kd,
     stride_vb, stride_vh, stride_vt, stride_vd,
     stride_btb, stride_btl,
@@ -88,10 +89,11 @@ def _write_prefill_kv_batched_kernel(
     token = tl.program_id(1)
     head = tl.program_id(2)
     dims = tl.arange(0, BLOCK_D)
-    token_valid = token < tl.load(seq_lens_ptr + batch)
+    token_valid = token < tl.load(chunk_lens_ptr + batch)
     valid = token_valid & (dims < HEAD_DIM)
-    logical_block = token // BLOCK_SIZE
-    block_offset = token % BLOCK_SIZE
+    position = tl.load(start_positions_ptr + batch) + token
+    logical_block = position // BLOCK_SIZE
+    block_offset = position % BLOCK_SIZE
     physical_block = tl.load(
         block_tables_ptr + batch * stride_btb + logical_block * stride_btl,
         mask=token_valid,
@@ -182,9 +184,10 @@ def write_prefill_kv_batched(
     key_pool: torch.Tensor,
     value_pool: torch.Tensor,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    chunk_lens: torch.Tensor,
+    start_positions: torch.Tensor | None = None,
 ) -> None:
-    """Write valid tokens from padded `[B,H,S,D]` K/V into per-request blocks."""
+    """Write padded K/V chunks into each request's absolute paged positions."""
     if key.ndim != 4 or value.shape != key.shape:
         raise ValueError("key/value must have matching [B,H,S,D] shapes")
     batch, heads, padded_length, head_dim = key.shape
@@ -194,16 +197,21 @@ def write_prefill_kv_batched(
         raise ValueError("pool head geometry does not match incoming K/V")
     if block_tables.ndim != 2 or block_tables.shape[0] != batch:
         raise ValueError("block tables must have shape [B,max_blocks]")
-    if seq_lens.ndim != 1 or seq_lens.numel() != batch:
-        raise ValueError("sequence lengths must have shape [B]")
+    if chunk_lens.ndim != 1 or chunk_lens.numel() != batch:
+        raise ValueError("chunk lengths must have shape [B]")
+    if start_positions is None:
+        start_positions = torch.zeros_like(chunk_lens)
+    if start_positions.ndim != 1 or start_positions.numel() != batch:
+        raise ValueError("start positions must have shape [B]")
     if head_dim > 256:
         raise ValueError("KV write kernel supports head dimensions up to 256")
 
     block_tables = block_tables.contiguous().to(dtype=torch.int32, device=key.device)
-    seq_lens = seq_lens.contiguous().to(dtype=torch.int32, device=key.device)
+    chunk_lens = chunk_lens.contiguous().to(dtype=torch.int32, device=key.device)
+    start_positions = start_positions.contiguous().to(dtype=torch.int32, device=key.device)
     block_d = triton.next_power_of_2(head_dim)
     _write_prefill_kv_batched_kernel[(batch, padded_length, heads)](
-        key, value, key_pool, value_pool, block_tables, seq_lens,
+        key, value, key_pool, value_pool, block_tables, start_positions, chunk_lens,
         *key.stride(), *value.stride(), *block_tables.stride(),
         *key_pool.stride(), *value_pool.stride(),
         BLOCK_SIZE=key_pool.shape[1], HEAD_DIM=head_dim, BLOCK_D=block_d,

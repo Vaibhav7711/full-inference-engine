@@ -81,3 +81,32 @@ def test_batched_prefill_write_ignores_padding_and_maps_each_request() -> None:
     # Padding for the short rows must never be written through their -1 sentinels.
     assert torch.count_nonzero(key_pool[-1]) == 0
     assert torch.count_nonzero(value_pool[-1]) == 0
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_prefill_write_supports_nonzero_chunk_starts() -> None:
+    from engine.kernels.kv_write import write_prefill_kv_batched
+
+    torch.manual_seed(53)
+    batch, heads, padded_length, head_dim = 2, 4, 9, 64
+    block_size = 4
+    starts = torch.tensor([3, 8], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([6, 9], dtype=torch.int32, device="cuda")
+    tables = torch.tensor([[7, 2, 10, 1, 0], [5, 11, 3, 9, 6]], device="cuda")
+    key = torch.randn(batch, heads, padded_length, head_dim, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+    key_pool = torch.zeros(12, block_size, heads, head_dim, device="cuda", dtype=torch.float16)
+    value_pool = torch.zeros_like(key_pool)
+
+    write_prefill_kv_batched(
+        key, value, key_pool, value_pool, tables, lengths, starts
+    )
+    torch.cuda.synchronize()
+    for row in range(batch):
+        for token in range(int(lengths[row])):
+            position = int(starts[row]) + token
+            logical_block, offset = divmod(position, block_size)
+            physical_block = int(tables[row, logical_block])
+            assert torch.equal(key_pool[physical_block, offset], key[row, :, token])
+            assert torch.equal(value_pool[physical_block, offset], value[row, :, token])

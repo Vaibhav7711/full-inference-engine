@@ -8,9 +8,12 @@ def test_request_lifecycle_and_token_limit() -> None:
     assert request.reserved_tokens == 6
     request.transition(RequestState.PREFILLING)
     assert request.queue_time_ms() is not None
+    request.advance_prefill(4)
     request.transition(RequestState.DECODING)
     request.append_token(42)
+    assert request.time_to_first_token_ms() is not None
     request.append_token(43)
+    assert request.generation_time_ms() is not None
     with pytest.raises(RuntimeError, match="max_new_tokens"):
         request.append_token(44)
     request.transition(RequestState.FINISHED, reason="LENGTH")
@@ -21,6 +24,19 @@ def test_request_rejects_invalid_transition() -> None:
     request = GenerationRequest("r1", prompt_token_count=1, max_new_tokens=1)
     with pytest.raises(RuntimeError, match="invalid request transition"):
         request.transition(RequestState.DECODING)
+
+
+def test_request_tracks_partial_prefill_progress() -> None:
+    request = GenerationRequest("chunked", prompt_token_count=10, max_new_tokens=2)
+    request.transition(RequestState.PREFILLING)
+    request.advance_prefill(4)
+    assert request.prefilled_token_count == 4
+    assert request.remaining_prefill_tokens == 6
+    with pytest.raises(RuntimeError, match="fully prefetched"):
+        request.transition(RequestState.DECODING)
+    assert request.state is RequestState.PREFILLING
+    request.advance_prefill(6)
+    request.transition(RequestState.DECODING)
 
 
 def test_request_exposes_manager_owned_block_table() -> None:

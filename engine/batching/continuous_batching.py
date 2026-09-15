@@ -37,6 +37,7 @@ import torch
 from engine.cache.paging import KVBlockManager
 from engine.kernels.kv_write import write_decode_kv
 from engine.kernels.paged_decode_batched import paged_decode_batched
+from engine.kernels.paged_prefill import paged_prefill
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
 
@@ -56,6 +57,17 @@ class _BatchContext:
 
 
 _BATCH_CTX: Optional[_BatchContext] = None
+@dataclass
+class _PrefillContext:
+    """Paged-pool metadata for one mixed-length prefill chunk batch."""
+    key_pool: list
+    value_pool: list
+    block_tables: torch.Tensor
+    start_positions: torch.Tensor
+    chunk_lens: torch.Tensor
+
+
+_PREFILL_CTX: Optional[_PrefillContext] = None
 _ATTN_CALLS = 0
 
 
@@ -67,6 +79,16 @@ def _set_batch_ctx(ctx: _BatchContext) -> None:
 def _clear_batch_ctx() -> None:
     global _BATCH_CTX
     _BATCH_CTX = None
+
+
+def _set_prefill_ctx(ctx: _PrefillContext) -> None:
+    global _PREFILL_CTX
+    _PREFILL_CTX = ctx
+
+
+def _clear_prefill_ctx() -> None:
+    global _PREFILL_CTX
+    _PREFILL_CTX = None
 
 
 def batched_decode_attention_forward(
@@ -113,6 +135,27 @@ def batched_decode_attention_forward(
     return out, None
 
 
+def chunked_prefill_attention_forward(
+    module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs,
+):
+    """Write a K/V chunk, then attend it to the paged prefix causally."""
+    ctx = _PREFILL_CTX
+    assert ctx is not None, "chunked prefill context not set"
+    layer_idx = module.layer_idx
+    key_pool = ctx.key_pool[layer_idx]
+    value_pool = ctx.value_pool[layer_idx]
+    from engine.kernels.kv_write import write_prefill_kv_batched
+    write_prefill_kv_batched(
+        key, value, key_pool, value_pool, ctx.block_tables,
+        ctx.chunk_lens, ctx.start_positions,
+    )
+    out = paged_prefill(
+        query, key_pool, value_pool, ctx.block_tables,
+        ctx.start_positions, ctx.chunk_lens, scale=scaling,
+    )
+    return out.transpose(1, 2).contiguous(), None
+
+
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
@@ -121,16 +164,24 @@ class ContinuousBatchingEngine:
     """Full batched decode over paged KV, scheduler-driven."""
 
     ATTN_NAME = "batched_paged_decode"
+    PREFILL_ATTN_NAME = "chunked_paged_prefill"
 
     def __init__(self, model, tokenizer, device, *,
-                 num_blocks: int = 4096, block_size: int = 16, max_active: int = 16):
-        if num_blocks <= 0 or block_size <= 0 or max_active <= 0:
-            raise ValueError("num_blocks, block_size, and max_active must be positive")
+                 num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
+                 prefill_chunk_size: int = 128,
+                 max_prefill_tokens_per_iteration: int = 512,
+                 max_waiting_requests: int | None = None):
+        if min(num_blocks, block_size, max_active, prefill_chunk_size,
+               max_prefill_tokens_per_iteration) <= 0:
+            raise ValueError("engine sizes and prefill budgets must be positive")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.block_size = block_size
         self.max_active = max_active
+        self.prefill_chunk_size = prefill_chunk_size
+        self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
+        self.max_waiting_requests = max_waiting_requests
 
         cfg = model.config
         self.num_layers = cfg.num_hidden_layers
@@ -181,11 +232,14 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
-        self.scheduler = FCFSScheduler(self.block_manager)
+        self.scheduler = FCFSScheduler(
+            self.block_manager, max_waiting_requests=max_waiting_requests
+        )
 
         # Register the batched attention fn once.
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         ALL_ATTENTION_FUNCTIONS[self.ATTN_NAME] = batched_decode_attention_forward
+        ALL_ATTENTION_FUNCTIONS[self.PREFILL_ATTN_NAME] = chunked_prefill_attention_forward
 
     def _prepare_decode_metadata(
         self, active: list[GenerationRequest]
@@ -226,7 +280,9 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=self.key_pool[0].shape[0], block_size_tokens=self.block_size,
         )
-        self.scheduler = FCFSScheduler(self.block_manager)
+        self.scheduler = FCFSScheduler(
+            self.block_manager, max_waiting_requests=self.max_waiting_requests
+        )
 
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
@@ -257,6 +313,18 @@ class ContinuousBatchingEngine:
                 raise RuntimeError("every request must be admitted before prefill")
             if not request.prompt_token_ids:
                 raise ValueError("prefill requires prompt_token_ids")
+
+        viable = []
+        for request in requests:
+            if self.block_manager.ensure_capacity(
+                request.request_id, request.prompt_token_count
+            ):
+                viable.append(request)
+            else:
+                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
+        requests = viable
+        if not requests:
+            return
 
         lengths_list = [len(request.prompt_token_ids) for request in requests]
         padded_length = max(lengths_list)
@@ -291,12 +359,154 @@ class ContinuousBatchingEngine:
         next_tokens = out.logits[rows, last_positions].argmax(dim=-1).tolist()
 
         for request, token in zip(requests, next_tokens):
+            if not self.block_manager.append_tokens(
+                request.request_id, request.remaining_prefill_tokens
+            ):
+                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
+                continue
+            request.advance_prefill(request.remaining_prefill_tokens)
             request.next_token_id = int(token)
             self.scheduler.mark_decoding(request.request_id)
             request.append_token(request.next_token_id)
             if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
                 reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
                 self.scheduler.finish(request.request_id, reason=reason)
+
+    @torch.inference_mode()
+    def prefill_chunks(
+        self, plans: list[tuple[GenerationRequest, int]]
+    ) -> None:
+        """Run one causal paged-prefill chunk for each planned request."""
+        if not plans:
+            return
+        if len(plans) > self.max_active:
+            raise ValueError("prefill chunk batch exceeds max_active")
+        for request, count in plans:
+            if request.state is not RequestState.PREFILLING or request.allocation is None:
+                raise RuntimeError("every chunk request must be admitted and PREFILLING")
+            if not request.prompt_token_ids or not 0 < count <= request.remaining_prefill_tokens:
+                raise ValueError("invalid prefill chunk plan")
+
+        # Keep the established SDPA fast path for a batch of complete fresh prompts.
+        # It is substantially better for short prompts; chunk attention is selected only
+        # when a request really needs resumable prefill.
+        if all(
+            request.prefilled_token_count == 0 and count == request.prompt_token_count
+            for request, count in plans
+        ):
+            self.prefill_batch([request for request, _ in plans])
+            return
+
+        viable_plans = []
+        for request, count in plans:
+            target = request.prefilled_token_count + count
+            if self.block_manager.ensure_capacity(request.request_id, target):
+                viable_plans.append((request, count))
+            else:
+                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
+        plans = viable_plans
+        if not plans:
+            return
+
+        self.model.config._attn_implementation = self.PREFILL_ATTN_NAME
+        if hasattr(self.model.config, "_attn_implementation_internal"):
+            self.model.config._attn_implementation_internal = self.PREFILL_ATTN_NAME
+
+        starts_list = [request.prefilled_token_count for request, _ in plans]
+        counts_list = [count for _, count in plans]
+        padded_length = max(counts_list)
+        max_blocks = max(len(request.block_table) for request, _ in plans)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = next(iter(self.eos_ids), 0)
+        padded_ids = []
+        position_rows = []
+        padded_tables = []
+        for (request, count), start in zip(plans, starts_list):
+            chunk = request.prompt_token_ids[start:start + count]
+            padded_ids.append(chunk + [pad_token_id] * (padded_length - count))
+            # Padded positions are not semantically observed, but valid absolute
+            # positions are essential so RoPE agrees with future decode steps.
+            positions = list(range(start, start + count))
+            positions.extend([start] * (padded_length - count))
+            position_rows.append(positions)
+            padded_tables.append(
+                request.block_table + [-1] * (max_blocks - len(request.block_table))
+            )
+
+        ids = torch.tensor(padded_ids, dtype=torch.long, device=self.device)
+        position_ids = torch.tensor(position_rows, dtype=torch.long, device=self.device)
+        block_tables = torch.tensor(padded_tables, dtype=torch.int32, device=self.device)
+        starts = torch.tensor(starts_list, dtype=torch.int32, device=self.device)
+        chunk_lens = torch.tensor(counts_list, dtype=torch.int32, device=self.device)
+        _set_prefill_ctx(_PrefillContext(
+            self.key_pool, self.value_pool, block_tables, starts, chunk_lens,
+        ))
+        try:
+            out = self.model(
+                input_ids=ids, position_ids=position_ids,
+                use_cache=False, return_dict=True,
+            )
+        finally:
+            _clear_prefill_ctx()
+
+        completed_rows: list[tuple[int, GenerationRequest]] = []
+        for row, (request, count) in enumerate(plans):
+            if not self.block_manager.append_tokens(request.request_id, count):
+                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
+                continue
+            request.advance_prefill(count)
+            if request.remaining_prefill_tokens == 0:
+                completed_rows.append((row, request))
+
+        # Only the final prompt token produces the first generated token. Keeping this
+        # device-side until one list transfer avoids a scalar synchronization per row.
+        if completed_rows:
+            rows = torch.tensor([row for row, _ in completed_rows], device=self.device)
+            positions = torch.tensor(
+                [counts_list[row] - 1 for row, _ in completed_rows], device=self.device
+            )
+            tokens = out.logits[rows, positions].argmax(dim=-1).tolist()
+            for (_, request), token in zip(completed_rows, tokens):
+                request.next_token_id = int(token)
+                self.scheduler.mark_decoding(request.request_id)
+                request.append_token(request.next_token_id)
+                if (request.next_token_id in self.eos_ids
+                        or len(request.output_token_ids) >= request.max_new_tokens):
+                    reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
+                    self.scheduler.finish(request.request_id, reason=reason)
+
+    def _plan_prefill_chunks(self) -> list[tuple[GenerationRequest, int]]:
+        return self.scheduler.plan_prefill(
+            chunk_size=self.prefill_chunk_size,
+            token_budget=self.max_prefill_tokens_per_iteration,
+        )
+
+    def cancel(self, request_id: str, reason: str = "CANCELLED_BY_CLIENT") -> GenerationRequest:
+        """Cancel queued, partially-prefilled, or decoding work and release its KV."""
+        return self.scheduler.cancel(request_id, reason=reason)
+
+    def submit(self, request: GenerationRequest) -> bool:
+        """Submit an externally-created request to the bounded online scheduler."""
+        return self.scheduler.submit(request)
+
+    @property
+    def has_unfinished_requests(self) -> bool:
+        return bool(self.scheduler.waiting or self.scheduler.active)
+
+    @torch.inference_mode()
+    def step(self) -> None:
+        """Run one decode-first scheduling iteration under the prefill budget."""
+        decoding = [
+            request for request in self.scheduler.active.values()
+            if request.state is RequestState.DECODING
+        ]
+        if decoding:
+            self.decode_step(decoding)
+        self.scheduler.admit_available(max_active_requests=self.max_active)
+        plans = self._plan_prefill_chunks()
+        if plans:
+            self.prefill_chunks(plans)
 
     # ------------------------------------------------------------------
     # D2: one batched decode step over all active sequences
@@ -313,11 +523,17 @@ class ContinuousBatchingEngine:
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = self.ATTN_NAME
 
-        # Ensure each sequence has a block for its new token (grow if at a boundary)
+        # Fail only requests that cannot grow; unrelated sequences keep making progress.
+        viable = []
         for s in active:
             target_length = s.allocation.sequence_length + 1
             if not self.block_manager.ensure_capacity(s.request_id, target_length):
-                raise RuntimeError(f"pool exhausted growing {s.request_id}")
+                self.scheduler.fail(s.request_id, "KV_POOL_EXHAUSTED")
+            else:
+                viable.append(s)
+        active = viable
+        if not active:
+            return
 
         input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(active)
 
@@ -359,18 +575,10 @@ class ContinuousBatchingEngine:
                 prompt_token_ids=ids,
             )
             requests.append(request)
-            self.scheduler.submit(request)
+            self.submit(request)
 
-        while self.scheduler.waiting or self.scheduler.active:
-            admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
-            self.prefill_batch(admitted)
-            active = [
-                request
-                for request in self.scheduler.active.values()
-                if request.state is RequestState.DECODING
-            ]
-            if active:
-                self.decode_step(active)
+        while self.has_unfinished_requests:
+            self.step()
 
         return [request.output_token_ids for request in requests]
 

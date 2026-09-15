@@ -252,3 +252,45 @@ def test_d3_mixed_lengths_and_staggered():
             f"mixed-length continuous batching diverged for prompt {i}\n"
             f"  ref: {ref}\n  cb:  {out}"
         )
+
+
+@cuda
+@requires_cuda
+def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
+    """A prompt spanning several resumable chunks remains token-identical."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    prompt = (
+        "Explain how paged attention, continuous batching, and chunked prefill work "
+        "together in a production inference engine. Include scheduling and memory details."
+    )
+    max_new = 12
+    reference = _reference_greedy(model, tok, prompt, max_new)
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
+        prefill_chunk_size=8, max_prefill_tokens_per_iteration=8,
+    )
+    actual = eng.generate([prompt], max_new_tokens=max_new)[0]
+    assert actual == reference
+    assert eng.block_manager.snapshot()["used_blocks"] == 0
+
+
+@cuda
+@requires_cuda
+def test_d4_partial_prefill_can_be_cancelled():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=128, block_size=16,
+        prefill_chunk_size=4, max_prefill_tokens_per_iteration=4,
+    )
+    ids = tok("A deliberately longer prompt for cancellation", return_tensors="pt").input_ids[0].tolist()
+    request = _admit(eng, "cancel-me", ids, 8)
+    eng.prefill_chunks([(request, min(4, len(ids) - 1))])
+    assert request.state.name == "PREFILLING"
+    assert request.prefilled_token_count > 0
+    eng.cancel(request.request_id)
+    assert request.state.name == "CANCELLED"
+    assert eng.block_manager.snapshot()["used_blocks"] == 0

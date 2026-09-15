@@ -9,19 +9,30 @@ from engine.runtime import GenerationRequest, RequestState
 
 
 class FCFSScheduler:
-    def __init__(self, block_manager: KVBlockManager):
+    def __init__(
+        self, block_manager: KVBlockManager, *, max_waiting_requests: int | None = None
+    ):
+        if max_waiting_requests is not None and max_waiting_requests <= 0:
+            raise ValueError("max_waiting_requests must be positive when provided")
         self.block_manager = block_manager
+        self.max_waiting_requests = max_waiting_requests
         self.waiting: deque[GenerationRequest] = deque()
         self.active: dict[str, GenerationRequest] = {}
+        self._prefill_order: deque[str] = deque()
         self.rejected_count = 0
         self.admission_count = 0
 
-    def submit(self, request: GenerationRequest) -> None:
+    def submit(self, request: GenerationRequest) -> bool:
         if request.state is not RequestState.WAITING:
             raise ValueError("only WAITING requests may be submitted")
         if request.request_id in self.active or any(item.request_id == request.request_id for item in self.waiting):
             raise ValueError(f"duplicate request_id {request.request_id!r}")
+        if self.max_waiting_requests is not None and len(self.waiting) >= self.max_waiting_requests:
+            request.transition(RequestState.REJECTED, reason="QUEUE_FULL")
+            self.rejected_count += 1
+            return False
         self.waiting.append(request)
+        return True
 
     def admit_available(self, *, max_active_requests: int | None = None) -> list[GenerationRequest]:
         """Admit requests in arrival order while request slots and blocks are available."""
@@ -41,8 +52,8 @@ class FCFSScheduler:
                 continue
             allocation = self.block_manager.reserve(
                 request.request_id,
-                request.prompt_token_count,
-                sequence_length=request.prompt_token_count,
+                min(request.prompt_token_count, self.block_manager.block_size_tokens),
+                sequence_length=0,
             )
             if allocation is None:
                 break
@@ -50,6 +61,7 @@ class FCFSScheduler:
             request.allocation = allocation
             request.transition(RequestState.PREFILLING)
             self.active[request.request_id] = request
+            self._prefill_order.append(request.request_id)
             self.admission_count += 1
             admitted.append(request)
         return admitted
@@ -61,8 +73,17 @@ class FCFSScheduler:
 
     def finish(self, request_id: str, reason: str = "EOS") -> GenerationRequest:
         request = self.active.pop(request_id)
+        self._remove_prefill_order(request_id)
         self.block_manager.release(request_id)
         request.transition(RequestState.FINISHED, reason=reason)
+        return request
+
+    def fail(self, request_id: str, reason: str) -> GenerationRequest:
+        """Release an active request and record a terminal engine failure."""
+        request = self.active.pop(request_id)
+        self._remove_prefill_order(request_id)
+        self.block_manager.release(request_id)
+        request.transition(RequestState.FAILED, reason=reason)
         return request
 
     def cancel(self, request_id: str, reason: str = "CANCELLED_BY_CLIENT") -> GenerationRequest:
@@ -72,9 +93,39 @@ class FCFSScheduler:
                 request.transition(RequestState.CANCELLED, reason=reason)
                 return request
         request = self.active.pop(request_id)
+        self._remove_prefill_order(request_id)
         self.block_manager.release(request_id)
         request.transition(RequestState.CANCELLED, reason=reason)
         return request
+
+    def plan_prefill(
+        self, *, chunk_size: int, token_budget: int
+    ) -> list[tuple[GenerationRequest, int]]:
+        """Round-robin at most one prompt chunk per active request."""
+        if chunk_size <= 0 or token_budget <= 0:
+            raise ValueError("prefill chunk size and token budget must be positive")
+        plans: list[tuple[GenerationRequest, int]] = []
+        visits = len(self._prefill_order)
+        for _ in range(visits):
+            request_id = self._prefill_order.popleft()
+            request = self.active.get(request_id)
+            if request is not None:
+                self._prefill_order.append(request_id)
+            if request is None or request.state is not RequestState.PREFILLING:
+                continue
+            count = min(request.remaining_prefill_tokens, chunk_size, token_budget)
+            if count:
+                plans.append((request, count))
+                token_budget -= count
+            if token_budget == 0:
+                break
+        return plans
+
+    def _remove_prefill_order(self, request_id: str) -> None:
+        try:
+            self._prefill_order.remove(request_id)
+        except ValueError:
+            pass
 
     def snapshot(self) -> dict[str, object]:
         return {

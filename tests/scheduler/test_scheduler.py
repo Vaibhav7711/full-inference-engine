@@ -14,11 +14,13 @@ def test_fcfs_admission_and_release() -> None:
     scheduler.submit(first)
     scheduler.submit(second)
     assert [request.request_id for request in scheduler.admit_available()] == ["first", "second"]
+    assert first.allocation.sequence_length == 0
+    first.advance_prefill(first.prompt_token_count)
     scheduler.mark_decoding("first")
     scheduler.finish("first")
     assert first.state is RequestState.FINISHED
-    # Paging reserves prompt blocks lazily; output capacity grows during decode.
-    assert scheduler.block_manager.snapshot()["free_blocks"] == 8
+    # Admission owns one block; prompt/output capacity grows only as work executes.
+    assert scheduler.block_manager.snapshot()["free_blocks"] == 9
 
 
 def test_oversized_request_is_rejected_without_blocking_queue() -> None:
@@ -30,3 +32,55 @@ def test_oversized_request_is_rejected_without_blocking_queue() -> None:
     assert [request.request_id for request in scheduler.admit_available()] == ["valid"]
     assert oversized.state is RequestState.REJECTED
     assert oversized.finish_reason == "KV_CAPACITY_EXCEEDED"
+
+
+def test_active_failure_releases_blocks() -> None:
+    scheduler = make_scheduler()
+    request = GenerationRequest("failed", 3, 2)
+    scheduler.submit(request)
+    scheduler.admit_available()
+    scheduler.fail("failed", "KV_POOL_EXHAUSTED")
+    assert request.state is RequestState.FAILED
+    assert request.finish_reason == "KV_POOL_EXHAUSTED"
+    assert scheduler.block_manager.snapshot()["free_blocks"] == 10
+
+
+def test_cancel_partial_prefill_releases_blocks() -> None:
+    scheduler = make_scheduler()
+    request = GenerationRequest("cancelled", 6, 2)
+    scheduler.submit(request)
+    scheduler.admit_available()
+    assert scheduler.block_manager.append_tokens(request.request_id, 3)
+    request.advance_prefill(3)
+    scheduler.cancel(request.request_id)
+    assert request.state is RequestState.CANCELLED
+    assert scheduler.block_manager.snapshot()["free_blocks"] == 10
+
+
+def test_waiting_queue_applies_backpressure() -> None:
+    scheduler = FCFSScheduler(
+        KVBlockManager(num_blocks=10, block_size_tokens=1), max_waiting_requests=1
+    )
+    accepted = GenerationRequest("accepted", 2, 1)
+    rejected = GenerationRequest("rejected", 2, 1)
+    assert scheduler.submit(accepted)
+    assert not scheduler.submit(rejected)
+    assert rejected.state is RequestState.REJECTED
+    assert rejected.finish_reason == "QUEUE_FULL"
+
+
+def test_prefill_planner_is_token_bounded_and_round_robin() -> None:
+    scheduler = make_scheduler(capacity=30)
+    requests = [GenerationRequest(f"r{i}", 6, 1) for i in range(3)]
+    for request in requests:
+        scheduler.submit(request)
+    scheduler.admit_available()
+
+    first = scheduler.plan_prefill(chunk_size=3, token_budget=4)
+    second = scheduler.plan_prefill(chunk_size=3, token_budget=4)
+    assert [(request.request_id, count) for request, count in first] == [
+        ("r0", 3), ("r1", 1)
+    ]
+    assert [(request.request_id, count) for request, count in second] == [
+        ("r2", 3), ("r0", 1)
+    ]
