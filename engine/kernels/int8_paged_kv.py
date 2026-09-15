@@ -70,13 +70,14 @@ def _paged_decode_batched_int8_kernel(
     stride_bts, stride_btt, stride_sl,
     num_q_heads, num_kv_heads, scale,
     BLOCK_SIZE: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
+    LENGTH_OFFSET: tl.constexpr,
 ):
     sequence = tl.program_id(0)
     q_head = tl.program_id(1)
     kv_head = q_head // (num_q_heads // num_kv_heads)
     dims = tl.arange(0, HEAD_DIM)
     offsets = tl.arange(0, BLOCK_N)
-    sequence_length = tl.load(sl_ptr + sequence * stride_sl)
+    sequence_length = tl.load(sl_ptr + sequence * stride_sl) + LENGTH_OFFSET
     query = tl.load(q_ptr + sequence * stride_qs + q_head * stride_qh + dims * stride_qd).to(tl.float32)
     table = bt_ptr + sequence * stride_bts
 
@@ -239,7 +240,7 @@ def paged_decode_batched_int8(
     query: torch.Tensor, key_pages: torch.Tensor, value_pages: torch.Tensor,
     key_scales: torch.Tensor, value_scales: torch.Tensor, block_tables: torch.Tensor,
     seq_lens: torch.Tensor, *, scale: float | None = None, block_n: int = 128,
-    num_warps: int = 4,
+    num_warps: int = 4, length_offset: int = 0,
 ) -> torch.Tensor:
     """Decode attention over INT8 pages, dequantizing each vector inside the kernel."""
     if query.ndim != 4 or query.shape[2] != 1:
@@ -272,7 +273,8 @@ def paged_decode_batched_int8(
         *query_view.stride(), *key_pages.stride(), *value_pages.stride(),
         *key_scales.stride(), *value_scales.stride(), *output_view.stride(),
         *block_tables.stride(), seq_lens.stride(0), q_heads, kv_heads, scale,
-        BLOCK_SIZE=block_size, HEAD_DIM=head_dim, BLOCK_N=block_n, num_warps=num_warps,
+        BLOCK_SIZE=block_size, HEAD_DIM=head_dim, BLOCK_N=block_n,
+        LENGTH_OFFSET=length_offset, num_warps=num_warps,
     )
     return output
 

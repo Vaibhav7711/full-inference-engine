@@ -59,6 +59,8 @@ class _BatchContext:
     block_size: int
     decode_block_n: int
     decode_num_warps: int
+    key_scale_pool: list | None = None
+    value_scale_pool: list | None = None
 
 
 _BATCH_CTX: Optional[_BatchContext] = None
@@ -70,6 +72,8 @@ class _PrefillContext:
     block_tables: torch.Tensor
     start_positions: torch.Tensor
     chunk_lens: torch.Tensor
+    key_scale_pool: list | None = None
+    value_scale_pool: list | None = None
 
 
 _PREFILL_CTX: Optional[_PrefillContext] = None
@@ -117,24 +121,25 @@ def batched_decode_attention_forward(
     key_pool = ctx.key_pool[layer_idx]      # [num_blocks, block_size, kv_heads, D]
     value_pool = ctx.value_pool[layer_idx]
 
-    # One kernel writes every sequence's new token. Keeping positions and block-table
-    # lookups on-device avoids 2*N `.item()` synchronizations in every model layer.
-    write_decode_kv(
-        key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens
-    )
-
-    # Run K4 over lengths including the token just written. The +1 is performed while
-    # each attention program loads its length, rather than by a separate tensor kernel.
-    out = paged_decode_batched(
-        query,                 # [N, num_q_heads, 1, D]
-        key_pool, value_pool,  # shared pool for this layer
-        ctx.block_tables,      # [N, max_blocks]
-        ctx.seq_lens,          # [N] lengths before the just-written token
-        scale=scaling,
-        block_n=ctx.decode_block_n,
-        num_warps=ctx.decode_num_warps,
-        length_offset=1,
-    )   # -> [N, num_q_heads, 1, D]
+    if ctx.key_scale_pool is None:
+        write_decode_kv(key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens)
+        out = paged_decode_batched(
+            query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
+            scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
+            length_offset=1,
+        )
+    else:
+        from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
+        write_decode_int8_kv(
+            key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
+        )
+        out = paged_decode_batched_int8(
+            query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
+            scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
+            length_offset=1,
+        )
 
     # HF expects [N, 1, heads, D] (transposed form)
     out = out.transpose(1, 2).contiguous()   # [N, 1, num_q_heads, D]
@@ -150,15 +155,28 @@ def chunked_prefill_attention_forward(
     layer_idx = module.layer_idx
     key_pool = ctx.key_pool[layer_idx]
     value_pool = ctx.value_pool[layer_idx]
-    from engine.kernels.kv_write import write_prefill_kv_batched
-    write_prefill_kv_batched(
-        key, value, key_pool, value_pool, ctx.block_tables,
-        ctx.chunk_lens, ctx.start_positions,
-    )
-    out = paged_prefill(
-        query, key_pool, value_pool, ctx.block_tables,
-        ctx.start_positions, ctx.chunk_lens, scale=scaling,
-    )
+    if ctx.key_scale_pool is None:
+        from engine.kernels.kv_write import write_prefill_kv_batched
+        write_prefill_kv_batched(
+            key, value, key_pool, value_pool, ctx.block_tables,
+            ctx.chunk_lens, ctx.start_positions,
+        )
+        out = paged_prefill(
+            query, key_pool, value_pool, ctx.block_tables,
+            ctx.start_positions, ctx.chunk_lens, scale=scaling,
+        )
+    else:
+        from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
+        write_prefill_int8_kv_batched(
+            key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.chunk_lens,
+            ctx.start_positions,
+        )
+        out = paged_prefill_int8(
+            query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.start_positions,
+            ctx.chunk_lens, scale=scaling,
+        )
     return out.transpose(1, 2).contiguous(), None
 
 
@@ -177,12 +195,15 @@ class ContinuousBatchingEngine:
                  prefill_chunk_size: int = 128,
                  max_prefill_tokens_per_iteration: int = 512,
                  max_waiting_requests: int | None = None,
-                 prefix_cache_blocks: int = 256):
+                 prefix_cache_blocks: int = 256,
+                 kv_cache_dtype: str = "fp16"):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
         if prefix_cache_blocks < 0:
             raise ValueError("prefix_cache_blocks must be non-negative")
+        if kv_cache_dtype not in {"fp16", "int8"}:
+            raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -192,6 +213,7 @@ class ContinuousBatchingEngine:
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
         self.max_waiting_requests = max_waiting_requests
         self.prefix_cache_blocks = prefix_cache_blocks
+        self.kv_cache_dtype = kv_cache_dtype
 
         cfg = model.config
         self.num_layers = cfg.num_hidden_layers
@@ -215,13 +237,21 @@ class ContinuousBatchingEngine:
         elif isinstance(ce, (list, tuple)):
             self.eos_ids.update(ce)
 
-        dtype = next(model.parameters()).dtype
+        dtype = torch.int8 if kv_cache_dtype == "int8" else next(model.parameters()).dtype
         self.key_pool = [
             torch.zeros((num_blocks, block_size, self.num_kv_heads, self.head_dim),
                         device=device, dtype=dtype)
             for _ in range(self.num_layers)
         ]
         self.value_pool = [torch.zeros_like(k) for k in self.key_pool]
+        if kv_cache_dtype == "int8":
+            scale_shape = (num_blocks, block_size, self.num_kv_heads)
+            self.key_scale_pool = [torch.zeros(scale_shape, device=device, dtype=torch.float16)
+                                   for _ in range(self.num_layers)]
+            self.value_scale_pool = [torch.zeros_like(scale) for scale in self.key_scale_pool]
+        else:
+            self.key_scale_pool = None
+            self.value_scale_pool = None
 
         # Decode metadata has a fixed upper bound. Keep both pinned-host staging and
         # GPU tensors alive for the engine lifetime so each token step performs a few
@@ -317,6 +347,10 @@ class ContinuousBatchingEngine:
         for key_pool, value_pool in zip(self.key_pool, self.value_pool):
             key_pool[new_block].copy_(key_pool[old_block])
             value_pool[new_block].copy_(value_pool[old_block])
+        if self.key_scale_pool is not None:
+            for key_scale, value_scale in zip(self.key_scale_pool, self.value_scale_pool):
+                key_scale[new_block].copy_(key_scale[old_block])
+                value_scale[new_block].copy_(value_scale[old_block])
         return True
 
     def _ensure_kv_capacity(self, request: GenerationRequest, target_length: int) -> bool:
@@ -401,7 +435,8 @@ class ContinuousBatchingEngine:
         block_tables = torch.tensor(padded_tables, dtype=torch.int32, device=self.device)
         seq_lens = torch.tensor(lengths_list, dtype=torch.int32, device=self.device)
         cache = BatchedPoolBackedPrefillCache(
-            self.key_pool, self.value_pool, block_tables, seq_lens, padded_length
+            self.key_pool, self.value_pool, block_tables, seq_lens, padded_length,
+            self.key_scale_pool, self.value_scale_pool,
         )
         out = self.model(
             input_ids=ids, attention_mask=attention_mask,
@@ -495,6 +530,7 @@ class ContinuousBatchingEngine:
         chunk_lens = torch.tensor(counts_list, dtype=torch.int32, device=self.device)
         _set_prefill_ctx(_PrefillContext(
             self.key_pool, self.value_pool, block_tables, starts, chunk_lens,
+            self.key_scale_pool, self.value_scale_pool,
         ))
         try:
             out = self.model(
@@ -615,6 +651,7 @@ class ContinuousBatchingEngine:
             key_pool=self.key_pool, value_pool=self.value_pool,
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
             decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
+            key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
         ))
         try:
             out = self.model(input_ids=input_ids, position_ids=position_ids,

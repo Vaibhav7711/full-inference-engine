@@ -256,6 +256,37 @@ def test_d3_mixed_lengths_and_staggered():
 
 @cuda
 @requires_cuda
+def test_int8_kv_mode_runs_chunked_prefill_then_decode():
+    """Opt-in INT8 storage covers both resumable prefill and fused decode attention."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=1024, block_size=16, max_active=4,
+        prefill_chunk_size=16, kv_cache_dtype="int8", prefix_cache_blocks=0,
+    )
+    prompt = ("Paged attention stores key and value vectors in blocks for efficient " * 12)
+    token_ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
+    assert len(token_ids) > 16
+    request = _admit(eng, "int8", token_ids, 4)
+
+    # The first partial chunk forces the custom paged-prefill kernel rather than the
+    # full-prompt SDPA fast path. Complete it in two or more resumable iterations.
+    while request.remaining_prefill_tokens:
+        eng.prefill_chunks([(request, min(16, request.remaining_prefill_tokens))])
+
+    assert request.state.name == "DECODING"
+    assert eng.key_pool[0].dtype is torch.int8
+    assert eng.key_scale_pool is not None
+    assert eng.key_scale_pool[0].dtype is torch.float16
+    before = request.allocation.sequence_length
+    eng.decode_step([request])
+    assert request.allocation.sequence_length == before + 1
+    assert len(request.output_token_ids) >= 2
+
+
+@cuda
+@requires_cuda
 def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
     """A prompt spanning several resumable chunks remains token-identical."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
