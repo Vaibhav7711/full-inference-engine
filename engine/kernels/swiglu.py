@@ -13,8 +13,10 @@ import triton.language as tl
 def _swiglu_kernel(gate_ptr, up_ptr, out_ptr, elements, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
-    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0)
-    up = tl.load(up_ptr + offsets, mask=mask, other=0.0)
+    # Triton 3.6's sigmoid accepts FP32/FP64. Promotion also mirrors the stable
+    # internal evaluation used by PyTorch SiLU before the result is stored as FP16.
+    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + offsets, gate * tl.sigmoid(gate) * up, mask=mask)
 
 

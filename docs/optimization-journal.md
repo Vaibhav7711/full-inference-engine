@@ -574,6 +574,16 @@ Single Colab gate:
 
 Decision: `PENDING T4 MEASUREMENT`.
 
+First T4 gate attempt:
+
+- All three fused Q/K RoPE numerical cases passed.
+- SwiGLU compilation failed before numerical comparison because Triton 3.6 restricts
+  `tl.sigmoid` to FP32/FP64 and the kernel supplied FP16.
+- The four continuous-generation failures had the identical downstream compiler error;
+  no benchmark or profile ran because the combined gate stopped at correctness.
+- Repair: promote gate and up values to FP32 for fused SiLU/product evaluation and let
+  the output store cast back to the model's FP16 dtype.
+
 ### Persistent decode metadata — accepted
 
 Commit: `5126ade` — `Persist continuous decode metadata buffers`
