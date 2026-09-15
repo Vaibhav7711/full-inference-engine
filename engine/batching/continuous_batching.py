@@ -198,7 +198,8 @@ class ContinuousBatchingEngine:
                  prefix_cache_blocks: int = 256,
                  kv_cache_dtype: str = "fp16",
                  cuda_graph_batch_size: int | None = None,
-                 cuda_graph_batch_sizes: tuple[int, ...] | None = None):
+                 cuda_graph_batch_sizes: tuple[int, ...] | None = None,
+                 fuse_mlp_gate_up: bool = True):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
@@ -225,6 +226,7 @@ class ContinuousBatchingEngine:
         self.prefix_cache_blocks = prefix_cache_blocks
         self.kv_cache_dtype = kv_cache_dtype
         self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or ()
+        self.fuse_mlp_gate_up = fuse_mlp_gate_up
         self._decode_graphs = {}
 
         cfg = model.config
@@ -240,7 +242,9 @@ class ContinuousBatchingEngine:
         from engine.kernels.swiglu import install_triton_qwen_swiglu
         self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
         install_triton_qwen_rope()
-        self.triton_swiglu_modules = install_triton_qwen_swiglu(model)
+        self.triton_swiglu_modules = install_triton_qwen_swiglu(
+            model, fuse_gate_up=fuse_mlp_gate_up,
+        )
 
         self.eos_ids = set()
         ce = model.generation_config.eos_token_id

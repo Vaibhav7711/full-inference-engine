@@ -68,7 +68,7 @@ class FusedGateUpProjection(nn.Module):
         return output.split(self.gate_features, dim=-1)
 
 
-def install_triton_qwen_swiglu(model: torch.nn.Module) -> int:
+def install_triton_qwen_swiglu(model: torch.nn.Module, *, fuse_gate_up: bool = True) -> int:
     """Patch Qwen3 MLP modules and return the number installed."""
     installed = 0
     for module in model.modules():
@@ -77,16 +77,17 @@ def install_triton_qwen_swiglu(model: torch.nn.Module) -> int:
         if not hasattr(module, "_pre_triton_swiglu_forward"):
             module._pre_triton_swiglu_forward = module.forward.__func__
             module.forward = MethodType(_triton_qwen_mlp_forward, module)
-            gate, up = module.gate_proj, module.up_proj
-            fused = FusedGateUpProjection(gate, up)
-            # Keep originals outside Module registration so fusion actually removes
-            # their duplicate parameters from the active inference model, while still
-            # allowing an exact uninstall for tests/debugging.
-            module.__dict__["_pre_triton_gate_proj"] = gate
-            module.__dict__["_pre_triton_up_proj"] = up
-            module.gate_proj = None
-            module.up_proj = None
-            module.fused_gate_up_proj = fused
+            if fuse_gate_up:
+                gate, up = module.gate_proj, module.up_proj
+                fused = FusedGateUpProjection(gate, up)
+                # Keep originals outside Module registration so fusion actually removes
+                # their duplicate parameters from the active inference model, while still
+                # allowing an exact uninstall for tests/debugging.
+                module.__dict__["_pre_triton_gate_proj"] = gate
+                module.__dict__["_pre_triton_up_proj"] = up
+                module.gate_proj = None
+                module.up_proj = None
+                module.fused_gate_up_proj = fused
         installed += 1
     if installed == 0:
         raise RuntimeError("model contains no Qwen3MLP modules")
