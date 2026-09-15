@@ -1302,3 +1302,26 @@ Decision: `KEEP` worker-routed cancellation and retain 944.2 tok/s as a same-pro
 service-throughput baseline. Relabel the benchmark's first-event field accordingly. A
 real `uvicorn` plus network HTTP client load harness is required for valid streamed TTFT
 percentiles; defer that transport-level measurement rather than publishing false TTFT.
+
+## Post-Phase 14 audit — prioritized remaining work
+
+This audit distinguishes a measured T4 bottleneck from production-runtime gaps. Items
+are ordered by value and risk; rejected W8A16/W8A8 and inconclusive MLP-projection fusion
+are intentionally excluded from the active backlog.
+
+| Priority | Work item | Why it remains | Acceptance evidence required |
+| --- | --- | --- | --- |
+| P0 | Batched decode-token transfer | Decode state advancement reads `next_tokens[i].item()` once per active row. Replace it with one batched host transfer and verify token identity. | CUDA profile: fewer DtoH transfers; no end-to-end regression. |
+| P0 | Real transport load harness | TestClient buffers SSE, so current TTFT is invalid as a network metric. | `uvicorn` + real HTTP client burst/steady tests with valid TTFT p50/p95/p99. |
+| P1 | Admission limits, timeout, and disconnect tests | Cancellation is worker-routed, but the server has no request deadline, prompt-token limit, or real disconnect test. | KV release, no leaked handles, correct 429/timeout behavior. |
+| P1 | Adaptive graph QoS policy | Graph buckets give 1.86x mixed-arrival throughput but regress short p95 ITL. | Policy A/B improves selected latency objective without sacrificing token identity. |
+| P1 | Long-prompt prefill coalescing | Current 128-token budget is a good default on one synthetic workload, not a universal policy. | Bursty long-prompt workload with throughput/TTFT/ITL improvement. |
+| P2 | Remove process-global attention contexts | `_BATCH_CTX` and `_PREFILL_CTX` make one process safe only for one active engine forward. The server enforces this deliberately. | Two independent engines/models cannot cross-contaminate state. |
+| P2 | GPU-resident sampling/request state | A deeper follow-on to batched transfer; removes most host decode control but requires redesign. | Profile-backed gain that exceeds added complexity. |
+| P2 | Paged-attention long-context retuning | Existing 64x4/128x4 regimes are measured; further tuning needs a new long-context profiler signal. | Isolated + end-to-end long-context A/B. |
+| P3 | Multi-model/model-family and distributed support | Current patches are Qwen/Transformers-version specific and single-GPU by design. | Adapter contract and model-specific correctness suite. |
+
+Documentation is also stale in places: the README still describes several pre-paged,
+pre-continuous milestones. Reconcile it with the journal after the P0/P1 runtime work so
+the public architecture description does not understate or contradict the implemented
+engine.
