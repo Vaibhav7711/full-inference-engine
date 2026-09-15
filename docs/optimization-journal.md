@@ -849,3 +849,81 @@ Interpretation:
 Decision: `KEEP` chunked prefill and decode-first scheduling. Do not claim lower typical
 ITL or better long-prompt TTFT; claim a measured 68.6% reduction in the worst decoder
 stall for this concurrent 1,001-token-prompt workload.
+
+## Phase 4 — Refcounted paged prefix caching
+
+Status: `PENDING T4 GATE`
+
+### Block-radix reuse, copy-on-write continuation, and pressure eviction
+
+Commit: `6428f81` — `Add refcounted paged prefix caching`
+
+Problem:
+
+Repeated system prompts and shared conversation prefixes were recomputed in full. The
+allocator also assumed exclusive block ownership, so merely copying block-table IDs
+would have caused use-after-free or allowed one request to overwrite another's KV.
+
+Ownership architecture:
+
+- `BlockAllocator` now refcounts physical blocks and tracks logical owners separately.
+  Allocation creates a reference, prefix attachment increments it, extension adds private
+  blocks, and a physical block returns to the free list only after its last owner exits.
+- `KVBlockManager.attach_prefix` accepts only block-aligned immutable prefixes. Shared
+  partial blocks are forbidden, avoiding copy-on-write inside a physical page.
+- Cache nodes retain their own allocator reference independently of active requests.
+  Finishing or cancelling a request therefore cannot invalidate a cached prefix, while
+  evicting a cache node cannot invalidate blocks still referenced by active requests.
+
+Lookup and eviction:
+
+- Added a block-radix tree keyed by `(parent, complete token block)`. Lookup walks the
+  longest matching token path and returns the existing physical block IDs directly.
+- Lookup always leaves at least one prompt token uncached. KV alone does not contain the
+  final-token logits, so residual prefill is required to produce the first generated
+  token without duplicating the last cached position.
+- Residual tokens use the Phase 3 paged-prefill kernel with absolute positions, naturally
+  continuing from shared blocks into newly allocated private blocks.
+- Cache capacity is expressed in physical blocks. Eviction removes least-recently-used
+  radix leaves first, preserving valid parent paths and never breaking descendants.
+- Admission and KV growth ask the cache to release LRU ownership under allocator
+  pressure before failing a request. If active references prevent reclamation, the
+  existing per-request `KV_POOL_EXHAUSTED` behavior remains authoritative.
+- Cache metrics expose lookups, request-level hits, reused tokens, hit rate, cached
+  blocks, and evictions. Allocator metrics expose unique used blocks, shared blocks, and
+  total logical references.
+
+Execution integration:
+
+- Scheduler admission attaches the longest available prefix and initializes committed
+  prefill progress from the reused token count.
+- Both full SDPA prefill and paged chunk completion publish complete prompt blocks before
+  decode begins. Concurrent identical misses remain correct: the first publication wins
+  the radix edge and duplicate request blocks are reclaimed normally on release.
+- The existing short-prompt batched fast path remains unchanged. Prefix caching is
+  configured by `prefix_cache_blocks` and is cleared with the engine allocator on reset.
+
+Validation and measurement:
+
+- Added unit coverage for reference lifetime, final-owner reclamation, block alignment,
+  residual-token preservation, longest-prefix lookup, LRU leaf eviction, scheduler
+  attachment, and cancellation after a cache hit.
+- Added full-model repeated-prompt token-equivalence and hit-accounting coverage.
+- Updated leak assertions to distinguish intentional cache residency from live request
+  ownership.
+- Added a same-engine TTFT benchmark. It warms the long SDPA shape, records one true
+  miss, excludes the first compiling prefix hit, then measures five warmed hits while
+  requiring identical greedy output tokens.
+- Local gate: 100 passed, 94 CUDA tests skipped; compilation and diff checks passed.
+
+T4 acceptance gate:
+
+- All prefix ownership, scheduler, paged-kernel, and continuous-generation tests pass.
+- Repeated-prompt output is token-identical and the benchmark reports nonzero reused
+  tokens with stable cache residency.
+- Warm cache-hit median TTFT improves over the same-engine warmed miss; report the exact
+  speedup without generalizing beyond the measured shared-prefix workload.
+- The established 16-request short-prompt throughput remains at least 393.1 tok/s,
+  confirming that miss-only workloads retain the accepted fast path.
+
+Decision: `PENDING T4 MEASUREMENT`.
