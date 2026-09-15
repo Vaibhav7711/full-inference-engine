@@ -425,7 +425,7 @@ Next order:
 
 Decision: `DIAGNOSTIC COMPLETE`; no performance claim is made from profiler timings.
 
-### Batched sampled-token materialization — awaiting T4 gate
+### Batched sampled-token materialization — rejected and reverted
 
 Commit: `f74c6ce` — `Batch decode token transfer to host`
 
@@ -452,7 +452,21 @@ Gate:
 - Re-run the decode profiler after the throughput gate. Expected synchronization count
   is approximately 31 rather than 496 for this fixed 16 × 31 workload.
 
-Decision: `PENDING T4 MEASUREMENT`.
+T4 result:
+
+- All continuous-generation correctness tests passed.
+- Synchronization calls fell exactly as predicted, from 496 to 31 for 16 requests and
+  31 decode steps.
+- The first throughput run reached only 227.2 tok/s at width 16. A repeat after the
+  runtime was warm produced approximately the same result, below both the 250.3 tok/s
+  acceptance floor and the 263.5 tok/s immediate baseline.
+- The first `.item()` already waits for outstanding decode work. Later per-request
+  synchronization API calls observe an almost idle stream, so their count overstated
+  their critical-path cost. The replacement introduced a pinned D2H copy plus an
+  explicit wait and did not improve end-to-end execution.
+
+Decision: `REVERT`. Preserve this result so synchronization call count is not mistaken
+for latency saved in future profiling.
 
 ### Persistent decode metadata — accepted
 

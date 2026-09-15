@@ -160,9 +160,6 @@ class ContinuousBatchingEngine:
         self._host_input_ids = torch.empty((max_active, 1), dtype=torch.long, pin_memory=True)
         self._host_position_ids = torch.empty((max_active, 1), dtype=torch.long, pin_memory=True)
         self._host_seq_lens = torch.empty((max_active,), dtype=torch.int32, pin_memory=True)
-        self._host_next_tokens = torch.empty(
-            (max_active,), dtype=torch.long, pin_memory=True
-        )
         self._host_block_tables = torch.empty(
             (max_active, num_blocks), dtype=torch.int32, pin_memory=True
         )
@@ -209,19 +206,6 @@ class ContinuousBatchingEngine:
         seq_lens.copy_(self._host_seq_lens[:count], non_blocking=True)
         block_tables.copy_(self._host_block_tables[:count], non_blocking=True)
         return input_ids, position_ids, block_tables, seq_lens
-
-    def _materialize_next_tokens(self, next_tokens: torch.Tensor) -> torch.Tensor:
-        """Copy a decode batch to pinned host memory with one stream synchronization."""
-        count = next_tokens.numel()
-        if next_tokens.ndim != 1 or count > self.max_active:
-            raise ValueError("next tokens must be a 1D tensor within max_active")
-        host_tokens = self._host_next_tokens[:count]
-        host_tokens.copy_(next_tokens, non_blocking=True)
-        # Scheduling, EOS handling, and user-visible output currently live on the CPU,
-        # so one synchronization is necessary. Synchronizing once for the whole batch
-        # replaces one implicit synchronization from `.item()` for every request.
-        torch.cuda.current_stream(next_tokens.device).synchronize()
-        return host_tokens
 
     def reset(self) -> None:
         """Reinitialize the allocator (fresh free-block list) for a clean run.
@@ -306,10 +290,9 @@ class ContinuousBatchingEngine:
 
         # Sample next token per sequence, advance state
         next_tokens = out.logits[:, -1, :].argmax(dim=-1)   # [N]
-        host_next_tokens = self._materialize_next_tokens(next_tokens)
         for i, s in enumerate(active):
             self.block_manager.append_tokens(s.request_id)
-            tok = int(host_next_tokens[i].item())
+            tok = int(next_tokens[i].item())
             s.next_token_id = tok
             s.append_token(tok)
             if tok in self.eos_ids or len(s.output_token_ids) >= s.max_new_tokens:
