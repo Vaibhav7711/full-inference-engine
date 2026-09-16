@@ -350,3 +350,74 @@ prefill context, runs the real model with `use_cache=False`, and lets the custom
 attention modules write K/V directly into the persistent paged pools. When a row's prompt
 is completed, the logits at that row's final real chunk position produce the first output
 token, the request transitions to `DECODING`, and the token is appended.
+
+## Understanding-phase checkpoint — implementation map
+
+The project was studied through the paths that execute in the current Qwen3-0.6B serving
+runtime. The main result is that it is a hybrid inference engine, rather than a complete
+standalone transformer reimplementation:
+
+```text
+FastAPI/SSE handler
+  -> bounded submission and cancellation queues
+  -> one GPU-owning continuous-batching worker
+  -> scheduler + refcounted block manager
+  -> persistent paged K/V pools and fixed decode metadata buffers
+  -> Hugging Face Qwen layer execution
+  -> custom Triton attention hooks / K-V writers at the attention boundary
+```
+
+Hugging Face remains responsible for Qwen's embeddings, linear projections, residual
+paths, layer ordering, logits, and the large FP16 GEMMs executed by PyTorch/CUTLASS. The
+engine replaces the unsuitable growing `DynamicCache` with fixed page pools, directs
+attention to the paged kernels, and schedules many independent request lifecycles around
+that shared GPU state. Triton additionally replaces selected RMSNorm, RoPE, and SwiGLU
+operations. The rejected W8A16/W8A8 linear experiments and optional MLP gate/up fusion
+are not on the production path.
+
+### Active ownership boundaries
+
+| Component | Primary files | State it owns |
+| --- | --- | --- |
+| HTTP contract | `engine/server/api.py` | tokenization, HTTP limits, SSE serialization |
+| Worker isolation | `engine/server/continuous.py` | bounded inbox, cancellation queue, completion handles |
+| Request lifecycle | `engine/runtime/request.py` | CPU state, output IDs, timestamps, terminal reason |
+| Scheduling | `engine/scheduler/scheduler.py` | waiting/active sets, FCFS admission, round-robin prefill plans |
+| Page ownership | `engine/cache/allocator.py`, `engine/cache/paging.py` | free pages, refcounts, logical-to-physical tables, capacity |
+| Prefix reuse | `engine/cache/prefix.py` | radix/exact entries and cache-owned page references |
+| GPU runtime | `engine/batching/continuous_batching.py` | pools, staging buffers, hook contexts, forward orchestration |
+| Kernel execution | `engine/kernels/kv_write.py`, `paged_decode_batched.py`, `paged_prefill.py` | direct K/V scatter and paged online-softmax attention |
+| Fixed-shape replay | `engine/graphs/paged_decode_graph.py` | CUDA graph and fixed-output tensor per bucket/regime |
+
+### Invariants established by the traces
+
+1. The request object owns only CPU metadata; physical K/V resides exclusively in
+   `key_pool[layer]` and `value_pool[layer]`.
+2. The allocator must reserve a writable page before the model forward, but a request's
+   committed sequence length advances only after logits return successfully.
+3. A logical token position resolves as `block_table[position // block_size]` plus
+   `position % block_size`; pages need not be contiguous in GPU memory.
+4. Each decode forward invokes all 28 Qwen attention modules. Every module writes the
+   new post-RoPE K/V vector to its own persistent pool and reads history through the same
+   request block table.
+5. Chunked prefill is cooperative scheduling: `chunk_size` caps one request's work in a
+   visit, while the iteration `token_budget` caps combined prompt work. The practical T4
+   default is a 128-token budget; the 16-token setting existed only to make the trace
+   observable.
+6. Padded CUDA-graph rows use permanently reserved pages and are never committed as
+   customer requests. Replay requires fixed tensor addresses and shapes, not fixed token
+   values.
+7. Exact prefix hits can bypass prefill entirely. A shared partial tail must be copied to
+   a private page before decode writes its next position.
+8. The current process-global `_BATCH_CTX` and `_PREFILL_CTX` bridge works because the
+   service deliberately permits one engine-owned model forward at a time. It is a known
+   future scaling boundary, not a multi-engine design.
+
+### Study status and deliberate pause
+
+The deep code walkthrough paused during the chunked-prefill implementation: padded
+chunk construction, the multi-token K/V writer, and the causal paged-prefill kernel were
+inspected but are intentionally left for a future focused revisit. The completed material
+above is sufficient to resume implementation work without losing the mental map. Future
+study should restart from this checkpoint, not repeat the earlier DynamicCache, paged
+decode, metadata staging, graph, prefix-cache, or scheduling traces.
