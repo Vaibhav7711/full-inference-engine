@@ -503,3 +503,175 @@ def test_d6_preempted_request_reattaches_its_published_prefix():
     assert all(r.output_token_ids == ref for r in requests)
     snapshot = eng.prefix_cache.snapshot()
     assert snapshot["hits"] >= 1
+    # Cache reuse between serialized requests would satisfy `hits` on its own. Require
+    # that a request which actually yielded came back through the prefix path.
+    assert any(r.preempted_count > 0 for r in requests)
+    assert eng.recompute_report()["recomputed_tokens"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Gate 1B: recompute preemption interacts safely with every other subsystem
+# ---------------------------------------------------------------------------
+
+_PRESSURE_PROMPTS = [
+    "The capital of France is",
+    "Once upon a time in a distant land there lived a careful engineer who",
+    "2 + 2 =",
+    "The transformer architecture works by attending over previous positions, which",
+]
+
+
+@cuda
+@requires_cuda
+def test_g1b_mixed_length_pressure_stays_token_identical():
+    """Uneven prompts under pressure: every request must match the stock reference."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    max_new = 32
+    refs = [_reference_greedy(tok, p, max_new) for p in _PRESSURE_PROMPTS]
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        prefix_cache_blocks=0,
+    )
+    requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
+    assert eng.scheduler.preemption_count > 0
+    assert all(r.state is RequestState.FINISHED for r in requests)
+    for request, ref in zip(requests, refs):
+        assert request.output_token_ids == ref, request.request_id
+
+
+@cuda
+@requires_cuda
+def test_g1b_preemption_under_cuda_graphs_stays_token_identical():
+    """Yielding changes the live row count, so replay must cross graph buckets safely."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    max_new = 32
+    refs = [_reference_greedy(tok, p, max_new) for p in _PRESSURE_PROMPTS]
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=14, block_size=16, max_active=4,
+        prefix_cache_blocks=0, cuda_graph_batch_sizes=(2, 4),
+    )
+    # Dummy rows are permanently reserved and must not count toward admission capacity.
+    assert eng.scheduler.reserved_blocks == len(eng._graph_dummy_blocks) == 3
+    assert eng.scheduler.effective_capacity_tokens == (14 - 3) * 16
+
+    requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
+    assert eng.scheduler.preemption_count > 0
+    assert all(r.state is RequestState.FINISHED for r in requests)
+    for request, ref in zip(requests, refs):
+        assert request.output_token_ids == ref, request.request_id
+    assert eng._decode_graphs, "no graph was captured under pressure"
+
+
+@cuda
+@requires_cuda
+def test_g1b_int8_kv_preemption_matches_int8_without_preemption():
+    """INT8 rebuilds per-block scales on recompute.
+
+    INT8 storage is not bit-identical to fp16, so the reference here is the same engine
+    with a pool large enough that nothing ever yields.
+    """
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    max_new = 24
+    roomy = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=256, block_size=16, max_active=4,
+        kv_cache_dtype="int8", prefix_cache_blocks=0,
+    )
+    baseline = _run_to_completion(roomy, _PRESSURE_PROMPTS, max_new)
+    assert roomy.scheduler.preemption_count == 0
+
+    tight = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        kv_cache_dtype="int8", prefix_cache_blocks=0,
+    )
+    pressured = _run_to_completion(tight, _PRESSURE_PROMPTS, max_new)
+    assert tight.scheduler.preemption_count > 0
+    assert all(r.state is RequestState.FINISHED for r in pressured)
+    for under_pressure, reference in zip(pressured, baseline):
+        assert under_pressure.output_token_ids == reference.output_token_ids
+
+
+@cuda
+@requires_cuda
+def test_g1b_cancelling_a_yielded_request_releases_everything():
+    """Cancellation must reach a request parked in the queue after a yield."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        prefix_cache_blocks=0,
+    )
+    requests = []
+    for index, prompt in enumerate(_PRESSURE_PROMPTS):
+        ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
+        request = GenerationRequest(f"g1b-cancel-{index}", prompt_token_count=len(ids),
+                                    max_new_tokens=64, prompt_token_ids=ids)
+        requests.append(request)
+        assert eng.submit(request)
+
+    yielded = None
+    for _ in range(400):
+        if not eng.has_unfinished_requests:
+            break
+        eng.step()
+        yielded = next(
+            (r for r in eng.scheduler.waiting if r.preempted_count > 0 and not r.done), None
+        )
+        if yielded is not None:
+            break
+    assert yielded is not None, "pressure never produced a yielded request"
+
+    eng.cancel(yielded.request_id, reason="CLIENT_DISCONNECTED")
+    assert yielded.state is RequestState.CANCELLED
+    assert yielded.finish_reason == "CLIENT_DISCONNECTED"
+    assert yielded.request_id not in eng.scheduler.active
+    assert all(r.request_id != yielded.request_id for r in eng.scheduler.waiting)
+
+    while eng.has_unfinished_requests:
+        eng.step()
+    # No customer page may survive the run, cancelled or not.
+    assert eng.block_manager.snapshot()["used_blocks"] == len(eng._graph_dummy_blocks)
+
+
+@cuda
+@requires_cuda
+def test_g1b_recompute_cost_is_measured_not_just_survived():
+    """Recompute must be observable: counts, tokens, and wall time, per request."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    max_new = 32
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        prefix_cache_blocks=0,
+    )
+    requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
+    assert all(r.state is RequestState.FINISHED for r in requests)
+
+    report = eng.recompute_report()
+    assert report["preemptions"] > 0
+    assert report["recomputed_tokens"] > 0
+    assert report["recompute_ms"] > 0
+    assert report["progress_epoch"] == len(requests)
+
+    preempted = [r for r in requests if r.preempted_count > 0]
+    assert preempted
+    for request in preempted:
+        overhead = request.recompute_overhead()
+        assert overhead["recomputed_tokens"] > 0
+        assert overhead["recompute_ms"] > 0
+        assert overhead["recompute_tokens_per_output_token"] > 0
+    print("\nGate 1B recompute cost:", report)
+    for request in requests:
+        print(" ", request.request_id, request.recompute_overhead())

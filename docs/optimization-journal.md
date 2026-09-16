@@ -1453,3 +1453,73 @@ Acceptance results:
 Decision: `KEEP` the FP16 Gate 1 survivability path, including bounded recompute
 preemption. Maintain the explicit boundary that INT8 K/V writer bounds checks are not yet
 part of this gate.
+
+## Gate 1B — Recompute preemption: fairness policy, limits, and cost
+
+Status: `PENDING GPU GATE — CPU-side suite green (54 passed under a torch stub)`
+
+Gate 1 proved recompute preemption is *correct* (token-identical under pressure). Gate 1B
+defines the policy it runs under, removes the arbitrary limit, and makes its cost visible.
+
+### Policy: strict-LIFO recompute with progress-gated readmission
+
+Stated in full on `FCFSScheduler`. Six clauses, each pinned by a test:
+
+1. Victims are chosen strictly by arrival, newest first. The oldest active request is
+   never displaced, so it always completes and always releases blocks.
+2. A request that needs capacity and is itself the newest active request yields itself.
+   If it is the *only* active request, nothing can free memory for it and it fails with
+   `KV_POOL_EXHAUSTED` rather than looping.
+3. A yielded request is not re-admitted until `progress_epoch` advances past the epoch at
+   which it yielded. The epoch advances only on a terminal state (finish/fail/cancel),
+   i.e. when blocks are permanently released. The gate is skipped when nothing is active,
+   so the GPU never idles behind it.
+4. `MAX_PREEMPTIONS_PER_REQUEST` is **removed**. A count was the wrong criterion: a
+   healthy request queued behind several long generations yields once per iteration
+   through no fault of its own, so any fixed bound (8, then 64) eventually fails valid
+   work under load. Termination is now structural — clauses 1-3 guarantee the oldest
+   request completes, every completion advances the epoch, and every yield strictly
+   shrinks the active set.
+5. Admission checks *effective* capacity: pool minus permanently reserved blocks. CUDA
+   graph dummy rows are reserved out of the pool, so counting them made admission
+   optimistic and pushed a solvable rejection into a late `KV_POOL_EXHAUSTED` failure.
+   A request that passes admission can now be served once it is alone.
+6. A yielded request re-enters the queue in arrival order, not at the head, so it cannot
+   overtake an older request still waiting for its first admission.
+
+The previous readmission behaviour — requeue at head, retry immediately — spent a full
+recompute prefill per retry with no memory freed in between. Clause 3 makes each retry
+follow an actual release.
+
+### Cost accounting (measure, don't just survive)
+
+Per request: `preempted_count`, `recomputed_token_count`, `recompute_ms`,
+`preempted_wait_ms`, and `recompute_tokens_per_output_token` via
+`GenerationRequest.recompute_overhead()`. Recompute tokens are counted on every replayed
+prefill token, including a request preempted before it emitted anything.
+
+Engine-wide: `ContinuousBatchingEngine.recompute_report()` sums banked (terminal) and
+in-flight cost, so a soak can sample it at any moment. Scheduler snapshot adds
+`progress_epoch`, `effective_capacity_tokens`, `recomputed_tokens_total`,
+`recompute_ms_total`.
+
+### Subsystem interaction tests (each isolated)
+
+- `test_g1b_mixed_length_pressure_stays_token_identical` — uneven prompts.
+- `test_g1b_preemption_under_cuda_graphs_stays_token_identical` — yielding changes the
+  live row count, so replay must cross graph buckets; also asserts clause 5's arithmetic.
+- `test_g1b_int8_kv_preemption_matches_int8_without_preemption` — INT8 rebuilds per-block
+  scales on recompute. INT8 is not bit-identical to fp16, so the reference is the same
+  engine with a pool large enough that nothing yields.
+- `test_g1b_cancelling_a_yielded_request_releases_everything` — cancellation reaches a
+  request parked in the queue; no customer page survives.
+- `test_g1b_recompute_cost_is_measured_not_just_survived` — prints the cost report.
+- D6-3 strengthened: prefix-cache reuse between serialized requests no longer satisfies
+  it; a request that actually yielded must have come back through the prefix path.
+
+### Known limitation, deliberately not fixed here
+
+Preempting a partially-prefilled request discards its completed chunks: `preempt()`
+resets `prefilled_token_count` to zero. Retaining partial prefill needs the blocks it
+already filled, which is exactly what the yield is releasing. Revisit only if soak data
+shows chunked prefills being yielded often.

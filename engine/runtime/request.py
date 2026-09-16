@@ -59,6 +59,19 @@ class GenerationRequest:
     # True while a preempted request is being recomputed. Its prefill sequence is then
     # the prompt plus every generated token except the last, which is the pending input.
     resuming: bool = False
+    # True from the moment a request is preempted until its rebuilt KV re-enters decode.
+    # Unlike ``resuming`` this also covers a request preempted before it produced any
+    # token, whose replayed prompt is recompute work too.
+    recomputing: bool = False
+    # Scheduler progress epoch at which this request last yielded. It is not re-admitted
+    # until the epoch advances, so a retry only happens after memory is actually freed.
+    preempted_at_epoch: int = 0
+    # Gate 1B recompute cost accounting.
+    recomputed_token_count: int = 0
+    recompute_ns: int = 0
+    preempted_wait_ns: int = 0
+    preempted_ns: int | None = None
+    resume_started_ns: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -110,7 +123,7 @@ class GenerationRequest:
     def remaining_prefill_tokens(self) -> int:
         return self.prefill_token_count - self.prefilled_token_count
 
-    def preempt(self, *, reason: str = "PREEMPTED") -> None:
+    def preempt(self, *, reason: str = "PREEMPTED", epoch: int = 0) -> None:
         """Yield all KV state and return to the queue; generated tokens are kept."""
         if self.state not in {RequestState.PREFILLING, RequestState.DECODING}:
             raise RuntimeError("only PREFILLING or DECODING requests can be preempted")
@@ -120,7 +133,11 @@ class GenerationRequest:
         self.cached_prefix_tokens = 0
         self.cached_next_token_id = None
         self.resuming = bool(self.output_token_ids)
+        self.recomputing = True
         self.preempted_count += 1
+        self.preempted_at_epoch = epoch
+        self.preempted_ns = perf_counter_ns()
+        self.resume_started_ns = None
 
     def complete_resumption(self) -> None:
         """Restore ordinary prompt accounting after rebuilt KV enters decode.
@@ -140,6 +157,8 @@ class GenerationRequest:
             raise RuntimeError("prefill can advance only while PREFILLING")
         if count <= 0 or count > self.remaining_prefill_tokens:
             raise ValueError("invalid prefill token count")
+        if self.recomputing:
+            self.recomputed_token_count += count
         self.prefilled_token_count += count
 
     def transition(self, next_state: RequestState, *, reason: str | None = None) -> None:
@@ -148,8 +167,26 @@ class GenerationRequest:
         if next_state is RequestState.DECODING and self.remaining_prefill_tokens:
             raise RuntimeError("request cannot decode before its prompt is fully prefetched")
         self.state = next_state
-        if next_state is RequestState.PREFILLING and self.admitted_ns is None:
-            self.admitted_ns = perf_counter_ns()
+        now = perf_counter_ns()
+        if next_state is RequestState.PREFILLING:
+            if self.admitted_ns is None:
+                self.admitted_ns = now
+            if self.preempted_ns is not None:
+                # Queue time accrued since the yield ends at re-admission, not at the
+                # end of the rebuild; the rebuild itself is charged to recompute_ns.
+                self.preempted_wait_ns += now - self.preempted_ns
+                self.preempted_ns = None
+                self.resume_started_ns = now
+        if next_state is RequestState.DECODING and self.recomputing:
+            self.recomputing = False
+            if self.resume_started_ns is not None:
+                self.recompute_ns += now - self.resume_started_ns
+                self.resume_started_ns = None
+        if next_state is not RequestState.WAITING and self.preempted_ns is not None:
+            # Cancelled or failed while parked after a yield: close the wait interval so
+            # reported totals stay consistent for terminal requests.
+            self.preempted_wait_ns += now - self.preempted_ns
+            self.preempted_ns = None
         if next_state in {RequestState.FINISHED, RequestState.CANCELLED, RequestState.FAILED, RequestState.REJECTED}:
             self.finish_reason = reason
 
@@ -179,3 +216,25 @@ class GenerationRequest:
         if self.first_token_ns is None or self.last_token_ns is None:
             return None
         return (self.last_token_ns - self.first_token_ns) / 1_000_000
+
+    def recompute_time_ms(self) -> float:
+        """Wall time spent rebuilding KV after preemption (prefill only, not queueing)."""
+        return self.recompute_ns / 1_000_000
+
+    def preempted_wait_time_ms(self) -> float:
+        """Wall time spent parked in the queue because of preemption."""
+        return self.preempted_wait_ns / 1_000_000
+
+    def recompute_overhead(self) -> dict[str, float | int]:
+        """Per-request recompute cost, for soak reports and the metrics endpoint."""
+        produced = len(self.output_token_ids)
+        return {
+            "preempted_count": self.preempted_count,
+            "recomputed_tokens": self.recomputed_token_count,
+            "recompute_ms": self.recompute_time_ms(),
+            "preempted_wait_ms": self.preempted_wait_time_ms(),
+            # Rebuilt prompt tokens per produced output token: the headline waste ratio.
+            "recompute_tokens_per_output_token": (
+                self.recomputed_token_count / produced if produced else 0.0
+            ),
+        }

@@ -189,11 +189,10 @@ class ContinuousBatchingEngine:
 
     ATTN_NAME = "batched_paged_decode"
     PREFILL_ATTN_NAME = "chunked_paged_prefill"
-    # A request repeatedly preempted under temporary pool pressure eventually fails
-    # rather than thrashing forever. The bound must tolerate a real long decode waiting
-    # behind several older requests: eight yielded too early in the Qwen D6 pressure
-    # workload before those older requests could complete and release pages.
-    MAX_PREEMPTIONS_PER_REQUEST = 64
+    # Gate 1B removed the preemption-count limit. A count is the wrong criterion: a
+    # healthy request waiting behind several long generations yields once per iteration
+    # through no fault of its own, so any fixed bound fails valid work under load.
+    # Termination is now structural - see FCFSScheduler's policy docstring.
 
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
@@ -299,6 +298,8 @@ class ContinuousBatchingEngine:
         self.scheduler = FCFSScheduler(
             self.block_manager, max_waiting_requests=max_waiting_requests,
             prefix_cache=self.prefix_cache,
+            # Dummy rows are never returned to the pool, so admission must not count them.
+            reserved_blocks=len(self._graph_dummy_blocks),
         )
 
         # Register the batched attention fn once.
@@ -423,11 +424,15 @@ class ContinuousBatchingEngine:
         return self.block_manager.ensure_capacity(request.request_id, target_length)
 
     def _acquire_capacity(self, request: GenerationRequest, target_length: int) -> bool:
-        """Obtain KV capacity for ``request``, preempting newer requests if needed.
+        """Obtain KV capacity for ``request``, yielding newer requests if needed.
 
-        Returns False when the request could not be served this iteration. In that case
-        it has either been preempted (state WAITING, will resume later) or is still active
-        and the caller must fail it: nothing older can free memory for it.
+        Strict LIFO: victims are always later arrivals than the requester, so the oldest
+        active request is never displaced and always completes. Returns False when the
+        request cannot be served this iteration, having either yielded itself (state
+        WAITING, retried after the progress epoch advances) or exhausted the options -
+        in which case it is the sole active request and the caller must fail it.
+
+        Each loop turn strictly shrinks the active set, so the loop always terminates.
         """
         while True:
             if self._ensure_kv_capacity(request, target_length):
@@ -436,13 +441,10 @@ class ContinuousBatchingEngine:
             if victim is None:
                 return False
             if victim.request_id == request.request_id:
-                # The requester is the lowest-priority request. Yield only when an older
-                # request exists to eventually free memory; otherwise the pool is simply
-                # too small and yielding would loop forever.
-                if (
-                    len(self.scheduler.active) <= 1
-                    or request.preempted_count >= self.MAX_PREEMPTIONS_PER_REQUEST
-                ):
+                # The requester is itself the correct LIFO victim. Yielding only helps if
+                # an older request remains to free memory; alone, the pool genuinely
+                # cannot serve it and yielding would spin forever.
+                if len(self.scheduler.active) <= 1:
                     return False
                 self.scheduler.preempt(request.request_id)
                 return False
@@ -455,6 +457,27 @@ class ContinuousBatchingEngine:
         if request.state is not RequestState.WAITING:
             self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
         return False
+
+    def recompute_report(self) -> dict[str, object]:
+        """Aggregate recompute cost, including requests still in flight.
+
+        Terminal requests are banked into the scheduler totals as they end; active and
+        waiting ones are added live so a soak can sample this at any moment.
+        """
+        in_flight_tokens = 0
+        in_flight_ns = 0
+        in_flight_preemptions = 0
+        for request in list(self.scheduler.active.values()) + list(self.scheduler.waiting):
+            in_flight_tokens += request.recomputed_token_count
+            in_flight_ns += request.recompute_ns
+            in_flight_preemptions += request.preempted_count
+        return {
+            "preemptions": self.scheduler.preemption_count,
+            "in_flight_preemptions": in_flight_preemptions,
+            "progress_epoch": self.scheduler.progress_epoch,
+            "recomputed_tokens": self.scheduler.recomputed_tokens_total + in_flight_tokens,
+            "recompute_ms": (self.scheduler.recompute_ns_total + in_flight_ns) / 1_000_000,
+        }
 
     def _publish_prefix(
         self, request: GenerationRequest, next_token_id: int | None,
