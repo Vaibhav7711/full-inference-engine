@@ -185,3 +185,17 @@ softmax without gathering a contiguous K/V tensor.
 The trace used intentionally large marker values. FP16 represents values near 9,000 in
 steps of eight, so `9100` was read back as `9104` and `9300` as `9296`. Those are normal
 FP16 rounding effects, not incorrect block-table addressing.
+
+The paged decode reader was then compared directly with PyTorch SDPA. Two sequences
+with tables `[[5, 1], [2, 4]]`, lengths `[5, 3]`, four Q heads, two KV heads, and
+head dimension eight produced a Triton grid `(2, 4)` (eight programs). The paged output
+shape was `[2, 4, 1, 8]`; its maximum absolute difference from an SDPA reference which
+first materialized logical contiguous K/V was `0.0009765625`, and `allclose` passed at
+`atol=rtol=0.002`. The difference is one normal FP16-scale rounding increment.
+
+For each `(sequence, query_head)` program, `kv_head = query_head // (q_heads // kv_heads)`
+implements grouped-query attention. The program loops through logical positions in
+`BLOCK_N` tiles, translates each position independently through the request's table,
+loads K/V straight from the corresponding physical pool rows, and keeps running
+`max`, normalization sum, and weighted-value accumulator in FP32. It does not form a
+contiguous K/V tensor or a full attention-score vector.
