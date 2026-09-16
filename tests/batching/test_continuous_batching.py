@@ -463,7 +463,7 @@ def test_d6_pool_pressure_preempts_and_resumes_without_changing_tokens():
 
 @cuda
 @requires_cuda
-def test_d6_pool_too_small_for_one_request_fails_it_instead_of_looping():
+def test_d6_pool_too_small_for_one_request_is_rejected_before_it_enters_the_engine():
     from engine.batching.continuous_batching import ContinuousBatchingEngine
     from engine.runtime import RequestState
 
@@ -472,8 +472,10 @@ def test_d6_pool_too_small_for_one_request_fails_it_instead_of_looping():
         model, tok, "cuda", num_blocks=2, block_size=16, max_active=4, prefix_cache_blocks=0,
     )
     [request] = _run_to_completion(eng, ["Explain paged attention in detail."], max_new=64)
-    assert request.state is RequestState.FAILED
-    assert request.finish_reason == "KV_POOL_EXHAUSTED"
+    # A request whose declared prompt + generation budget cannot fit even in an empty
+    # pool is an admission error, not an active request that should be preempted.
+    assert request.state is RequestState.REJECTED
+    assert request.finish_reason == "KV_CAPACITY_EXCEEDED"
     assert eng.block_manager.snapshot()["used_blocks"] == 0
 
 
@@ -488,10 +490,12 @@ def test_d6_preempted_request_reattaches_its_published_prefix():
         "You are a careful inference-engine reviewer. Discuss correctness, scheduling, "
         "paged KV ownership, kernel numerical accuracy, and production reliability."
     )
-    max_new = 24
+    max_new = 40
     ref = _reference_greedy(tok, prompt, max_new)
     eng = ContinuousBatchingEngine(
-        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        # Three complete sequences need more than eight pages, while one fits. This
+        # forces real recompute preemption rather than merely exercising prefix hits.
+        model, tok, "cuda", num_blocks=8, block_size=16, max_active=4,
         prefix_cache_blocks=4,
     )
     requests = _run_to_completion(eng, [prompt, prompt, prompt], max_new)

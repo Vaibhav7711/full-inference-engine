@@ -189,8 +189,11 @@ class ContinuousBatchingEngine:
 
     ATTN_NAME = "batched_paged_decode"
     PREFILL_ATTN_NAME = "chunked_paged_prefill"
-    # A request preempted this many times is failed rather than thrashed forever.
-    MAX_PREEMPTIONS_PER_REQUEST = 8
+    # A request repeatedly preempted under temporary pool pressure eventually fails
+    # rather than thrashing forever. The bound must tolerate a real long decode waiting
+    # behind several older requests: eight yielded too early in the Qwen D6 pressure
+    # workload before those older requests could complete and release pages.
+    MAX_PREEMPTIONS_PER_REQUEST = 64
 
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,

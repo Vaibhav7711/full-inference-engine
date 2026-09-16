@@ -1396,7 +1396,9 @@ Changes:
   keeps its generated tokens, returns to the queue head, and is recomputed later
   (`GenerationRequest.preempt`, `FCFSScheduler.preempt`). A request is failed with
   `KV_POOL_EXHAUSTED` only when it is the sole active request or has yielded
-  `MAX_PREEMPTIONS_PER_REQUEST` times, i.e. the pool cannot hold it at all.
+  `MAX_PREEMPTIONS_PER_REQUEST` times. A request whose declared prompt plus maximum
+  generation length cannot fit an otherwise empty pool is instead rejected at admission
+  with `KV_CAPACITY_EXCEEDED`.
 - Resumed requests prefill `prompt + generated[:-1]`, re-attach any published prefix
   blocks, and continue from the pending token; the recompute's own prediction is
   discarded (`_complete_prefill`).
