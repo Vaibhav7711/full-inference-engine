@@ -122,6 +122,19 @@ class GenerationRequest:
         self.resuming = bool(self.output_token_ids)
         self.preempted_count += 1
 
+    def complete_resumption(self) -> None:
+        """Restore ordinary prompt accounting after rebuilt KV enters decode.
+
+        While ``resuming`` is true, prefill accounting includes generated tokens except
+        the pending decode input. The `PREFILLING -> DECODING` guard must observe that
+        expanded sequence first. Only after the transition may normal prompt accounting
+        be restored.
+        """
+        if self.state is not RequestState.DECODING or not self.resuming:
+            raise RuntimeError("only a resumed DECODING request can complete resumption")
+        self.resuming = False
+        self.prefilled_token_count = self.prompt_token_count
+
     def advance_prefill(self, count: int) -> None:
         if self.state is not RequestState.PREFILLING:
             raise RuntimeError("prefill can advance only while PREFILLING")

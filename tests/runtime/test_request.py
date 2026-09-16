@@ -76,7 +76,11 @@ def test_preempt_keeps_generated_tokens_and_resumes_from_pending_input() -> None
     assert request.admitted_ns == first_admission  # queue metrics keep first admission
     request.advance_prefill(5)
     request.transition(RequestState.DECODING)
+    request.complete_resumption()
     assert request.state is RequestState.DECODING
+    assert not request.resuming
+    assert request.prefilled_token_count == request.prompt_token_count
+    assert request.remaining_prefill_tokens == 0
 
 
 def test_preempt_before_any_output_replays_the_prompt() -> None:

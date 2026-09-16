@@ -471,10 +471,10 @@ class ContinuousBatchingEngine:
             # pending decode input. The prefill's own prediction is discarded so a resumed
             # request continues exactly where it was preempted. Only the original prompt
             # is (re)published: generated continuations are not useful prefixes.
-            request.resuming = False
             request.next_token_id = request.output_token_ids[-1]
             self._publish_prefix(request, None, request.prompt_token_ids)
             self.scheduler.mark_decoding(request.request_id)
+            request.complete_resumption()
             return
         if predicted_token is None:
             self.scheduler.fail(request.request_id, "INVALID_PREFIX_ENTRY")
