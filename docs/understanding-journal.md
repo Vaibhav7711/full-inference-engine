@@ -154,3 +154,34 @@ The count is therefore not merely “cache concatenation.” Half of the calls c
 the unfused Hugging Face RoPE implementation, 56 come from cache growth, and two are
 per-forward mask/rotary construction. This distinction explains why fused RoPE removed
 56 cats while direct paged KV writes later removed the other 56 cache cats.
+
+## Layer 3 — paged KV physical storage and kernels
+
+`ContinuousBatchingEngine` owns one persistent key pool and one value pool per model
+layer. In FP16 their common layout is `[physical_block, token_offset, kv_head, head_dim]`:
+
+```python
+torch.zeros((num_blocks, block_size, num_kv_heads, head_dim), device=device)
+```
+
+For the Qwen3-0.6B engine this is `[num_blocks, 16, 8, 128]` per K or V layer pool.
+The CPU `KVBlockManager` owns only the mapping: each request has a list where
+`physical_block_ids[logical_position // 16]` selects a row in those shared tensors.
+
+The CUDA toy trace used tables `[[5, 1], [2, 4]]` with a four-token block. Triton's
+prefill writer correctly placed request 0 positions 0--4 at `(5,0)` through `(5,3)`,
+then `(1,0)`, and request 1 positions 0--2 at `(2,0)` through `(2,2)`. A decode write
+at pre-write lengths `[5, 3]` then landed at request 0 `(1,1)` and request 1 `(2,3)`.
+Gathering through the same mappings reconstructed the logical order exactly.
+
+The decode writer launches a grid `(batch_size, kv_heads)`: one Triton program copies
+one `[head_dim]` K vector and one V vector for one request/KV-head pair. Its destination
+is calculated from sequence length, block table, and actual tensor strides; no cache
+tensor is grown or copied. The decode attention kernel launches `(active_sequences,
+query_heads)`, maps each Q head to its GQA KV head, walks logical positions in tiles,
+translates every position through that sequence's block table, and performs online
+softmax without gathering a contiguous K/V tensor.
+
+The trace used intentionally large marker values. FP16 represents values near 9,000 in
+steps of eight, so `9100` was read back as `9104` and `9300` as `9296`. Those are normal
+FP16 rounding effects, not incorrect block-table addressing.
