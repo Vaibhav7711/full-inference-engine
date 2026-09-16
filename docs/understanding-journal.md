@@ -219,3 +219,33 @@ as input IDs at positions 12 and 9, wrote their K/V at those positions, predicte
 `2504` and `374`, and only then advanced allocator sequence lengths to 13 and 10. Thus
 the real custom engine retains the same one-token generation recurrence established in
 Layer 1 while replacing DynamicCache growth with persistent-pool writes.
+
+## Layer 4 — decode metadata staging
+
+With a real two-request Qwen engine and 128 blocks, persistent host buffers were pinned
+and persistent GPU buffers had distinct CUDA pointers. Their shapes were input IDs
+`[2,1]` int64, position IDs `[2,1]` int64, sequence lengths `[2]` int32, and complete
+block tables `[2,128]` int32. The real pre-decode CPU metadata was token IDs `[1096,
+1096]`, positions/lengths `[13,12]`, and valid block-table prefixes `[[127],[126]]`.
+The GPU views contained the same values and their data pointers exactly matched the
+long-lived device buffers. A second staging call reused all four CUDA addresses.
+
+The measured per-iteration H2D payload was 1,064 bytes:
+
+```text
+2 * 1 * 8  input IDs       =   16 bytes
+2 * 1 * 8  position IDs    =   16 bytes
+2 * 4      sequence lengths =   8 bytes
+2 * 128 * 4 complete tables = 1024 bytes
+                                   ------
+                                   1064 bytes
+```
+
+The engine deliberately copies full block-table rows, not only currently used columns,
+to preserve contiguous fixed-size buffer views suitable for CUDA-graph capture and to
+avoid per-step tensor allocations. Entries beyond a request's allocated logical blocks
+may be stale, but paged kernels read table positions only for `logical_block` values
+reached by masked positions below that request's `seq_len`; they are semantically dead.
+Pinned host memory permits the `copy_(..., non_blocking=True)` calls to enqueue DMA
+transfers without a host-side wait. On the same CUDA stream, the subsequent model
+kernels still observe the copies in order.
