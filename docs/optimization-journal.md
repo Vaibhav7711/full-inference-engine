@@ -1383,7 +1383,7 @@ profile-backed bottleneck, not speculative tuning.
 
 ## Gate 1 — Survivability (delivery plan, gate 1 of 7)
 
-Status: `PENDING GPU GATE — CPU-side suite green (38 passed under a torch stub)`
+Status: `COMPLETE — KEEP; FP16 SERVING PATH ACCEPTED`
 
 Goal: the server survives its first bad request. Request-level failures end in a
 terminal state with the right HTTP status; only engine-level failures stop the worker,
@@ -1435,3 +1435,21 @@ here is a real finding, not noise — record it if it happens.
 
 Not in this gate: INT8 KV write kernels are not bounds-checked yet; OpenAI-compatible
 routes, detokenizer, and sampling are Gate 3.
+
+Acceptance results:
+
+- Local CPU reliability gate: 100 passed, 8 CUDA-marked tests skipped; full local suite:
+  126 passed, 116 skipped.
+- On the Colab T4, all three D6 pressure tests passed in 31.22 seconds. The engine
+  preempted and recomputed under a ten-block pool without changing greedy tokens,
+  rejected an individually impossible request before admission, and reattached a
+  published prefix while resuming.
+- The first D6 GPU run exposed an actual ordering bug: resumption cleared its expanded
+  prefill accounting before the guarded `PREFILLING -> DECODING` transition. The fix
+  keeps `resuming=True` through that transition, then calls
+  `GenerationRequest.complete_resumption()` to restore ordinary prompt accounting. A
+  CPU regression test now covers the invariant.
+
+Decision: `KEEP` the FP16 Gate 1 survivability path, including bounded recompute
+preemption. Maintain the explicit boundary that INT8 K/V writer bounds checks are not yet
+part of this gate.

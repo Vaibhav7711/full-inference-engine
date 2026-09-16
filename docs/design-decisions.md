@@ -302,11 +302,12 @@ record before it is considered complete.
   host-side lifecycle validation. INT8 paths require equivalent coverage before the gate
   can be considered fully complete.
 - **Code:** `engine/batching/continuous_batching.py`, `engine/kernels/kv_write.py`.
-- **Evidence:** local kernel/unit tests pass; CUDA kernel gates remain required.
+- **Evidence:** local tests and the FP16 T4 D6 gate pass. INT8 writers remain an explicit
+  follow-up because this decision currently protects the active FP16 serving path only.
 
 ### DD-027 — Evaluate recompute preemption under real GPU pressure before accepting it
 
-- **Decision:** Gate 1 adds a bounded newest-active-request preemption mechanism: release
+- **Decision:** Gate 1 adds and accepts a bounded newest-active-request preemption mechanism: release
   a victim's KV pages, retain its generated token history, requeue it, and rebuild its KV
   state later. It is provisional until CUDA tests prove token identity and convergence.
 - **Why:** temporary KV pressure should not automatically turn into request failure when a
@@ -316,8 +317,10 @@ record before it is considered complete.
   newest-active-victim preemption, not a generic fairness guarantee.
 - **Code:** `engine/runtime/request.py`, `engine/scheduler/scheduler.py`,
   `engine/batching/continuous_batching.py`, `tests/scheduler/test_preemption.py`.
-- **Evidence:** CPU lifecycle tests pass. The real Qwen D6 pressure tests are mandatory
-  before status changes from provisional to accepted.
+- **Evidence:** CPU lifecycle tests pass and all three real Qwen/T4 D6 pressure tests
+  passed: token-identical recomputation, admission rejection of an impossible request,
+  and prefix reattachment during resumption. The original GPU run exposed and corrected
+  a resumption-accounting ordering bug, now covered by a CPU regression test.
 
 ## Recording rule
 
