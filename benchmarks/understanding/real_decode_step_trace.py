@@ -40,7 +40,6 @@ def main() -> None:
     engine = ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, "cuda", num_blocks=args.num_blocks,
         block_size=16, max_active=2, prefix_cache_blocks=0,
-        cuda_graph_batch_sizes=(),
     )
     # Prevent early EOS from shortening the trace; this does not alter model logits.
     engine.eos_ids.clear()
