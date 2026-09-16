@@ -249,3 +249,31 @@ reached by masked positions below that request's `seq_len`; they are semanticall
 Pinned host memory permits the `copy_(..., non_blocking=True)` calls to enqueue DMA
 transfers without a host-side wait. On the same CUDA stream, the subsequent model
 kernels still observe the copies in order.
+
+## Layer 5 — real padded CUDA-graph replay
+
+The real Qwen engine was configured with `max_active=4` and graph buckets `(2,4)`. It
+permanently reserved three pages `[127,126,125]` under the special allocator owner
+`__cuda_graph_dummy_rows__`: the maximum bucket can need `4 - 1 = 3` padding rows when
+only one customer request is live. With three live requests, their actual first pages
+were `[124,123,122]`, and one width-four dummy row used page 127.
+
+The staged fixed-width GPU metadata was input IDs `[[1096],[1096],[576],[151643]]`,
+positions `[8,8,12,0]`, sequence lengths `[8,8,12,0]`, and first table entries
+`[124,123,122,127]`. `151643` was the tokenizer's pad token. The dummy row has length
+zero and position zero, but it has a valid private page so the captured model can execute
+the same memory accesses and tensor shapes as four real rows. Its logits are discarded
+through `logits[:len(active)]`; the scheduler never commits its length.
+
+First use generated graph key `(4,64,4)`: width four, the selected paged-attention tile
+regime of 64, and four Triton warps. The captured logits tensor had fixed shape
+`[4,1,151936]`. Capture executes one eager warmup model forward and one captured forward,
+therefore 56 Python attention-hook calls (`28 * 2`). Subsequent `graph.replay()` launches
+the recorded GPU graph directly, so it makes no new Python hook calls while still running
+the 28-layer model computation.
+
+After replay, only live requests advanced from lengths `[8,8,12]` to `[9,9,13]` and
+received their next output tokens. The dummy allocation remained at sequence length zero.
+The writer may overwrite its physical page at offset zero during every captured/replayed
+forward, but that page is permanently isolated from customers and the allocator regards
+it as reusable scratch for graph padding.
