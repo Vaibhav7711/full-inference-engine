@@ -1523,3 +1523,21 @@ Preempting a partially-prefilled request discards its completed chunks: `preempt
 resets `prefilled_token_count` to zero. Retaining partial prefill needs the blocks it
 already filled, which is exactly what the yield is releasing. Revisit only if soak data
 shows chunked prefills being yielded often.
+
+
+### Gate 1B GPU gate, first run: three pressure tests never created pressure
+
+`test_g1b_preemption_under_cuda_graphs_stays_token_identical` and
+`test_g1b_cancelling_a_yielded_request_releases_everything` passed, which is the result
+that matters: yielding across CUDA-graph buckets and cancelling a request parked in the
+queue both work. The other three failed on `preemption_count == 0` — the pool was sized
+by checking that each request fits *alone*, never that the four together exceed it. At 16
+tokens per block the four prompts at `max_new=32` need 3 blocks each, exactly the 12-block
+pool, so nothing ever yielded. The graph test passed only because its 3 reserved dummy
+rows left 11 usable; the cancellation test only because `max_new=64` needed 20 blocks.
+
+Fixed by deriving the pool from the real tokenization (`_pressure_blocks`) rather than
+hard-coding it: 60% of the blocks all requests need at peak, floored at the largest single
+request so admission cannot reject it, with an assertion that the workload is squeezable
+at all. A hard-coded pool that merely looks tight silently stops testing anything the next
+time a prompt or the tokenizer changes, which is precisely what happened here.

@@ -513,6 +513,28 @@ def test_d6_preempted_request_reattaches_its_published_prefix():
 # Gate 1B: recompute preemption interacts safely with every other subsystem
 # ---------------------------------------------------------------------------
 
+def _pressure_blocks(tok, prompts, max_new, *, block_size=16, fraction=0.6, reserved=0):
+    """Pool size that is guaranteed to force preemption for this exact workload.
+
+    Derived from the real tokenization rather than hard-coded, because a pool that merely
+    *looks* tight silently stops testing anything when a prompt or tokenizer changes —
+    which is exactly how the first version of these tests passed without preempting.
+
+    Returns a pool that is a fraction of the blocks all requests need at peak, but never
+    smaller than the largest single request (otherwise admission rejects it instead).
+    """
+    per_request = [
+        (len(tok(prompt, return_tensors="pt").input_ids[0]) + max_new + block_size - 1)
+        // block_size
+        for prompt in prompts
+    ]
+    peak = sum(per_request)
+    squeezed = max(1, int(peak * fraction))
+    usable = max(squeezed, max(per_request))
+    assert usable < peak, "workload cannot be squeezed; lengthen prompts or max_new"
+    return usable + reserved
+
+
 _PRESSURE_PROMPTS = [
     "The capital of France is",
     "Once upon a time in a distant land there lived a careful engineer who",
@@ -532,10 +554,11 @@ def test_g1b_mixed_length_pressure_stays_token_identical():
     max_new = 32
     refs = [_reference_greedy(tok, p, max_new) for p in _PRESSURE_PROMPTS]
     eng = ContinuousBatchingEngine(
-        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
-        prefix_cache_blocks=0,
+        model, tok, "cuda", block_size=16, max_active=4, prefix_cache_blocks=0,
+        num_blocks=_pressure_blocks(tok, _PRESSURE_PROMPTS, max_new),
     )
     requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
+    print("\nmixed-length pressure:", eng.recompute_report())
     assert eng.scheduler.preemption_count > 0
     assert all(r.state is RequestState.FINISHED for r in requests)
     for request, ref in zip(requests, refs):
@@ -552,15 +575,18 @@ def test_g1b_preemption_under_cuda_graphs_stays_token_identical():
     model, tok = _load()
     max_new = 32
     refs = [_reference_greedy(tok, p, max_new) for p in _PRESSURE_PROMPTS]
+    # Graph dummy rows are carved out of the pool, so ask for them on top of the squeezed
+    # size; clause 5 then has to subtract them again for admission to stay honest.
+    num_blocks = _pressure_blocks(tok, _PRESSURE_PROMPTS, max_new, reserved=3)
     eng = ContinuousBatchingEngine(
-        model, tok, "cuda", num_blocks=14, block_size=16, max_active=4,
+        model, tok, "cuda", num_blocks=num_blocks, block_size=16, max_active=4,
         prefix_cache_blocks=0, cuda_graph_batch_sizes=(2, 4),
     )
-    # Dummy rows are permanently reserved and must not count toward admission capacity.
     assert eng.scheduler.reserved_blocks == len(eng._graph_dummy_blocks) == 3
-    assert eng.scheduler.effective_capacity_tokens == (14 - 3) * 16
+    assert eng.scheduler.effective_capacity_tokens == (num_blocks - 3) * 16
 
     requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
+    print("\ncuda-graph pressure:", eng.recompute_report())
     assert eng.scheduler.preemption_count > 0
     assert all(r.state is RequestState.FINISHED for r in requests)
     for request, ref in zip(requests, refs):
@@ -589,10 +615,12 @@ def test_g1b_int8_kv_preemption_matches_int8_without_preemption():
     assert roomy.scheduler.preemption_count == 0
 
     tight = ContinuousBatchingEngine(
-        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        model, tok, "cuda", block_size=16, max_active=4,
         kv_cache_dtype="int8", prefix_cache_blocks=0,
+        num_blocks=_pressure_blocks(tok, _PRESSURE_PROMPTS, max_new),
     )
     pressured = _run_to_completion(tight, _PRESSURE_PROMPTS, max_new)
+    print("\nint8 pressure:", tight.recompute_report())
     assert tight.scheduler.preemption_count > 0
     assert all(r.state is RequestState.FINISHED for r in pressured)
     for under_pressure, reference in zip(pressured, baseline):
@@ -608,8 +636,8 @@ def test_g1b_cancelling_a_yielded_request_releases_everything():
 
     model, tok = _load()
     eng = ContinuousBatchingEngine(
-        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
-        prefix_cache_blocks=0,
+        model, tok, "cuda", block_size=16, max_active=4, prefix_cache_blocks=0,
+        num_blocks=_pressure_blocks(tok, _PRESSURE_PROMPTS, 64),
     )
     requests = []
     for index, prompt in enumerate(_PRESSURE_PROMPTS):
@@ -653,8 +681,8 @@ def test_g1b_recompute_cost_is_measured_not_just_survived():
     model, tok = _load()
     max_new = 32
     eng = ContinuousBatchingEngine(
-        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
-        prefix_cache_blocks=0,
+        model, tok, "cuda", block_size=16, max_active=4, prefix_cache_blocks=0,
+        num_blocks=_pressure_blocks(tok, _PRESSURE_PROMPTS, max_new),
     )
     requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
     assert all(r.state is RequestState.FINISHED for r in requests)
