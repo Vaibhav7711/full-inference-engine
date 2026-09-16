@@ -252,3 +252,44 @@ def test_recompute_cost_is_attributed_to_the_request_and_banked_on_completion() 
     scheduler.finish("r", reason="LENGTH")
     assert scheduler.recomputed_tokens_total == 10
     assert scheduler.snapshot()["recompute_ms_total"] > 0
+
+
+# -------------------------------------------------- page-releasing exit accounting
+def test_only_page_releasing_exits_advance_the_epoch_and_set_the_flag() -> None:
+    manager = KVBlockManager(num_blocks=64, block_size_tokens=4)
+    scheduler = FCFSScheduler(manager, max_waiting_requests=8)
+
+    finished = _request("finished", 4)
+    scheduler.submit(finished)
+    scheduler.admit_available()
+    finished.advance_prefill(finished.remaining_prefill_tokens)
+    scheduler.mark_decoding("finished")
+    scheduler.finish("finished", reason="LENGTH")
+    assert finished.held_pages_at_exit is True
+    assert scheduler.progress_epoch == 1
+
+    # Cancelled while queued before ever being admitted: held nothing.
+    queued = _request("queued", 4)
+    scheduler.submit(queued)
+    scheduler.cancel("queued")
+    assert queued.held_pages_at_exit is False
+    assert scheduler.progress_epoch == 1
+
+    # Cancelled while parked after a yield: also held nothing, because preempt released
+    # its pages. Advancing here would release peers from the gate for no freed memory.
+    parked = _request("parked", 4)
+    scheduler.submit(parked)
+    scheduler.admit_available()
+    scheduler.preempt("parked")
+    scheduler.cancel("parked")
+    assert parked.held_pages_at_exit is False
+    assert scheduler.progress_epoch == 1
+
+    # Failed while active: released pages, so it counts.
+    failed = _request("failed", 4)
+    scheduler.submit(failed)
+    scheduler.admit_available()
+    scheduler.fail("failed", "KV_POOL_EXHAUSTED")
+    assert failed.held_pages_at_exit is True
+    assert scheduler.progress_epoch == 2
+    assert manager.snapshot()["used_blocks"] == 0

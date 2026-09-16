@@ -484,7 +484,7 @@ class ContinuousBatchingEngine:
             "kv_utilization": (used - reserved) / usable,
             "prefix_cache_blocks": int(cache.get("cached_blocks", 0)),
             "prefix_cache_hits": int(cache.get("hits", 0)),
-            "prefix_cache_misses": int(cache.get("misses", 0)),
+            "prefix_cache_misses": int(cache.get("lookups", 0)) - int(cache.get("hits", 0)),
             "recomputed_tokens_total": self.scheduler.recomputed_tokens_total,
             "recompute_ms_total": self.scheduler.recompute_ns_total / 1_000_000,
         }

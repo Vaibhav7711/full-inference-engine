@@ -1,0 +1,361 @@
+"""Mixed-arrival reliability soak for the continuous-batching engine.
+
+What this exercises that the staged tests do not: requests arriving at random times while
+others are mid-generation, prompts that share prefixes so the cache is really used and
+really evicted, cancellations aimed at *every* lifecycle state rather than whichever one
+happens to come up, and a full accounting audit once the engine has drained.
+
+The audit is the point. A soak that merely finishes proves very little; a soak that
+finishes and can account for every KV page proves the lifecycle is closed.
+
+Run:
+    python -m benchmarks.reliability.soak --duration 60 --arrival-rate 25
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from time import perf_counter
+
+from engine.runtime import GenerationRequest, RequestState
+
+_TERMINAL = {
+    RequestState.FINISHED, RequestState.CANCELLED,
+    RequestState.FAILED, RequestState.REJECTED,
+}
+# States a request can be cancelled from. WAITING appears twice in a request's life -
+# before first admission and after a yield - and they are different code paths, so the
+# injector tracks them separately.
+_CANCEL_TARGETS = ("WAITING", "PREFILLING", "DECODING", "PREEMPTED")
+
+
+@dataclass(frozen=True)
+class SoakConfig:
+    duration_s: float = 30.0
+    arrival_rate_per_s: float = 20.0
+    shared_prefixes: int = 3
+    prefix_tokens: tuple[int, int] = (16, 128)
+    suffix_tokens: tuple[int, int] = (4, 96)
+    max_new_tokens: tuple[int, int] = (1, 64)
+    cancel_probability: float = 0.15
+    seed: int = 0
+    max_steps: int = 500_000
+    sample_every_steps: int = 25
+
+
+@dataclass
+class SoakResult:
+    config: SoakConfig
+    steps: int = 0
+    wall_s: float = 0.0
+    submitted: int = 0
+    counts: Counter = field(default_factory=Counter)
+    finish_reasons: Counter = field(default_factory=Counter)
+    cancelled_from: Counter = field(default_factory=Counter)
+    states_observed: Counter = field(default_factory=Counter)
+    latency: dict[str, float] = field(default_factory=dict)
+    recompute: dict[str, float] = field(default_factory=dict)
+    peak_kv_utilization: float = 0.0
+    peak_waiting: int = 0
+    peak_active: int = 0
+    prefix_cache: dict[str, float] = field(default_factory=dict)
+    violations: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.violations
+
+    def to_dict(self) -> dict:
+        payload = {
+            "config": self.config.__dict__, "steps": self.steps, "wall_s": self.wall_s,
+            "submitted": self.submitted, "counts": dict(self.counts),
+            "finish_reasons": dict(self.finish_reasons),
+            "cancelled_from": dict(self.cancelled_from),
+            "states_observed": dict(self.states_observed), "latency_ms": self.latency,
+            "recompute": self.recompute, "peak_kv_utilization": self.peak_kv_utilization,
+            "peak_waiting": self.peak_waiting, "peak_active": self.peak_active,
+            "prefix_cache": self.prefix_cache, "violations": self.violations,
+        }
+        return payload
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
+    return ordered[index]
+
+
+class _Workload:
+    """Prompts built from a small pool of shared prefixes plus a random tail.
+
+    Shared prefixes are what make the prefix cache do real work: several requests hit the
+    same pages, refcounts rise above one, and eviction has to distinguish pinned entries
+    from free ones. Fully random prompts would never exercise that.
+    """
+
+    def __init__(self, config: SoakConfig, rng: random.Random, forbidden: set[int]):
+        self.config = config
+        self.rng = rng
+        low, high = config.prefix_tokens
+        self.prefixes = [
+            [self._token(rng, forbidden) for _ in range(rng.randint(low, high))]
+            for _ in range(config.shared_prefixes)
+        ]
+        self.forbidden = forbidden
+
+    @staticmethod
+    def _token(rng: random.Random, forbidden: set[int]) -> int:
+        while True:
+            token = rng.randint(1000, 20_000)
+            if token not in forbidden:
+                return token
+
+    def next_request(self, index: int) -> GenerationRequest:
+        prefix = self.rng.choice(self.prefixes)
+        low, high = self.config.suffix_tokens
+        suffix = [
+            self._token(self.rng, self.forbidden)
+            for _ in range(self.rng.randint(low, high))
+        ]
+        prompt = prefix + suffix
+        new_low, new_high = self.config.max_new_tokens
+        return GenerationRequest(
+            request_id=f"soak-{index:05d}", prompt_token_count=len(prompt),
+            max_new_tokens=self.rng.randint(new_low, new_high), prompt_token_ids=prompt,
+        )
+
+
+def _classify(request: GenerationRequest) -> str:
+    """Lifecycle bucket used by the cancellation injector."""
+    if request.state is RequestState.WAITING:
+        return "PREEMPTED" if request.preempted_count else "WAITING"
+    return request.state.name
+
+
+def check_invariants(engine, submitted: list[GenerationRequest]) -> list[str]:
+    """Audit a drained engine. Every returned string is a violation.
+
+    These are the properties that must hold no matter what the workload did, so they are
+    equally valid as a soak assertion and as a post-run check in production.
+    """
+    violations: list[str] = []
+    scheduler = engine.scheduler
+
+    if scheduler.active:
+        violations.append(f"{len(scheduler.active)} requests still active after drain")
+    if scheduler.waiting:
+        violations.append(f"{len(scheduler.waiting)} requests still queued after drain")
+
+    unterminated = [r.request_id for r in submitted if r.state not in _TERMINAL]
+    if unterminated:
+        violations.append(f"non-terminal requests: {unterminated[:5]}")
+
+    holding = [r.request_id for r in submitted if r.allocation is not None]
+    if holding:
+        violations.append(f"terminal requests still holding KV: {holding[:5]}")
+
+    # The accounting identity: every page in use belongs either to a permanent engine
+    # reservation or to the prefix cache. Anything else is a leaked customer page.
+    blocks = engine.block_manager.snapshot()
+    used = int(blocks["used_blocks"])
+    reserved = len(engine._graph_dummy_blocks)
+    cached = int(engine.prefix_cache.snapshot()["cached_blocks"])
+    if used != reserved + cached:
+        violations.append(
+            f"KV page leak: {used} used != {reserved} reserved + {cached} cached"
+        )
+
+    # The epoch counts exits that actually returned pages. A request rejected at
+    # admission, or cancelled while parked in the queue after a yield, held nothing and
+    # must not advance it - otherwise yielded peers would be released from the gate by an
+    # event that freed no memory.
+    page_releasing = sum(1 for r in submitted if r.held_pages_at_exit)
+    if scheduler.progress_epoch != page_releasing:
+        violations.append(
+            f"progress_epoch {scheduler.progress_epoch} != {page_releasing} page-releasing exits"
+        )
+    never_admitted_but_released = [
+        r.request_id for r in submitted if r.held_pages_at_exit and r.admitted_ns is None
+    ]
+    if never_admitted_but_released:
+        violations.append(
+            f"released pages without ever being admitted: {never_admitted_but_released[:5]}"
+        )
+
+    for request in submitted:
+        produced = len(request.output_token_ids)
+        if produced > request.max_new_tokens:
+            violations.append(f"{request.request_id} produced {produced} > max_new_tokens")
+        if request.state is RequestState.FINISHED and produced == 0:
+            violations.append(f"{request.request_id} finished with no output")
+        if request.state in _TERMINAL and request.finish_reason is None:
+            violations.append(f"{request.request_id} terminal with no finish_reason")
+    return violations
+
+
+def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
+    """Drive the engine with Poisson arrivals, injected cancellations, and an audit."""
+    config = config or SoakConfig()
+    rng = random.Random(config.seed)
+    workload = _Workload(config, rng, forbidden=set(engine.eos_ids))
+    result = SoakResult(config=config)
+
+    submitted: list[GenerationRequest] = []
+    in_flight: dict[str, GenerationRequest] = {}
+    started = perf_counter()
+    next_arrival = started
+    index = 0
+    accepting = True
+
+    while True:
+        now = perf_counter()
+        elapsed = now - started
+        if accepting and elapsed >= config.duration_s:
+            accepting = False
+        if accepting:
+            while now >= next_arrival:
+                request = workload.next_request(index)
+                index += 1
+                submitted.append(request)
+                result.submitted += 1
+                if engine.submit(request):
+                    in_flight[request.request_id] = request
+                next_arrival += rng.expovariate(config.arrival_rate_per_s)
+
+        for request in in_flight.values():
+            if not request.done:
+                result.states_observed[_classify(request)] += 1
+
+        # Aim cancellations at states not yet covered, so "cancel from every state" is a
+        # guarantee rather than something the random schedule might or might not produce.
+        if in_flight and rng.random() < config.cancel_probability:
+            uncovered = [s for s in _CANCEL_TARGETS if not result.cancelled_from[s]]
+            wanted = uncovered or list(_CANCEL_TARGETS)
+            candidates = [
+                r for r in in_flight.values()
+                if not r.done and _classify(r) in wanted
+            ]
+            if candidates:
+                victim = rng.choice(candidates)
+                state = _classify(victim)
+                engine.cancel(victim.request_id, reason="SOAK_CANCEL")
+                result.cancelled_from[state] += 1
+                in_flight.pop(victim.request_id, None)
+
+        if engine.has_unfinished_requests:
+            engine.step()
+            result.steps += 1
+        elif not accepting:
+            break
+        if result.steps >= config.max_steps:
+            result.violations.append(f"step budget {config.max_steps} exhausted")
+            break
+
+        for request_id in [rid for rid, r in in_flight.items() if r.done]:
+            in_flight.pop(request_id)
+
+        if result.steps % config.sample_every_steps == 0:
+            stats = engine.stats_snapshot()
+            result.peak_kv_utilization = max(
+                result.peak_kv_utilization, float(stats["kv_utilization"])
+            )
+            result.peak_waiting = max(result.peak_waiting, int(stats["waiting_requests"]))
+            result.peak_active = max(result.peak_active, int(stats["active_requests"]))
+
+    result.wall_s = perf_counter() - started
+    for request in submitted:
+        result.counts[request.state.name] += 1
+        if request.finish_reason:
+            result.finish_reasons[request.finish_reason] += 1
+
+    produced = [r for r in submitted if r.state is RequestState.FINISHED]
+    ttfts = [r.time_to_first_token_ms() for r in produced if r.time_to_first_token_ms()]
+    itls = [
+        r.mean_inter_token_latency_ms() for r in produced
+        if r.mean_inter_token_latency_ms()
+    ]
+    queues = [r.total_queue_time_ms() for r in produced if r.total_queue_time_ms()]
+    stalls = [r.stall_time_ms() for r in produced]
+    result.latency = {
+        "ttft_p50": _percentile(ttfts, 0.50), "ttft_p99": _percentile(ttfts, 0.99),
+        "itl_p50": _percentile(itls, 0.50), "itl_p99": _percentile(itls, 0.99),
+        "total_queue_p50": _percentile(queues, 0.50),
+        "total_queue_p99": _percentile(queues, 0.99),
+        "stall_p99": _percentile(stalls, 0.99),
+        "stall_max": max(stalls) if stalls else 0.0,
+    }
+    result.recompute = dict(engine.recompute_report())
+    result.prefix_cache = {
+        k: v for k, v in engine.prefix_cache.snapshot().items()
+        if k in {"hit_rate", "hits", "lookups", "evictions", "cached_blocks"}
+    }
+    result.violations.extend(check_invariants(engine, submitted))
+    # A state the workload never entered cannot be cancelled from, and demanding it would
+    # make the soak fail for the wrong reason. PREFILLING is only observable when prompts
+    # exceed the prefill token budget; PREEMPTED only under real KV pressure.
+    uncovered = [
+        state for state in _CANCEL_TARGETS
+        if result.states_observed[state] and not result.cancelled_from[state]
+    ]
+    if uncovered:
+        result.violations.append(f"states reached but never cancelled from: {uncovered}")
+    return result
+
+
+def _build_engine(args) -> object:
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.model import load_model
+
+    loaded = load_model(args.model)
+    return ContinuousBatchingEngine(
+        loaded.model, loaded.tokenizer, loaded.device,
+        num_blocks=args.num_blocks, block_size=16, max_active=args.max_active,
+        prefix_cache_blocks=args.prefix_cache_blocks,
+        cuda_graph_batch_sizes=(2, 4, 8, 16) if args.cuda_graphs else None,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument("--arrival-rate", type=float, default=20.0)
+    parser.add_argument("--num-blocks", type=int, default=256)
+    parser.add_argument("--max-active", type=int, default=16)
+    parser.add_argument("--prefix-cache-blocks", type=int, default=64)
+    parser.add_argument("--cancel-probability", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cuda-graphs", action="store_true")
+    parser.add_argument("--out", default="results/soak.json")
+    args = parser.parse_args()
+
+    engine = _build_engine(args)
+    config = SoakConfig(
+        duration_s=args.duration, arrival_rate_per_s=args.arrival_rate,
+        cancel_probability=args.cancel_probability, seed=args.seed,
+    )
+    result = run_soak(engine, config)
+
+    print(json.dumps(result.to_dict(), indent=2, default=str))
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result.to_dict(), indent=2, default=str))
+    print(f"\nSaved -> {out}")
+    if result.ok:
+        print("SOAK PASS: engine drained with every KV page accounted for.")
+        return 0
+    print("SOAK FAIL:")
+    for violation in result.violations:
+        print(f"  - {violation}")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

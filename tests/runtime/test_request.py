@@ -190,3 +190,29 @@ def test_an_unstarted_request_reports_no_latency_rather_than_zero() -> None:
     assert report["ttft_ms"] is None and report["decode_ms"] is None
     assert report["stall_ms"] == 0.0
     assert report["mean_itl_ms"] is None
+
+
+def test_terminal_transition_drops_the_allocation_handle() -> None:
+    """A finished request must not keep pointing at pages that now belong elsewhere."""
+    from engine.cache import KVBlockManager
+    from engine.runtime import GenerationRequest, RequestState
+
+    manager = KVBlockManager(num_blocks=8, block_size_tokens=4)
+    request = GenerationRequest("r-terminal", prompt_token_count=4, max_new_tokens=2,
+                                prompt_token_ids=[1, 2, 3, 4])
+    request.allocation = manager.reserve("r-terminal", 4)
+    request.transition(RequestState.PREFILLING)
+    request.advance_prefill(4)
+    request.transition(RequestState.DECODING)
+    assert request.allocation is not None and request.block_table
+
+    request.transition(RequestState.FINISHED, reason="LENGTH")
+    assert request.allocation is None
+    assert request.block_table == []
+
+
+def test_held_pages_at_exit_defaults_false_until_the_scheduler_sets_it() -> None:
+    from engine.runtime import GenerationRequest
+
+    request = GenerationRequest("r-flag", prompt_token_count=1, max_new_tokens=1)
+    assert request.held_pages_at_exit is False

@@ -76,6 +76,10 @@ class GenerationRequest:
     # because it was preempted and rebuilt. Separating this lets generation time be
     # reported as wall clock and as pure decode time, instead of conflating the two.
     stalled_ns: int = 0
+    # True when this request still owned KV pages at the moment it terminated, i.e. its
+    # exit returned memory to the pool. False for a request rejected at admission or
+    # cancelled while parked in the queue, which held nothing.
+    held_pages_at_exit: bool = False
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -199,6 +203,11 @@ class GenerationRequest:
             self.preempted_ns = None
         if next_state in {RequestState.FINISHED, RequestState.CANCELLED, RequestState.FAILED, RequestState.REJECTED}:
             self.finish_reason = reason
+            # Drop the allocation handle with the state. The scheduler has already
+            # returned the pages, so keeping the reference would leave the request
+            # pointing at block ids that now belong to somebody else - harmless until
+            # something reads `block_table` on a finished request, then not harmless.
+            self.allocation = None
 
     def append_token(self, token_id: int) -> None:
         if self.state is not RequestState.DECODING:

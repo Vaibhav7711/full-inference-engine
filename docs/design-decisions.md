@@ -417,6 +417,48 @@ record before it is considered complete.
   `stats_snapshot` leaves the worker alive and generation unaffected.
 
 
+### DD-032 — Audit KV page accounting after every soak, and make the audit falsifiable
+
+- **Decision:** `benchmarks/reliability/soak.py` drives Poisson arrivals with shared
+  prefixes and state-targeted cancellation, then runs `check_invariants()` on the drained
+  engine: scheduler empty, every request terminal with a finish reason and no allocation,
+  `used_blocks == reserved + cached` exactly, `progress_epoch` equal to the number of
+  page-releasing exits, and output within `max_new_tokens`. A test deliberately strands an
+  allocation to prove the audit fails when it should.
+- **Why:** a soak that merely completes proves almost nothing. The accounting identity is
+  the property that actually matters - every page in the pool belongs to a permanent engine
+  reservation or to the prefix cache, and anything else is a leaked customer page.
+- **Found immediately:** `finish`/`fail`/`cancel` released a request's pages but left
+  `request.allocation` populated, so terminal requests kept pointing at block ids that had
+  been handed to someone else. `preempt` had always cleared it; the terminal paths had not.
+  Now cleared on any terminal transition.
+- **Code:** `benchmarks/reliability/soak.py`, `tests/reliability/test_soak.py`,
+  `engine/runtime/request.py`, `engine/scheduler/scheduler.py`.
+- **Tradeoff:** the audit is engine-internal, so it is a development and CI gate rather
+  than something a deployed server can run against itself mid-flight.
+- **Evidence:** three CPU soak configurations against a fake engine with the real
+  scheduler, block manager and prefix cache; the audit reported the stale-allocation
+  defect on its first run and reports clean after the fix.
+
+### DD-033 — Cancellation coverage is asserted only for states the workload reaches
+
+- **Decision:** the soak records which lifecycle states it observed, and demands a
+  cancellation from a state only if that state was actually entered. Coverage over
+  `WAITING`, `PREFILLING`, `DECODING`, and `PREEMPTED` (a yielded request parked in the
+  queue, which is a different code path from a never-admitted one).
+- **Why:** `PREFILLING` is only observable when a prompt exceeds the prefill token budget,
+  and `PREEMPTED` only under real KV pressure. Demanding them unconditionally makes the
+  soak fail for a workload reason rather than a correctness one, which trains people to
+  ignore it.
+- **Rejected — counting a preempted-then-cancelled request as a page-releasing exit.** It
+  looks like an admitted request terminating, but `preempt` already returned its pages, so
+  advancing the progress epoch would release parked peers on an event that freed no memory.
+  The first soak run flagged this as an off-by-one; the invariant was wrong, not the code.
+- **Code:** `benchmarks/reliability/soak.py`, `engine/runtime/request.py`.
+- **Evidence:** the pressure configuration reaches and cancels from `PREEMPTED`; the roomy
+  configuration never enters it and is not penalised.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

@@ -1620,3 +1620,42 @@ Gate 1B added a per-step `sorted(active, ...)` to `decode_step`, and Gate 1 adde
 capacity check to metadata staging plus two mask computations in each write kernel. All are
 small, but the step is host-overhead-bound, which is exactly where small per-step Python
 costs show up.
+
+
+## Item 1 — Mixed-arrival reliability soak
+
+Status: `CPU HARNESS VERIFIED — PENDING GPU GATE`
+
+`benchmarks/reliability/soak.py` drives the engine with Poisson arrivals, prompts built
+from a small pool of shared prefixes plus random tails (so the prefix cache is genuinely
+used and genuinely evicted - hit rates of 0.35 to 0.83 across configurations), and
+cancellations aimed at whichever lifecycle state has not been covered yet. It ends with an
+accounting audit rather than a completion check.
+
+The audit earned its place on the first run by finding a real defect: `finish`, `fail` and
+`cancel` released a request's KV pages but left `request.allocation` populated. `preempt`
+had always cleared it; the terminal paths had not. Nothing read a terminal request's
+allocation today, so no test caught it, but `block_table` on a finished request returned
+block ids that had already been reissued. Fixed by clearing the handle on any terminal
+transition.
+
+Two further findings were the audit being wrong rather than the engine:
+
+- **Epoch accounting.** The first invariant counted admitted terminals, which is one too
+  many: a request cancelled while parked after a yield was admitted, but `preempt` had
+  already returned its pages. Advancing the epoch for it would release parked peers on an
+  event that freed no memory. The scheduler now marks `held_pages_at_exit` where the epoch
+  advances, and the invariant counts page-releasing exits.
+- **Coverage over unreachable states.** `PREFILLING` is only observable when a prompt
+  exceeds the prefill token budget, and `PREEMPTED` only under pressure. The soak now
+  records observed states and demands a cancellation only from states actually entered.
+
+Three CPU configurations (roomy, pressure, oversized) run clean against a fake engine that
+uses the real scheduler, block manager and prefix cache. Peak KV utilisation reaches 1.0
+under pressure, the oversized configuration rejects 286 of 294 requests at admission with
+`KV_CAPACITY_EXCEEDED` and zero `KV_POOL_EXHAUSTED`, confirming clause 5 rejects before any
+work rather than failing after it.
+
+`tests/reliability/test_soak.py` holds six seeded short soaks for the T4, including the
+long-generation configuration that the removed preemption-count limit would have failed,
+and one test that deliberately strands an allocation to prove the audit can fail.

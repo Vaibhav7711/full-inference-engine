@@ -67,6 +67,7 @@ class FCFSScheduler:
 
     def _advance_progress(self, request: GenerationRequest) -> None:
         """Record a terminal request: bank its recompute cost and unblock yielded peers."""
+        request.held_pages_at_exit = True
         self.progress_epoch += 1
         self.recomputed_tokens_total += request.recomputed_token_count
         self.recompute_ns_total += request.recompute_ns
