@@ -277,3 +277,29 @@ received their next output tokens. The dummy allocation remained at sequence len
 The writer may overwrite its physical page at offset zero during every captured/replayed
 forward, but that page is permanently isolated from customers and the allocator regards
 it as reusable scratch for graph padding.
+
+## Layer 6 — real prefix cache and partial-tail copy-on-write
+
+An actual 103-token Qwen prompt occupied seven 16-token pages: six complete blocks and
+a final partial block with seven valid offsets. Its source allocation was
+`[127,126,125,124,123,122,121]`. Publishing created six radix nodes for the complete
+blocks plus one exact entry holding all seven pages and the first prediction (token
+3555). Before source release, complete-page refcounts were three (source + radix node +
+exact entry) and the partial tail refcount was two (source + exact entry). After source
+release, the cache alone retained all seven physical pages: six radix nodes, one exact
+entry, and seven unique cached blocks.
+
+An identical request then matched the exact entry with `cached_prefix_tokens=103`,
+attached the same block table, received cached first output token 3555, and made zero
+attention-hook calls: it bypassed prefill entirely. Its shared partial-tail refcount was
+two (exact entry + request). On the first decode, `_ensure_writable_tail` replaced tail
+121 with private page 120, copied the valid existing K prefix correctly in all 28 layers,
+then the normal decode wrote the consumed token at offset 7. The old tail refcount became
+one (exact cache) and the private tail was one (request); the request length became 104
+and predicted output token 374.
+
+Copy-on-write copies an entire physical tail page, not only seven valid offsets: in this
+FP16 Qwen geometry that is `16 * 8 * 128 * 2 = 32 KiB` per K or V page per layer, or
+`64 KiB * 28 = 1.75 MiB` for K and V across the model. It is paid only when an exact hit
+ends inside a shared page and subsequently begins decoding; the dramatic saved work is
+the avoided 103-token, 28-layer prompt prefill.
