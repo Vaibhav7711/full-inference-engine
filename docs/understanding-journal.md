@@ -199,3 +199,23 @@ implements grouped-query attention. The program loops through logical positions 
 loads K/V straight from the corresponding physical pool rows, and keeps running
 `max`, normalization sum, and weighted-value accumulator in FP32. It does not form a
 contiguous K/V tensor or a full attention-score vector.
+
+### Real Qwen engine integration trace
+
+The same path was exercised with the actual Qwen3-0.6B engine, two real prompts, and
+128 physical blocks. Its real geometry was 28 layers, 16 Q heads, 8 KV heads, and head
+dimension 128; each per-layer K or V pool had shape `[128, 16, 8, 128]`. After prefill,
+request `real-0` had length 12 and table `[127]`, and `real-1` had length 9 and table
+`[126]`. Their next decode writes therefore targeted `(127,12)` and `(126,9)`.
+
+One subsequent ordinary `engine.step()` produced exactly 28 custom attention-hook calls:
+one invocation by each real Qwen attention module. The trace compared only the imminent
+K slots before/after the forward and found 56 changed slots out of 56 expected
+(`28 layers * 2 requests`), while all 28 K-pool CUDA data pointers were unchanged.
+The writer stores V in the same invocation; K was selected for compact observation.
+
+The first prefill outputs were `[8886]` and `[1096]`. The decode forward consumed those
+as input IDs at positions 12 and 9, wrote their K/V at those positions, predicted tokens
+`2504` and `374`, and only then advanced allocator sequence lengths to 13 and 10. Thus
+the real custom engine retains the same one-token generation recurrence established in
+Layer 1 while replacing DynamicCache growth with persistent-pool writes.
