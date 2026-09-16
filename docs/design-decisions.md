@@ -322,6 +322,60 @@ record before it is considered complete.
   and prefix reattachment during resumption. The original GPU run exposed and corrected
   a resumption-accounting ordering bug, now covered by a CPU regression test.
 
+### DD-028 — Gate recompute readmission on a progress epoch, not a preemption count
+
+- **Decision:** accept *strict-LIFO recompute preemption with progress-gated readmission*
+  as the fairness policy. Six clauses, stated in full on `FCFSScheduler`: victims strictly
+  by arrival (newest first); a requester that is itself the newest yields itself, and fails
+  only when it is the sole active request; a yielded request is not re-admitted until
+  `progress_epoch` advances past its yield epoch, with the gate skipped when nothing is
+  active; no preemption-count limit; admission checks capacity minus permanently reserved
+  blocks; yielded requests requeue in arrival order.
+- **Why:** termination becomes structural rather than heuristic. The oldest active request
+  is never displaced, so it always completes; every completion advances the epoch; every
+  yield strictly shrinks the active set. The epoch gate also removes the dominant waste in
+  the previous design, where a yielded request was requeued at the head and rebuilt its KV
+  immediately even though nothing had been released in between.
+- **Rejected — a preemption-count limit (`MAX_PREEMPTIONS_PER_REQUEST`).** Set to 8 in the
+  first Gate 1 patch, raised to 64 when the D6 workload tripped it. A count is the wrong
+  criterion: a healthy request queued behind several long generations yields once per
+  iteration through no fault of its own, so the bound scales with peers' remaining
+  generation length and any fixed value eventually fails valid work under load. Removed.
+- **Rejected — copy-out/swap preemption.** Copying a victim's KV to host memory instead of
+  discarding it would avoid rebuild work, but Gate 1 proved recompute is token-identical
+  and the measured rebuild cost is ~37 ms per yield on the T4, well below the ~131–664 ms
+  a yielded request already spends queued. Swap adds PCIe traffic and a second memory pool
+  for no measured benefit at this scale. Revisit only when long prompts make the
+  rebuilt-tokens-per-output-token ratio large.
+- **Code:** `engine/scheduler/scheduler.py`, `engine/runtime/request.py`,
+  `engine/batching/continuous_batching.py`.
+- **Tradeoff:** the gate converts avoided GPU waste into queue latency. That is the right
+  trade here — see the measurement in the optimization journal — but it makes preemption a
+  latency event, so per-request deadlines (Gate 3) must account for it.
+- **Evidence:** 14 CPU policy tests, one per clause, plus five Qwen/T4 interaction tests
+  covering mixed lengths, CUDA-graph buckets, INT8 KV, cancellation of a yielded request,
+  and cost measurement. All pass at `0b20313`.
+
+### DD-029 — Size pressure tests from real tokenization, never from hard-coded pools
+
+- **Decision:** pressure tests derive their KV pool from the actual tokenized workload
+  (`_pressure_blocks`): 60% of the blocks all requests need at peak, floored at the largest
+  single request so admission cannot reject it, with an assertion that the workload is
+  squeezable at all.
+- **Why:** the first version hard-coded a 12-block pool after checking that each request
+  fits *alone*, never that the four together exceed it. At 16 tokens per page the four
+  prompts at `max_new=32` need exactly 12 pages, so three tests ran to completion without
+  a single preemption and asserted nothing. A pool that merely looks tight silently stops
+  testing anything the next time a prompt or the tokenizer changes.
+- **Code:** `tests/batching/test_continuous_batching.py`.
+- **Tradeoff:** test setup is computed rather than literal, so a reader must run the helper
+  to know the pool size; the printed recompute report compensates.
+- **Evidence:** identical suite, same engine code — three failures before, five passes
+  after. Two tests passed throughout only by accident: the CUDA-graph test because its
+  three reserved dummy pages left 11 usable, and the cancellation test because
+  `max_new=64` needed 20 pages.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

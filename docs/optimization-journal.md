@@ -1456,7 +1456,8 @@ part of this gate.
 
 ## Gate 1B — Recompute preemption: fairness policy, limits, and cost
 
-Status: `PENDING GPU GATE — CPU-side suite green (54 passed under a torch stub)`
+Status: `ACCEPTED at 0b20313` — 5/5 Gate 1B interaction tests and 19/19 CUDA tests
+pass on Colab T4 (Qwen3-0.6B, FP16), plus 19/19 kernel tests and the CPU policy suite.
 
 Gate 1 proved recompute preemption is *correct* (token-identical under pressure). Gate 1B
 defines the policy it runs under, removes the arbitrary limit, and makes its cost visible.
@@ -1541,3 +1542,57 @@ hard-coding it: 60% of the blocks all requests need at peak, floored at the larg
 request so admission cannot reject it, with an assertion that the workload is squeezable
 at all. A hard-coded pool that merely looks tight silently stops testing anything the next
 time a prompt or the tokenizer changes, which is precisely what happened here.
+
+
+### Gate 1B measured recompute cost (Colab T4, Qwen3-0.6B FP16)
+
+Workload: four prompts of 5-14 tokens, `max_new=32`, `block_size=16`, `max_active=4`, pool
+squeezed to 7 pages against the 12 needed at peak (58%). Four requests, two yields.
+
+| request | preempted | tokens rebuilt | recompute ms | queued after yield ms | rebuilt/output |
+|---|---|---|---|---|---|
+| d6-0 | 0 | 0 | 0 | 0 | 0 |
+| d6-1 | 0 | 0 | 0 | 0 | 0 |
+| d6-2 | 1 | 32 | 37.53 | 130.75 | 1.00 |
+| d6-3 | 1 | 22 | 37.53 | 663.99 | 0.69 |
+
+Engine totals: `preemptions=2, progress_epoch=4, recomputed_tokens=54, recompute_ms=75.06`.
+Per-request sums reconcile exactly with the engine report (32+22=54, 37.53+37.53=75.06).
+
+**Queue wait dominates rebuild cost by 3.5x to 17x.** The expensive part of a preemption is
+not rebuilding KV, it is waiting for the progress epoch to advance: 131 ms and 664 ms of
+queueing against 37.5 ms of recompute. That is the epoch gate working as designed. Under
+the previous requeue-at-head behaviour those same waits would have been filled with repeated
+rebuild attempts at ~37.5 ms each, so the gate converted roughly 17 wasted rebuilds on d6-3
+into idle queue time. It trades GPU waste for latency, deliberately, which is why per-request
+deadlines (Gate 3) must treat preemption as a latency event.
+
+**Rebuild time is independent of token count.** 32 tokens and 22 tokens both took 37.53 ms -
+0.003 ms apart. Prefill at this size is bound by per-call fixed overhead, not by the tokens
+in it, and 37.5 ms sits right next to the ~39 ms flat decode step measured earlier. Same
+overhead, same cause. It also means the rebuilt-tokens-per-output-token ratio (1.00 and 0.69
+here) understates nothing at short prompts but will dominate at long ones, where rebuild
+becomes genuinely compute-bound. That is the condition under which copy-out preemption
+(rejected in DD-028) should be reconsidered.
+
+**`recompute_ms` includes first-use Triton JIT and must be read as steady-state only.** The
+same workload reported 814.96 ms in the first test of the session and 75.06 ms in the last,
+a 10.9x difference with identical code and configuration; the INT8 engine reported 1464.86 ms
+on its first pressured run because its own kernels compile separately. Only the steady-state
+numbers above are meaningful. This is direct evidence for the Gate 5 requirement to warm every
+Triton variant and capture every graph bucket before a server reports ready - otherwise the
+first real request pays a full compile.
+
+**Determinism check.** The FP16 and CUDA-graph runs report identical `preemptions=2` and
+`recomputed_tokens=54` despite different pool sizes (7 pages, and 10 pages of which 3 are
+graph dummy rows), because clause 5 makes both 7 *usable* pages. Equal effective capacity
+produced an identical schedule.
+
+### Gate 1B GPU gate, second run: the patch had not been pushed
+
+The full `-m cuda` suite was re-run before the pressure-sizing fix reached `origin/main`, so
+the same three tests failed identically on the old tree. The traceback was the giveaway: it
+showed the hard-coded `num_blocks=12` that the fix replaces. Worth recording because the
+run was otherwise informative - 16/19 passing, including D6-3 with the strengthened
+assertion that a request which actually yielded came back through the prefix path.
+Verification step added to the workflow: `grep -c "_pressure_blocks"` before spending GPU time.
