@@ -106,3 +106,51 @@ predict tokens 1--31. The final predicted token is returned without another mode
 5. The explicit recurrence is token-identical to Hugging Face greedy generation.
 6. Reference benchmark metrics are internal runtime timings, not network-visible service
    latency.
+
+### DynamicCache storage and one-token operator anatomy
+
+The installed Transformers `DynamicLayer.update` implementation was inspected directly:
+
+```python
+self.keys = torch.cat([self.keys, key_states], dim=-2)
+self.values = torch.cat([self.values, value_states], dim=-2)
+```
+
+The `DynamicCache` and its layer object remain mutable containers, but their tensor
+attributes are replaced. For layer zero, a decode changed key storage from shape
+`[1, 8, 9, 128]` at CUDA pointer `140653626959872` to `[1, 8, 10, 128]` at pointer
+`140653627957248`. Retaining the old tensor object confirmed both Python identity and
+CUDA storage identity were false after the update. The new tensors remained contiguous;
+their strides changed from `(9216, 1152, 128, 1)` to `(10240, 1280, 128, 1)`.
+
+Net allocated memory grew by 115,200 bytes while reserved memory remained unchanged.
+The logical KV increase is 114,688 bytes; the small remainder is allocator/tensor
+overhead. PyTorch satisfied new storage from its existing CUDA caching-allocator pool,
+so a changed `data_ptr` did not require reserved memory to grow.
+
+Profiling one reference decode produced exactly 197 `aten::mm` calls:
+
+```text
+28 layers * (4 attention projections + 3 MLP projections) + 1 lm_head = 197
+```
+
+It also produced 113 separate RMSNorm reduction sequences:
+
+```text
+28 layers * (input norm + post-attention norm + Q norm + K norm) + final norm = 113
+```
+
+Python-level tracing attributed all 114 `torch.cat` calls exactly:
+
+| Source | Calls | Purpose |
+| --- | ---: | --- |
+| `modeling_qwen3.py:rotate_half` | 56 | Q and K RoPE rotation in each of 28 layers |
+| `cache_utils.py:DynamicLayer.update` key | 28 | allocate/copy enlarged key cache |
+| `cache_utils.py:DynamicLayer.update` value | 28 | allocate/copy enlarged value cache |
+| `engine/model/runner.py:decode_one` | 1 | extend the attention mask |
+| `modeling_qwen3.py` rotary `forward` | 1 | concatenate duplicated rotary frequencies |
+
+The count is therefore not merely “cache concatenation.” Half of the calls come from
+the unfused Hugging Face RoPE implementation, 56 come from cache growth, and two are
+per-forward mask/rotary construction. This distinction explains why fused RoPE removed
+56 cats while direct paged KV writes later removed the other 56 cache cats.
