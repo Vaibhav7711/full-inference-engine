@@ -303,3 +303,50 @@ FP16 Qwen geometry that is `16 * 8 * 128 * 2 = 32 KiB` per K or V page per layer
 `64 KiB * 28 = 1.75 MiB` for K and V across the model. It is paid only when an exact hit
 ends inside a shared page and subsequently begins decoding; the dramatic saved work is
 the avoided 103-token, 28-layer prompt prefill.
+
+## Layer 7 — real chunked prefill and decode-first scheduling
+
+The real Qwen engine was run with three admitted requests, two 125-token prompts and one
+7-token prompt. The scheduler was configured with `prefill_chunk_size=16`,
+`max_prefill_tokens_per_iteration=16`, and `max_active=3`. This forces prompt work to
+be spread across scheduling iterations instead of letting one long prompt monopolize the
+engine until its whole prefill is complete.
+
+`ContinuousBatchingEngine.step()` is intentionally decode-first. It first gathers active
+`DECODING` requests and calls one batched `decode_step`; then it admits waiting requests;
+only after that does it plan and run prefill chunks. The prefill planner is the
+scheduler's round-robin `_prefill_order` deque. Each visit chooses
+`min(remaining_prefill_tokens, chunk_size, token_budget)` and subtracts from the
+iteration's remaining budget.
+
+The trace showed the exact effect:
+
+| Iteration | Main work performed | Resulting state |
+| --- | --- | --- |
+| 0 | Admit all three, prefill `long-a` by 16 | `long-a=16/125`, others `0/...` |
+| 1 | Prefill `long-b` by 16 | `long-b=16/125` |
+| 2 | Prefill `short` by 7, then spend remaining 9 on `long-a` | `short` enters `DECODING`, `long-a=25/125` |
+| 3 | Decode `short`, then prefill `long-b` by 16 | `short` length 8, `long-b=32/125` |
+| 4 | Decode `short`, then prefill `long-a` by 16 | `short` length 9, `long-a=41/125` |
+
+This is the important service invariant: a short prompt can finish prefill and begin
+streaming tokens while long prompts are still only partially prefilling. The engine does
+not need to finish all admitted prefill work before decode begins. Once a request reaches
+`DECODING`, it gets a decode opportunity at the front of each `step()` before more prompt
+chunks are scheduled.
+
+The allocator numbers also matched the paging model. At admission, each request reserved
+one 16-token page, so capacity was 48 tokens while only 16 real tokens had been written.
+As long prompts crossed block boundaries, new physical pages were appended: `long-a`
+moved from `[127]` to `[127,124]` at 25 tokens and then `[127,124,122]` at 41 tokens;
+`long-b` moved from `[126]` to `[126,123]` at 32 tokens. Internal fragmentation shrank
+from 32 to 14 tokens as the already-reserved pages filled.
+
+Chunked prefill uses the custom prefill attention path only when resumability is needed.
+The code keeps a faster complete-prompt SDPA path for batches where every request is
+fresh and the planned chunk covers the whole prompt. For partial chunks, it builds padded
+IDs, absolute position IDs, block tables, start offsets, and chunk lengths, installs a
+prefill context, runs the real model with `use_cache=False`, and lets the custom
+attention modules write K/V directly into the persistent paged pools. When a row's prompt
+is completed, the logits at that row's final real chunk position produce the first output
+token, the request transitions to `DECODING`, and the token is appended.
