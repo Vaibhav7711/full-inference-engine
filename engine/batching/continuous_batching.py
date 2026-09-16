@@ -189,6 +189,8 @@ class ContinuousBatchingEngine:
 
     ATTN_NAME = "batched_paged_decode"
     PREFILL_ATTN_NAME = "chunked_paged_prefill"
+    # A request preempted this many times is failed rather than thrashed forever.
+    MAX_PREEMPTIONS_PER_REQUEST = 8
 
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
@@ -231,6 +233,7 @@ class ContinuousBatchingEngine:
 
         cfg = model.config
         self.num_layers = cfg.num_hidden_layers
+        self.max_model_len = getattr(cfg, "max_position_embeddings", None)
         self.num_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
         self.num_q_heads = cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
@@ -327,6 +330,11 @@ class ContinuousBatchingEngine:
             allocation = request.allocation
             if allocation is None or request.next_token_id is None:
                 raise RuntimeError("decode request is missing token or KV allocation")
+            if allocation.sequence_length >= allocation.capacity_tokens:
+                # The write kernel would otherwise index past this row's block table.
+                raise RuntimeError(
+                    f"request {request.request_id!r} has no KV slot for its next token"
+                )
             self._host_input_ids[row, 0] = request.next_token_id
             self._host_position_ids[row, 0] = allocation.sequence_length
             self._host_seq_lens[row] = allocation.sequence_length
@@ -411,11 +419,70 @@ class ContinuousBatchingEngine:
             self.prefix_cache.evict_until_free(extra_blocks)
         return self.block_manager.ensure_capacity(request.request_id, target_length)
 
-    def _publish_prefix(self, request: GenerationRequest, next_token_id: int) -> None:
-        if request.allocation is not None and request.prompt_token_ids:
-            self.prefix_cache.publish(
-                request.prompt_token_ids, request.allocation, next_token_id
-            )
+    def _acquire_capacity(self, request: GenerationRequest, target_length: int) -> bool:
+        """Obtain KV capacity for ``request``, preempting newer requests if needed.
+
+        Returns False when the request could not be served this iteration. In that case
+        it has either been preempted (state WAITING, will resume later) or is still active
+        and the caller must fail it: nothing older can free memory for it.
+        """
+        while True:
+            if self._ensure_kv_capacity(request, target_length):
+                return True
+            victim = self.scheduler.newest_active()
+            if victim is None:
+                return False
+            if victim.request_id == request.request_id:
+                # The requester is the lowest-priority request. Yield only when an older
+                # request exists to eventually free memory; otherwise the pool is simply
+                # too small and yielding would loop forever.
+                if (
+                    len(self.scheduler.active) <= 1
+                    or request.preempted_count >= self.MAX_PREEMPTIONS_PER_REQUEST
+                ):
+                    return False
+                self.scheduler.preempt(request.request_id)
+                return False
+            self.scheduler.preempt(victim.request_id)
+
+    def _capacity_or_fail(self, request: GenerationRequest, target_length: int) -> bool:
+        """Acquire capacity; fail the request only if preemption could not help it."""
+        if self._acquire_capacity(request, target_length):
+            return True
+        if request.state is not RequestState.WAITING:
+            self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
+        return False
+
+    def _publish_prefix(
+        self, request: GenerationRequest, next_token_id: int | None,
+        token_ids: list[int] | None = None,
+    ) -> None:
+        sequence = request.prompt_token_ids if token_ids is None else token_ids
+        if request.allocation is not None and sequence:
+            self.prefix_cache.publish(sequence, request.allocation, next_token_id)
+
+    def _complete_prefill(self, request: GenerationRequest, predicted_token: int | None) -> None:
+        """Move a fully prefilled request into decode, handling resumption after preemption."""
+        if request.resuming:
+            # The KV now covers prompt + generated[:-1]; the last generated token is the
+            # pending decode input. The prefill's own prediction is discarded so a resumed
+            # request continues exactly where it was preempted. Only the original prompt
+            # is (re)published: generated continuations are not useful prefixes.
+            request.resuming = False
+            request.next_token_id = request.output_token_ids[-1]
+            self._publish_prefix(request, None, request.prompt_token_ids)
+            self.scheduler.mark_decoding(request.request_id)
+            return
+        if predicted_token is None:
+            self.scheduler.fail(request.request_id, "INVALID_PREFIX_ENTRY")
+            return
+        request.next_token_id = int(predicted_token)
+        self._publish_prefix(request, request.next_token_id)
+        self.scheduler.mark_decoding(request.request_id)
+        request.append_token(request.next_token_id)
+        if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
+            reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
+            self.scheduler.finish(request.request_id, reason=reason)
 
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
@@ -451,23 +518,27 @@ class ContinuousBatchingEngine:
 
         viable = []
         for request in requests:
-            if self._ensure_kv_capacity(request, request.prompt_token_count):
+            if request.state is not RequestState.PREFILLING:
+                continue  # preempted while making room for an earlier request
+            if self._capacity_or_fail(request, request.prefill_token_count):
                 viable.append(request)
-            else:
-                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
-        requests = viable
+        requests = [
+            request for request in viable
+            if request.state is RequestState.PREFILLING and request.allocation is not None
+        ]
         if not requests:
             return
 
-        lengths_list = [len(request.prompt_token_ids) for request in requests]
+        sequences = [request.prefill_token_ids for request in requests]
+        lengths_list = [len(sequence) for sequence in sequences]
         padded_length = max(lengths_list)
         max_blocks = max(len(request.block_table) for request in requests)
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = next(iter(self.eos_ids), 0)
         padded_ids = [
-            request.prompt_token_ids + [pad_token_id] * (padded_length - length)
-            for request, length in zip(requests, lengths_list)
+            sequence + [pad_token_id] * (padded_length - length)
+            for sequence, length in zip(sequences, lengths_list)
         ]
         masks = [
             [1] * length + [0] * (padded_length - length) for length in lengths_list
@@ -496,16 +567,9 @@ class ContinuousBatchingEngine:
             if not self.block_manager.append_tokens(
                 request.request_id, request.remaining_prefill_tokens
             ):
-                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
-                continue
+                raise RuntimeError("prefill capacity was acquired but could not be committed")
             request.advance_prefill(request.remaining_prefill_tokens)
-            request.next_token_id = int(token)
-            self._publish_prefix(request, request.next_token_id)
-            self.scheduler.mark_decoding(request.request_id)
-            request.append_token(request.next_token_id)
-            if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
-                reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
-                self.scheduler.finish(request.request_id, reason=reason)
+            self._complete_prefill(request, int(token))
 
     @torch.inference_mode()
     def prefill_chunks(
@@ -526,7 +590,7 @@ class ContinuousBatchingEngine:
         # It is substantially better for short prompts; chunk attention is selected only
         # when a request really needs resumable prefill.
         if all(
-            request.prefilled_token_count == 0 and count == request.prompt_token_count
+            request.prefilled_token_count == 0 and count == request.prefill_token_count
             for request, count in plans
         ):
             self.prefill_batch([request for request, _ in plans])
@@ -534,12 +598,15 @@ class ContinuousBatchingEngine:
 
         viable_plans = []
         for request, count in plans:
+            if request.state is not RequestState.PREFILLING:
+                continue  # preempted while making room for an earlier request
             target = request.prefilled_token_count + count
-            if self._ensure_kv_capacity(request, target):
+            if self._capacity_or_fail(request, target):
                 viable_plans.append((request, count))
-            else:
-                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
-        plans = viable_plans
+        plans = [
+            (request, count) for request, count in viable_plans
+            if request.state is RequestState.PREFILLING and request.allocation is not None
+        ]
         if not plans:
             return
 
@@ -558,7 +625,7 @@ class ContinuousBatchingEngine:
         position_rows = []
         padded_tables = []
         for (request, count), start in zip(plans, starts_list):
-            chunk = request.prompt_token_ids[start:start + count]
+            chunk = request.prefill_token_ids[start:start + count]
             padded_ids.append(chunk + [pad_token_id] * (padded_length - count))
             # Padded positions are not semantically observed, but valid absolute
             # positions are essential so RoPE agrees with future decode steps.
@@ -589,8 +656,7 @@ class ContinuousBatchingEngine:
         completed_rows: list[tuple[int, GenerationRequest]] = []
         for row, (request, count) in enumerate(plans):
             if not self.block_manager.append_tokens(request.request_id, count):
-                self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
-                continue
+                raise RuntimeError("prefill capacity was acquired but could not be committed")
             request.advance_prefill(count)
             if request.remaining_prefill_tokens == 0:
                 completed_rows.append((row, request))
@@ -604,14 +670,7 @@ class ContinuousBatchingEngine:
             )
             tokens = out.logits[rows, positions].argmax(dim=-1).tolist()
             for (_, request), token in zip(completed_rows, tokens):
-                request.next_token_id = int(token)
-                self._publish_prefix(request, request.next_token_id)
-                self.scheduler.mark_decoding(request.request_id)
-                request.append_token(request.next_token_id)
-                if (request.next_token_id in self.eos_ids
-                        or len(request.output_token_ids) >= request.max_new_tokens):
-                    reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
-                    self.scheduler.finish(request.request_id, reason=reason)
+                self._complete_prefill(request, int(token))
 
     def _plan_prefill_chunks(self) -> list[tuple[GenerationRequest, int]]:
         return self.scheduler.plan_prefill(
@@ -643,16 +702,7 @@ class ContinuousBatchingEngine:
         admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
         for request in admitted:
             if request.remaining_prefill_tokens == 0:
-                if request.cached_next_token_id is None:
-                    self.scheduler.fail(request.request_id, "INVALID_PREFIX_ENTRY")
-                    continue
-                request.next_token_id = request.cached_next_token_id
-                self.scheduler.mark_decoding(request.request_id)
-                request.append_token(request.next_token_id)
-                if (request.next_token_id in self.eos_ids
-                        or len(request.output_token_ids) >= request.max_new_tokens):
-                    reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
-                    self.scheduler.finish(request.request_id, reason=reason)
+                self._complete_prefill(request, request.cached_next_token_id)
         plans = self._plan_prefill_chunks()
         if plans:
             self.prefill_chunks(plans)
@@ -672,15 +722,17 @@ class ContinuousBatchingEngine:
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = self.ATTN_NAME
 
-        # Fail only requests that cannot grow; unrelated sequences keep making progress.
+        # Grow in FCFS priority order. A request that cannot grow preempts newer requests
+        # (which then vanish from this batch) and is failed only when nothing older can
+        # help. Victims are always later in priority order, but a resumed request sits at
+        # the end of the admission order with an old arrival time, so re-check at the end.
         viable = []
-        for s in active:
-            target_length = s.allocation.sequence_length + 1
-            if not self._ensure_kv_capacity(s, target_length):
-                self.scheduler.fail(s.request_id, "KV_POOL_EXHAUSTED")
-            else:
+        for s in sorted(active, key=lambda item: (item.created_ns, item.request_id)):
+            if s.state is not RequestState.DECODING or s.allocation is None:
+                continue  # preempted earlier in this loop
+            if self._capacity_or_fail(s, s.allocation.sequence_length + 1):
                 viable.append(s)
-        active = viable
+        active = [s for s in viable if s.state is RequestState.DECODING and s.allocation is not None]
         if not active:
             return
 

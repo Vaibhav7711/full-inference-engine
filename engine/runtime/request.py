@@ -21,8 +21,14 @@ class RequestState(StrEnum):
 
 _ALLOWED_TRANSITIONS = {
     RequestState.WAITING: {RequestState.PREFILLING, RequestState.CANCELLED, RequestState.REJECTED},
-    RequestState.PREFILLING: {RequestState.DECODING, RequestState.CANCELLED, RequestState.FAILED},
-    RequestState.DECODING: {RequestState.FINISHED, RequestState.CANCELLED, RequestState.FAILED},
+    # PREFILLING/DECODING -> WAITING is preemption: the request yields its KV blocks under
+    # memory pressure and re-enters the queue head to be recomputed later.
+    RequestState.PREFILLING: {
+        RequestState.DECODING, RequestState.WAITING, RequestState.CANCELLED, RequestState.FAILED,
+    },
+    RequestState.DECODING: {
+        RequestState.FINISHED, RequestState.WAITING, RequestState.CANCELLED, RequestState.FAILED,
+    },
     RequestState.FINISHED: set(),
     RequestState.CANCELLED: set(),
     RequestState.FAILED: set(),
@@ -49,6 +55,10 @@ class GenerationRequest:
     token_timestamps_ns: list[int] = field(default_factory=list)
     cached_prefix_tokens: int = 0
     cached_next_token_id: int | None = None
+    preempted_count: int = 0
+    # True while a preempted request is being recomputed. Its prefill sequence is then
+    # the prompt plus every generated token except the last, which is the pending input.
+    resuming: bool = False
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -69,6 +79,19 @@ class GenerationRequest:
         return self.prompt_token_count + self.max_new_tokens
 
     @property
+    def prefill_token_ids(self) -> list[int]:
+        """Token sequence whose KV must exist before this request can decode."""
+        if self.resuming and self.output_token_ids:
+            return self.prompt_token_ids + self.output_token_ids[:-1]
+        return self.prompt_token_ids
+
+    @property
+    def prefill_token_count(self) -> int:
+        if self.resuming and self.output_token_ids:
+            return self.prompt_token_count + len(self.output_token_ids) - 1
+        return self.prompt_token_count
+
+    @property
     def block_table(self) -> list[int]:
         if self.allocation is None:
             return []
@@ -85,7 +108,19 @@ class GenerationRequest:
 
     @property
     def remaining_prefill_tokens(self) -> int:
-        return self.prompt_token_count - self.prefilled_token_count
+        return self.prefill_token_count - self.prefilled_token_count
+
+    def preempt(self, *, reason: str = "PREEMPTED") -> None:
+        """Yield all KV state and return to the queue; generated tokens are kept."""
+        if self.state not in {RequestState.PREFILLING, RequestState.DECODING}:
+            raise RuntimeError("only PREFILLING or DECODING requests can be preempted")
+        self.transition(RequestState.WAITING, reason=reason)
+        self.allocation = None
+        self.prefilled_token_count = 0
+        self.cached_prefix_tokens = 0
+        self.cached_next_token_id = None
+        self.resuming = bool(self.output_token_ids)
+        self.preempted_count += 1
 
     def advance_prefill(self, count: int) -> None:
         if self.state is not RequestState.PREFILLING:
@@ -100,7 +135,7 @@ class GenerationRequest:
         if next_state is RequestState.DECODING and self.remaining_prefill_tokens:
             raise RuntimeError("request cannot decode before its prompt is fully prefetched")
         self.state = next_state
-        if next_state is RequestState.PREFILLING:
+        if next_state is RequestState.PREFILLING and self.admitted_ns is None:
             self.admitted_ns = perf_counter_ns()
         if next_state in {RequestState.FINISHED, RequestState.CANCELLED, RequestState.FAILED, RequestState.REJECTED}:
             self.finish_reason = reason

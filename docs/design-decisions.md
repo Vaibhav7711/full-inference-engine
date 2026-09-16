@@ -278,6 +278,47 @@ record before it is considered complete.
   engine, terminal-state accounting, allocator/refcount invariants, and repeatable Colab
   results.
 
+### DD-025 — Isolate request failures from worker failures
+
+- **Decision:** Gate 1 introduces typed submission errors, terminal-status mapping,
+  liveness/readiness probes, worker-routed drain/shutdown, and a CPU fake-engine chaos
+  suite. A rejected, cancelled, timed-out, or capacity-failed request becomes observable
+  to its own caller without taking down unrelated requests or the worker.
+- **Why:** a production server must survive malformed input, queue pressure, disconnects,
+  and a request-local resource failure. Only an actual engine/worker exception should mark
+  the service unavailable.
+- **Code:** `engine/server/api.py`, `engine/server/continuous.py`,
+  `tests/server/test_chaos.py`.
+- **Tradeoff:** the API now has a deliberate status contract and additional lifecycle
+  state; callers must distinguish readiness from liveness.
+- **Evidence:** local CPU suites pass. Real uvicorn/T4 acceptance remains required.
+
+### DD-026 — Defend paged K/V writes at both host and device boundaries
+
+- **Decision:** Gate 1 validates decode-page capacity before metadata staging and adds
+  masked page-table/destination bounds checks to FP16 K/V writers.
+- **Why:** a violated page-table invariant must never become an out-of-bounds GPU write.
+- **Tradeoff:** the device mask is a last-resort memory-safety guard, not a substitute for
+  host-side lifecycle validation. INT8 paths require equivalent coverage before the gate
+  can be considered fully complete.
+- **Code:** `engine/batching/continuous_batching.py`, `engine/kernels/kv_write.py`.
+- **Evidence:** local kernel/unit tests pass; CUDA kernel gates remain required.
+
+### DD-027 — Evaluate recompute preemption under real GPU pressure before accepting it
+
+- **Decision:** Gate 1 adds a bounded newest-active-request preemption mechanism: release
+  a victim's KV pages, retain its generated token history, requeue it, and rebuild its KV
+  state later. It is provisional until CUDA tests prove token identity and convergence.
+- **Why:** temporary KV pressure should not automatically turn into request failure when a
+  newer request can yield cache pages and be recomputed later.
+- **Tradeoff:** recomputation adds GPU work and latency, can thrash without a bound, and
+  complicates prefix/cache/graph interactions. The policy is FCFS-priority preserving,
+  newest-active-victim preemption, not a generic fairness guarantee.
+- **Code:** `engine/runtime/request.py`, `engine/scheduler/scheduler.py`,
+  `engine/batching/continuous_batching.py`, `tests/scheduler/test_preemption.py`.
+- **Evidence:** CPU lifecycle tests pass. The real Qwen D6 pressure tests are mandatory
+  before status changes from provisional to accepted.
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

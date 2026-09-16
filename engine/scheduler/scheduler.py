@@ -26,6 +26,7 @@ class FCFSScheduler:
         self._prefill_order: deque[str] = deque()
         self.rejected_count = 0
         self.admission_count = 0
+        self.preemption_count = 0
 
     def submit(self, request: GenerationRequest) -> bool:
         if request.state is not RequestState.WAITING:
@@ -55,9 +56,10 @@ class FCFSScheduler:
                 request.transition(RequestState.REJECTED, reason="KV_CAPACITY_EXCEEDED")
                 self.rejected_count += 1
                 continue
+            prefill_ids = request.prefill_token_ids
             match = (
-                self.prefix_cache.lookup(request.prompt_token_ids)
-                if self.prefix_cache is not None and request.prompt_token_ids
+                self.prefix_cache.lookup(prefill_ids)
+                if self.prefix_cache is not None and prefill_ids
                 else None
             )
             if match is not None and match.token_count:
@@ -68,17 +70,14 @@ class FCFSScheduler:
                 request.cached_prefix_tokens = match.token_count
                 request.cached_next_token_id = match.next_token_id
             else:
+                initial_tokens = min(request.prefill_token_count, self.block_manager.block_size_tokens)
                 allocation = self.block_manager.reserve(
-                    request.request_id,
-                    min(request.prompt_token_count, self.block_manager.block_size_tokens),
-                    sequence_length=0,
+                    request.request_id, initial_tokens, sequence_length=0,
                 )
                 if allocation is None and self.prefix_cache is not None:
                     self.prefix_cache.evict_until_free(1)
                     allocation = self.block_manager.reserve(
-                        request.request_id,
-                        min(request.prompt_token_count, self.block_manager.block_size_tokens),
-                        sequence_length=0,
+                        request.request_id, initial_tokens, sequence_length=0,
                     )
             if allocation is None:
                 break
@@ -109,6 +108,26 @@ class FCFSScheduler:
         self._remove_prefill_order(request_id)
         self.block_manager.release(request_id)
         request.transition(RequestState.FAILED, reason=reason)
+        return request
+
+    def newest_active(self) -> GenerationRequest | None:
+        """The active request with the lowest FCFS priority (latest arrival)."""
+        if not self.active:
+            return None
+        return max(self.active.values(), key=lambda item: (item.created_ns, item.request_id))
+
+    def preempt(self, request_id: str, reason: str = "PREEMPTED") -> GenerationRequest:
+        """Release an active request's KV blocks and requeue it at the head.
+
+        Recompute-style preemption: generated tokens are retained on the request, and its
+        KV is rebuilt by a later prefill of the prompt plus generated prefix.
+        """
+        request = self.active.pop(request_id)
+        self._remove_prefill_order(request_id)
+        self.block_manager.release(request_id)
+        request.preempt(reason=reason)
+        self.waiting.appendleft(request)
+        self.preemption_count += 1
         return request
 
     def cancel(self, request_id: str, reason: str = "CANCELLED_BY_CLIENT") -> GenerationRequest:
@@ -158,6 +177,7 @@ class FCFSScheduler:
             "active_requests": len(self.active),
             "admission_count": self.admission_count,
             "rejected_count": self.rejected_count,
+            "preemption_count": self.preemption_count,
             "head_request_id": self.waiting[0].request_id if self.waiting else None,
             "block_manager": self.block_manager.snapshot(),
             "prefix_cache": (

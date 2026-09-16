@@ -15,6 +15,8 @@ def _write_decode_kv_kernel(
     value_pool_ptr,
     block_tables_ptr,
     seq_lens_ptr,
+    max_blocks,
+    num_pool_blocks,
     stride_kb,
     stride_kh,
     stride_kd,
@@ -42,9 +44,17 @@ def _write_decode_kv_kernel(
     position = tl.load(seq_lens_ptr + batch)
     logical_block = position // BLOCK_SIZE
     block_offset = position % BLOCK_SIZE
+    # Bounds-checked indirection: a row whose sequence outgrew its block table, or a
+    # stale/padded table entry, must never write into another request's block. The
+    # engine asserts the invariant host-side; this is the device-side backstop.
+    table_valid = logical_block < max_blocks
     physical_block = tl.load(
-        block_tables_ptr + batch * stride_bt_b + logical_block
+        block_tables_ptr + batch * stride_bt_b + logical_block,
+        mask=table_valid,
+        other=-1,
     )
+    dest_valid = table_valid & (physical_block >= 0) & (physical_block < num_pool_blocks)
+    mask = mask & dest_valid
 
     key = tl.load(
         key_ptr + batch * stride_kb + head * stride_kh + offsets_d * stride_kd,
@@ -77,7 +87,7 @@ def _write_decode_kv_kernel(
 @triton.jit
 def _write_prefill_kv_batched_kernel(
     key_ptr, value_ptr, key_pool_ptr, value_pool_ptr, block_tables_ptr,
-    start_positions_ptr, chunk_lens_ptr,
+    start_positions_ptr, chunk_lens_ptr, max_blocks, num_pool_blocks,
     stride_kb, stride_kh, stride_kt, stride_kd,
     stride_vb, stride_vh, stride_vt, stride_vd,
     stride_btb, stride_btl,
@@ -94,11 +104,13 @@ def _write_prefill_kv_batched_kernel(
     position = tl.load(start_positions_ptr + batch) + token
     logical_block = position // BLOCK_SIZE
     block_offset = position % BLOCK_SIZE
+    table_valid = token_valid & (logical_block < max_blocks)
     physical_block = tl.load(
         block_tables_ptr + batch * stride_btb + logical_block * stride_btl,
-        mask=token_valid,
-        other=0,
+        mask=table_valid,
+        other=-1,
     )
+    valid = valid & table_valid & (physical_block >= 0) & (physical_block < num_pool_blocks)
     key = tl.load(
         key_ptr + batch * stride_kb + head * stride_kh + token * stride_kt + dims * stride_kd,
         mask=valid, other=0.0,
@@ -156,6 +168,8 @@ def write_decode_kv(
         value_pool,
         block_tables,
         seq_lens,
+        block_tables.shape[1],
+        key_pool.shape[0],
         key.stride(0),
         key.stride(1),
         key.stride(3),
@@ -212,6 +226,7 @@ def write_prefill_kv_batched(
     block_d = triton.next_power_of_2(head_dim)
     _write_prefill_kv_batched_kernel[(batch, padded_length, heads)](
         key, value, key_pool, value_pool, block_tables, start_positions, chunk_lens,
+        block_tables.shape[1], key_pool.shape[0],
         *key.stride(), *value.stride(), *block_tables.stride(),
         *key_pool.stride(), *value_pool.stride(),
         BLOCK_SIZE=key_pool.shape[1], HEAD_DIM=head_dim, BLOCK_D=block_d,

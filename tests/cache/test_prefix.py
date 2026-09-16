@@ -65,3 +65,24 @@ def test_exact_prompt_hit_reuses_partial_tail_and_first_token() -> None:
     assert copied is not None and copied[0] == old_tail
     assert attached.physical_block_ids[-1] != old_tail
     assert manager.allocator.refcount(old_tail) >= 1
+
+
+def test_pressure_eviction_skips_entries_pinned_by_active_requests() -> None:
+    from engine.cache import KVBlockManager, PrefixCache
+    from engine.runtime import GenerationRequest
+
+    manager = KVBlockManager(num_blocks=4, block_size_tokens=4)
+    cache = PrefixCache(manager, max_blocks=4)
+    shared = manager.reserve("shared-owner", 8)
+    manager.append_tokens("shared-owner", 8)
+    cache.publish(list(range(1, 9)), shared, next_token_id=9)
+    # The publishing request is still active: its blocks are pinned (refcount > 1).
+    assert cache.snapshot()["cached_blocks"] == 2
+    freed = cache.evict_until_free(4)
+    assert freed == 0
+    assert cache.snapshot()["cached_blocks"] == 2  # nothing wiped for no gain
+
+    manager.release("shared-owner")
+    freed = cache.evict_until_free(4)
+    assert freed == 2 and manager.allocator.free_block_count == 4
+    assert cache.snapshot()["cached_blocks"] == 0

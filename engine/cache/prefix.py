@@ -165,13 +165,18 @@ class PrefixCache:
         return published
 
     def evict_until_free(self, required_free_blocks: int) -> int:
-        """Drop LRU leaf ownership until allocator pressure is satisfied."""
+        """Drop LRU entries whose blocks actually free memory, until pressure is satisfied.
+
+        Entries whose blocks are still referenced by active requests are left alone: evicting
+        them frees nothing now and would only wipe the cache. Callers that still lack
+        capacity after this must preempt a request instead.
+        """
         if required_free_blocks < 0:
             raise ValueError("required_free_blocks must be non-negative")
         before = self.block_manager.allocator.free_block_count
         while (
             self.block_manager.allocator.free_block_count < required_free_blocks
-            and self._evict_one()
+            and self._evict_one(only_freeable=True)
         ):
             pass
         return self.block_manager.allocator.free_block_count - before
@@ -207,9 +212,40 @@ class PrefixCache:
             blocks.update(entry.physical_block_ids)
         return blocks
 
-    def _evict_one(self) -> bool:
+    def _entry_blocks(self, item: _PrefixNode | _ExactEntry) -> tuple[int, ...]:
+        if isinstance(item, _ExactEntry):
+            return item.physical_block_ids
+        return (item.physical_block_id,)
+
+    def _cache_references(self) -> dict[int, int]:
+        """How many cache owners (radix nodes and exact entries) reference each block."""
+        references: dict[int, int] = {}
+        for node in self._nodes.values():
+            references[node.physical_block_id] = references.get(node.physical_block_id, 0) + 1
+        for entry in self._exact.values():
+            for block in entry.physical_block_ids:
+                references[block] = references.get(block, 0) + 1
+        return references
+
+    def _is_freeable(self, item: _PrefixNode | _ExactEntry, references: dict[int, int]) -> bool:
+        """True when some block of this entry has no owner outside the cache.
+
+        Such a block is returned to the allocator once every cache owner releases it, so
+        evicting this entry makes progress toward freeing memory. An entry whose blocks
+        are all held by active requests is pinned: evicting it would free nothing.
+        """
+        allocator = self.block_manager.allocator
+        return any(
+            allocator.refcount(block) == references.get(block, 0)
+            for block in self._entry_blocks(item)
+        )
+
+    def _evict_one(self, *, only_freeable: bool = False) -> bool:
         leaves = [node for node in self._nodes.values() if not node.children]
         candidates: list[_PrefixNode | _ExactEntry] = leaves + list(self._exact.values())
+        if only_freeable:
+            references = self._cache_references()
+            candidates = [item for item in candidates if self._is_freeable(item, references)]
         if not candidates:
             return False
         victim = min(

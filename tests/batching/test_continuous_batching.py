@@ -37,13 +37,31 @@ def _load():
     return model, tok
 
 
-def _reference_greedy(model, tok, prompt, max_new_tokens):
-    """Per-sequence reference: stock sdpa + DynamicCache via generate."""
+_STOCK_MODEL = None
+
+
+def _stock_model():
+    """A second, never-patched copy of the checkpoint for token-identical references.
+
+    The engine installs Triton RMSNorm/SwiGLU on the model object it is given and a
+    process-global Triton RoPE, so references must not share that object or kernels.
+    """
+    global _STOCK_MODEL
+    if _STOCK_MODEL is None:
+        _STOCK_MODEL, _ = _load()
+    return _STOCK_MODEL
+
+
+def _reference_greedy(tok, prompt, max_new_tokens):
+    """Per-sequence reference: stock Transformers kernels, SDPA, DynamicCache."""
+    from engine.kernels.rope import stock_rope
+
+    model = _stock_model()
     model.config._attn_implementation = "sdpa"
     if hasattr(model.config, "_attn_implementation_internal"):
         model.config._attn_implementation_internal = "sdpa"
     ids = tok(prompt, return_tensors="pt").input_ids.cuda()
-    with torch.inference_mode():
+    with stock_rope(), torch.inference_mode():
         out = model.generate(ids, max_new_tokens=max_new_tokens, do_sample=False,
                              temperature=None, top_p=None)
     return out[0, ids.shape[1]:].tolist()
@@ -118,7 +136,7 @@ def test_d1_batched_prefill_matches_individual_reference():
         "The capital of France is",
         "Explain why continuous batching improves inference throughput in one sentence.",
     ]
-    refs = [_reference_greedy(model, tok, prompt, 1)[0] for prompt in prompts]
+    refs = [_reference_greedy(tok, prompt, 1)[0] for prompt in prompts]
     requests = []
     for index, prompt in enumerate(prompts):
         token_ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
@@ -160,7 +178,7 @@ def test_d2_decode_step_matches_per_seq():
         "2 + 2 =",
     ]
     # Reference: each prompt's first TWO greedy tokens (prefill token + first decode token)
-    refs = [_reference_greedy(model, tok, p, max_new_tokens=2) for p in prompts]
+    refs = [_reference_greedy(tok, p, max_new_tokens=2) for p in prompts]
 
     # Prefill all (gives each its first token = refs[i][0])
     seqs = []
@@ -206,7 +224,7 @@ def test_d3_full_generation_matches_ref():
     max_new = 24
 
     # Reference per sequence
-    refs = [_reference_greedy(model, tok, p, max_new_tokens=max_new) for p in prompts]
+    refs = [_reference_greedy(tok, p, max_new_tokens=max_new) for p in prompts]
 
     # Continuous batching
     outs = eng.generate(prompts, max_new_tokens=max_new)
@@ -240,7 +258,7 @@ def test_d3_mixed_lengths_and_staggered():
         "42",
     ]
     max_new = 20
-    refs = [_reference_greedy(model, tok, p, max_new_tokens=max_new) for p in prompts]
+    refs = [_reference_greedy(tok, p, max_new_tokens=max_new) for p in prompts]
     outs = eng.generate(prompts, max_new_tokens=max_new)
 
     snapshot = eng.block_manager.snapshot()
@@ -293,7 +311,7 @@ def test_fixed_width_cuda_graph_bucket_matches_reference():
 
     model, tok = _load()
     prompts = ["The capital of France is", "2 + 2 ="]
-    refs = [_reference_greedy(model, tok, prompt, 3) for prompt in prompts]
+    refs = [_reference_greedy(tok, prompt, 3) for prompt in prompts]
     eng = ContinuousBatchingEngine(
         model, tok, "cuda", num_blocks=512, max_active=2, prefix_cache_blocks=0,
         cuda_graph_batch_size=2,
@@ -311,7 +329,7 @@ def test_padded_cuda_graph_bucket_matches_reference():
 
     model, tok = _load()
     prompts = ["The capital of France is", "2 + 2 =", "Water is composed of"]
-    refs = [_reference_greedy(model, tok, prompt, 3) for prompt in prompts]
+    refs = [_reference_greedy(tok, prompt, 3) for prompt in prompts]
     eng = ContinuousBatchingEngine(
         model, tok, "cuda", num_blocks=512, max_active=4, prefix_cache_blocks=0,
         cuda_graph_batch_sizes=(2, 4),
@@ -334,7 +352,7 @@ def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
         "together in a production inference engine. Include scheduling and memory details."
     )
     max_new = 12
-    reference = _reference_greedy(model, tok, prompt, max_new)
+    reference = _reference_greedy(tok, prompt, max_new)
     eng = ContinuousBatchingEngine(
         model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
         prefill_chunk_size=8, max_prefill_tokens_per_iteration=8,
@@ -388,3 +406,96 @@ def test_d5_repeated_prompt_reuses_prefix_without_changing_tokens():
     assert after["hit_tokens"] > before["hit_tokens"]
     assert after["exact_entries"] >= 1
     assert eng.block_manager.snapshot()["active_requests"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D6: KV exhaustion preempts the newest request and resumes it token-identically
+# ---------------------------------------------------------------------------
+
+def _run_to_completion(eng, prompts, max_new):
+    requests = []
+    for index, prompt in enumerate(prompts):
+        ids = eng.tokenizer(prompt, return_tensors="pt").input_ids[0].tolist()
+        request = GenerationRequest(f"d6-{index}", prompt_token_count=len(ids),
+                                    max_new_tokens=max_new, prompt_token_ids=ids)
+        requests.append(request)
+        assert eng.submit(request)
+    steps = 0
+    while eng.has_unfinished_requests:
+        eng.step()
+        steps += 1
+        assert steps < 10_000, "engine did not converge"
+    return requests
+
+
+@cuda
+@requires_cuda
+def test_d6_pool_pressure_preempts_and_resumes_without_changing_tokens():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    prompts = [
+        "The capital of France is",
+        "Once upon a time in a distant land",
+        "2 + 2 =",
+        "The transformer architecture works by",
+    ]
+    max_new = 40
+    refs = [_reference_greedy(tok, p, max_new) for p in prompts]
+    # Four requests need ~4 blocks each at full length; ten blocks cannot hold them all,
+    # so the newest must yield under pressure and be recomputed later.
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=10, block_size=16, max_active=4,
+        prefix_cache_blocks=0,
+    )
+    requests = _run_to_completion(eng, prompts, max_new)
+
+    assert eng.scheduler.snapshot()["preemption_count"] > 0
+    assert all(r.state is RequestState.FINISHED for r in requests), [
+        (r.request_id, r.state, r.finish_reason) for r in requests
+    ]
+    assert any(r.preempted_count > 0 for r in requests)
+    for request, ref in zip(requests, refs):
+        assert request.output_token_ids == ref, request.request_id
+    assert eng.block_manager.snapshot()["used_blocks"] == 0
+
+
+@cuda
+@requires_cuda
+def test_d6_pool_too_small_for_one_request_fails_it_instead_of_looping():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=2, block_size=16, max_active=4, prefix_cache_blocks=0,
+    )
+    [request] = _run_to_completion(eng, ["Explain paged attention in detail."], max_new=64)
+    assert request.state is RequestState.FAILED
+    assert request.finish_reason == "KV_POOL_EXHAUSTED"
+    assert eng.block_manager.snapshot()["used_blocks"] == 0
+
+
+@cuda
+@requires_cuda
+def test_d6_preempted_request_reattaches_its_published_prefix():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    prompt = (
+        "You are a careful inference-engine reviewer. Discuss correctness, scheduling, "
+        "paged KV ownership, kernel numerical accuracy, and production reliability."
+    )
+    max_new = 24
+    ref = _reference_greedy(tok, prompt, max_new)
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=12, block_size=16, max_active=4,
+        prefix_cache_blocks=4,
+    )
+    requests = _run_to_completion(eng, [prompt, prompt, prompt], max_new)
+    assert all(r.state is RequestState.FINISHED for r in requests)
+    assert all(r.output_token_ids == ref for r in requests)
+    snapshot = eng.prefix_cache.snapshot()
+    assert snapshot["hits"] >= 1

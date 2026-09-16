@@ -89,8 +89,15 @@ def triton_rope_qk(
         raise ValueError("cos and sin must have [1|B,S,D] shapes")
     if not all(t.device == query.device for t in (key, cos, sin)):
         raise ValueError("Q/K/cos/sin must share a device")
-    if query.device.type != "cuda" or key.dtype != query.dtype:
-        raise ValueError("Q/K must share a CUDA dtype")
+    if query.device.type != "cuda":
+        # The install is module-global for every Qwen3 model in the process. A CPU
+        # model (a stock reference, for example) keeps working through the original.
+        original = _original_apply_rotary_pos_emb()
+        if original is None:
+            raise ValueError("fused Qwen RoPE requires CUDA tensors")
+        return original(query, key, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    if key.dtype != query.dtype:
+        raise ValueError("Q/K must share a dtype")
 
     # Transformers emits [1,S,D] RoPE tables when every batch row shares positions.
     # An expanded view gives the kernel a zero batch stride without allocating/copying.
@@ -109,6 +116,29 @@ def triton_rope_qk(
         HEAD_DIM=head_dim, BLOCK_D=block_d, num_warps=4,
     )
     return query_out, key_out
+
+
+def _original_apply_rotary_pos_emb():
+    import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
+
+    return getattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb", None)
+
+
+class stock_rope:
+    """Context manager that temporarily restores Transformers' RoPE for reference runs."""
+
+    def __enter__(self):
+        import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
+
+        self._was_installed = hasattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb")
+        if self._was_installed:
+            uninstall_triton_qwen_rope()
+        return self
+
+    def __exit__(self, *exc):
+        if self._was_installed:
+            install_triton_qwen_rope()
+        return False
 
 
 def install_triton_qwen_rope() -> None:

@@ -1380,3 +1380,56 @@ Decision: `KEEP` every Phase 15 change. Freeze performance optimization at this 
 Subsequent work moves to comprehensive correctness, stress, failure-recovery, and API
 contract testing. Performance changes after this point require a failing test or a new
 profile-backed bottleneck, not speculative tuning.
+
+## Gate 1 — Survivability (delivery plan, gate 1 of 7)
+
+Status: `PENDING GPU GATE — CPU-side suite green (38 passed under a torch stub)`
+
+Goal: the server survives its first bad request. Request-level failures end in a
+terminal state with the right HTTP status; only engine-level failures stop the worker,
+and they do so observably.
+
+Changes:
+
+- KV exhaustion no longer fails requests. `ContinuousBatchingEngine._acquire_capacity`
+  preempts the newest active request (FCFS priority by arrival) and retries; the victim
+  keeps its generated tokens, returns to the queue head, and is recomputed later
+  (`GenerationRequest.preempt`, `FCFSScheduler.preempt`). A request is failed with
+  `KV_POOL_EXHAUSTED` only when it is the sole active request or has yielded
+  `MAX_PREEMPTIONS_PER_REQUEST` times, i.e. the pool cannot hold it at all.
+- Resumed requests prefill `prompt + generated[:-1]`, re-attach any published prefix
+  blocks, and continue from the pending token; the recompute's own prediction is
+  discarded (`_complete_prefill`).
+- Prefix eviction under pressure (`PrefixCache.evict_until_free`) skips entries whose
+  blocks are pinned by active requests instead of wiping the cache for no gain.
+- Both KV write kernels bounds-check the block-table lookup and the destination block;
+  `_prepare_decode_metadata` asserts host-side that every row has a slot for its token.
+- Service: `alive` (liveness) vs `ready` (readiness), typed `SubmitError` with a status
+  hint, `drain()` on shutdown, every handle completed on stop, admission event so
+  streaming responses can send real status codes, asyncio completion callbacks instead
+  of one executor thread per waiting request.
+- API: `/health` returns 503 when the worker is dead; new `/ready`; 400 for empty or
+  over-context prompts, 413 for oversized/unfittable, 429 for full queues, 503 for
+  pool drops and shutdown, 504 for deadlines; `x-request-id` on every response;
+  tokenization off the event loop; `engine_factory` injection for GPU-free tests.
+- Tests: `tests/server/test_chaos.py` (12 cases, CPU, scripted engine incl. a real ASGI
+  disconnect), preemption tests for request/scheduler/prefix layers, and D6 engine tests
+  (`test_d6_*`) that force pool pressure on the T4 and require token-identical output.
+- Reference retired: `_reference_greedy` now runs a second, unpatched checkpoint under
+  `stock_rope()`; the engine's Triton RMSNorm/SwiGLU/RoPE are no longer on both sides
+  of the token-identical comparison. The global RoPE patch also delegates to the stock
+  implementation for non-CUDA tensors.
+
+GPU gate to run (Kaggle T4x2 or Colab T4):
+
+    python -m pytest tests/batching/test_continuous_batching.py -v -m cuda
+    python -m pytest tests/kernels/test_kv_write.py tests/kernels/test_paged_decode_batched.py -v
+    python -m pytest tests/server tests/scheduler tests/runtime tests/cache -q
+
+Known risk to watch in D6: recompute preemption rebuilds KV with batched prefill rather
+than the original incremental decode; fp16 rounding could in principle flip a greedy
+token. D3/D4 already require prefill-built KV to match the stock reference, so a flip
+here is a real finding, not noise — record it if it happens.
+
+Not in this gate: INT8 KV write kernels are not bounds-checked yet; OpenAI-compatible
+routes, detokenizer, and sampling are Gate 3.
