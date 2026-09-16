@@ -171,13 +171,11 @@ def create_app(
         return await _await_event(handle.on_accept, timeout_s)
 
     def metrics(handle: RequestHandle) -> dict[str, float | int | None]:
+        """Per-request timing with queueing, stalls, and recompute cost separated."""
         request = handle.request
-        return {
-            "queue_ms": request.queue_time_ms(), "ttft_ms": request.time_to_first_token_ms(),
-            "generation_ms": request.generation_time_ms(),
-            "output_tokens": len(request.output_token_ids),
-            "preemptions": request.preempted_count,
-        }
+        report = dict(request.latency_report())
+        report.update(request.recompute_overhead())
+        return report
 
     def failure_response(handle: RequestHandle) -> JSONResponse | None:
         status = terminal_status(handle)

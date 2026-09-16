@@ -88,6 +88,10 @@ class _ScriptedEngine:
             if request in self.requests:
                 self.requests.remove(request)
 
+    def stats_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {"waiting_requests": 0, "active_requests": len(self.requests)}
+
     def cancel(self, request_id: str, reason: str = "CANCELLED"):
         with self._lock:
             for request in list(self.requests):
@@ -112,7 +116,7 @@ def test_successful_generation_carries_request_id_and_metrics() -> None:
         body = response.json()
         assert body["token_ids"] == [7, 7, 7] and body["finish_reason"] == "LENGTH"
         assert response.headers["x-request-id"] == body["request_id"]
-        assert body["metrics"]["preemptions"] == 0
+        assert body["metrics"]["preempted_count"] == 0
 
 
 def test_zero_token_and_oversized_prompts_are_client_errors() -> None:
@@ -261,3 +265,53 @@ def test_probes_report_unavailable_before_startup(path: str) -> None:
     app = _app(_ScriptedEngine())
     client = TestClient(app)  # no lifespan: service is None
     assert client.get(path).status_code == 503
+
+
+def test_metrics_endpoint_reports_worker_published_engine_stats() -> None:
+    """Engine stats must reach /health without a handler touching live scheduler state."""
+    engine = _ScriptedEngine()
+    engine.stats_snapshot = lambda: {  # type: ignore[method-assign]
+        "waiting_requests": 0, "active_requests": 0, "kv_blocks_total": 64,
+        "kv_blocks_used": 8, "kv_utilization": 0.125, "preemptions_total": 3,
+        "progress_epoch": 7, "recomputed_tokens_total": 54,
+    }
+    with TestClient(_app(engine)) as client:
+        assert client.post("/generate", json={"prompt": "a b", "max_new_tokens": 2}).status_code == 200
+        body = client.get("/health").json()
+        assert body["status"] == "ok"
+        assert body["kv_utilization"] == 0.125
+        assert body["preemptions_total"] == 3
+        assert body["progress_epoch"] == 7
+        assert body["completed_requests"] == 1
+
+
+def test_broken_engine_stats_never_break_generation() -> None:
+    """Metrics are best-effort: a failing snapshot must not stop the worker."""
+    engine = _ScriptedEngine()
+
+    def _explode():
+        raise RuntimeError("stats backend is down")
+
+    engine.stats_snapshot = _explode  # type: ignore[method-assign]
+    with TestClient(_app(engine)) as client:
+        assert client.post("/generate", json={"prompt": "a b", "max_new_tokens": 3}).status_code == 200
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["worker_failed"] is False
+
+
+def test_per_request_metrics_separate_queueing_stalls_and_recompute() -> None:
+    with TestClient(_app(_ScriptedEngine())) as client:
+        body = client.post("/generate", json={"prompt": "a b", "max_new_tokens": 3}).json()
+    metrics = body["metrics"]
+    for field in ("queue_ms", "total_queue_ms", "ttft_ms", "generation_ms", "decode_ms",
+                  "stall_ms", "mean_itl_ms", "output_tokens",
+                  "preempted_count", "recomputed_tokens", "recompute_ms",
+                  "preempted_wait_ms", "recompute_tokens_per_output_token"):
+        assert field in metrics, field
+    # Nothing was preempted, so stall and recompute must be exactly zero, and wall-clock
+    # generation time must equal decode time.
+    assert metrics["stall_ms"] == 0.0
+    assert metrics["recomputed_tokens"] == 0
+    assert metrics["generation_ms"] == metrics["decode_ms"]
+    assert metrics["total_queue_ms"] == metrics["queue_ms"]

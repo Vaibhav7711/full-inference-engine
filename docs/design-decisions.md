@@ -376,6 +376,47 @@ record before it is considered complete.
   `max_new=64` needed 20 pages.
 
 
+### DD-030 — Report queueing, stalls, and decode time separately once preemption exists
+
+- **Decision:** a request reports `queue_ms` (to first admission) and `total_queue_ms`
+  (including post-yield waits); `generation_ms` (wall clock) and `decode_ms` (stalls
+  removed); plus `stall_ms` and a mean inter-token latency that excludes the preemption
+  gap. `latency_report()` returns the set; the server merges it with
+  `recompute_overhead()`.
+- **Why:** Gate 1 made `admitted_ns` record only the first admission, so `queue_ms` stopped
+  counting a preempted request's second wait, while `generation_ms` silently absorbed it -
+  d6-3 spent 664 ms parked, invisible in one metric and hidden inside the other. Any
+  percentile computed from those numbers, including the soak harness's, would have been
+  wrong in both directions at once.
+- **Code:** `engine/runtime/request.py`, `engine/server/api.py`.
+- **Tradeoff:** more fields to carry, and two defensible answers to "how long did
+  generation take". The wall-clock number stays the default because it is what the client
+  experienced; `decode_ms` exists for engine-efficiency comparisons.
+- **Evidence:** CPU tests construct a real preempt/rebuild cycle and assert the stall
+  appears in `total_queue_ms` and `stall_ms`, is absent from `decode_ms`, and does not
+  dominate the reported mean ITL.
+
+### DD-031 — Publish engine stats from the worker; never read live scheduler state cross-thread
+
+- **Decision:** `ContinuousBatchingEngine.stats_snapshot()` returns plain ints and floats
+  and is called only by the GPU worker, at most every 100 ms, into a lock-guarded dict that
+  `ContinuousBatchingService.snapshot()` merges for `/health` and `/ready`. A failing
+  snapshot is swallowed.
+- **Why:** the worker mutates `scheduler.waiting`, `scheduler.active`, the block manager
+  and the prefix cache on every step. An HTTP handler calling `scheduler.snapshot()`
+  directly would iterate those containers from another thread and can raise mid-iteration.
+  Rate-limiting matters too: `recompute_report()` walks active plus waiting, which is
+  per-step work on a path we know is host-overhead-bound.
+- **Rejected — locking the scheduler.** A lock around scheduler mutation would put metrics
+  in the decode path's critical section to serve a monitoring endpoint. The publish model
+  costs one dict copy per 100 ms instead.
+- **Code:** `engine/batching/continuous_batching.py`, `engine/server/continuous.py`.
+- **Tradeoff:** reported stats can be up to 100 ms stale, which is irrelevant for scraping
+  and preferable to a metrics call that can crash a serving thread.
+- **Evidence:** server tests assert stats reach `/health`, and that an exploding
+  `stats_snapshot` leaves the worker alive and generation unaffected.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

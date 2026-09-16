@@ -72,6 +72,10 @@ class GenerationRequest:
     preempted_wait_ns: int = 0
     preempted_ns: int | None = None
     resume_started_ns: int | None = None
+    # Time a request spent *not* decoding between its first and last output token,
+    # because it was preempted and rebuilt. Separating this lets generation time be
+    # reported as wall clock and as pure decode time, instead of conflating the two.
+    stalled_ns: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -174,13 +178,19 @@ class GenerationRequest:
             if self.preempted_ns is not None:
                 # Queue time accrued since the yield ends at re-admission, not at the
                 # end of the rebuild; the rebuild itself is charged to recompute_ns.
-                self.preempted_wait_ns += now - self.preempted_ns
+                waited = now - self.preempted_ns
+                self.preempted_wait_ns += waited
+                if self.first_token_ns is not None:
+                    self.stalled_ns += waited
                 self.preempted_ns = None
                 self.resume_started_ns = now
         if next_state is RequestState.DECODING and self.recomputing:
             self.recomputing = False
             if self.resume_started_ns is not None:
-                self.recompute_ns += now - self.resume_started_ns
+                spent = now - self.resume_started_ns
+                self.recompute_ns += spent
+                if self.first_token_ns is not None:
+                    self.stalled_ns += spent
                 self.resume_started_ns = None
         if next_state is not RequestState.WAITING and self.preempted_ns is not None:
             # Cancelled or failed while parked after a yield: close the wait interval so
@@ -203,9 +213,21 @@ class GenerationRequest:
         self.token_timestamps_ns.append(now)
 
     def queue_time_ms(self) -> float | None:
+        """Time from arrival to *first* admission. Excludes later preemption waits."""
         if self.admitted_ns is None:
             return None
         return (self.admitted_ns - self.created_ns) / 1_000_000
+
+    def total_queue_time_ms(self) -> float | None:
+        """Every millisecond this request spent queued, including after a yield.
+
+        `queue_time_ms` alone understates a preempted request, because `admitted_ns` is
+        recorded once and never moves. Report this whenever queueing is the question.
+        """
+        first = self.queue_time_ms()
+        if first is None:
+            return None
+        return first + self.preempted_wait_time_ms()
 
     def time_to_first_token_ms(self) -> float | None:
         if self.first_token_ns is None:
@@ -213,9 +235,47 @@ class GenerationRequest:
         return (self.first_token_ns - self.created_ns) / 1_000_000
 
     def generation_time_ms(self) -> float | None:
+        """Wall-clock span from first to last token, stalls included."""
         if self.first_token_ns is None or self.last_token_ns is None:
             return None
         return (self.last_token_ns - self.first_token_ns) / 1_000_000
+
+    def stall_time_ms(self) -> float:
+        """Generation time lost to preemption: queued plus rebuilding, after token one."""
+        return self.stalled_ns / 1_000_000
+
+    def decode_time_ms(self) -> float | None:
+        """Generation time with preemption stalls removed - time actually spent decoding."""
+        wall = self.generation_time_ms()
+        if wall is None:
+            return None
+        return max(0.0, wall - self.stall_time_ms())
+
+    def mean_inter_token_latency_ms(self) -> float | None:
+        """Average gap between tokens, excluding preemption stalls.
+
+        A preempted request has one enormous gap in `token_timestamps_ns`. Including it
+        makes a mean meaningless, so it is removed here; consumers that want the
+        user-visible worst case should read the raw timestamps and `stall_time_ms`.
+        """
+        produced = len(self.output_token_ids)
+        decode_ms = self.decode_time_ms()
+        if decode_ms is None or produced < 2:
+            return None
+        return decode_ms / (produced - 1)
+
+    def latency_report(self) -> dict[str, float | int | None]:
+        """Every timing number for one request, with queueing and stalls separated."""
+        return {
+            "queue_ms": self.queue_time_ms(),
+            "total_queue_ms": self.total_queue_time_ms(),
+            "ttft_ms": self.time_to_first_token_ms(),
+            "generation_ms": self.generation_time_ms(),
+            "decode_ms": self.decode_time_ms(),
+            "stall_ms": self.stall_time_ms(),
+            "mean_itl_ms": self.mean_inter_token_latency_ms(),
+            "output_tokens": len(self.output_token_ids),
+        }
 
     def recompute_time_ms(self) -> float:
         """Wall time spent rebuilding KV after preemption (prefill only, not queueing)."""

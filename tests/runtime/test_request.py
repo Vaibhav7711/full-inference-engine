@@ -1,5 +1,7 @@
 import pytest
 
+pytest_approx = pytest.approx
+
 from engine.runtime import GenerationRequest, RequestState
 
 
@@ -103,3 +105,88 @@ def test_preempt_requires_an_active_state() -> None:
     request = GenerationRequest("r-waiting", prompt_token_count=1, max_new_tokens=1)
     with pytest.raises(RuntimeError):
         request.preempt()
+
+
+def _preempted_request():
+    """A request that emits a token, yields, is rebuilt, and finishes."""
+    import time
+
+    from engine.runtime import GenerationRequest, RequestState
+
+    request = GenerationRequest("r-metrics", prompt_token_count=4, max_new_tokens=8,
+                                prompt_token_ids=[1, 2, 3, 4])
+    time.sleep(0.01)                      # queueing before first admission
+    request.transition(RequestState.PREFILLING)
+    request.advance_prefill(4)
+    request.transition(RequestState.DECODING)
+    request.append_token(10)
+    request.append_token(11)
+    request.preempt()
+    time.sleep(0.02)                      # parked in the queue after yielding
+    request.transition(RequestState.PREFILLING)
+    time.sleep(0.01)                      # rebuilding KV
+    request.advance_prefill(request.remaining_prefill_tokens)
+    request.transition(RequestState.DECODING)
+    request.complete_resumption()
+    request.append_token(12)
+    return request
+
+
+def test_preemption_wait_is_reported_in_total_queue_time_not_hidden() -> None:
+    request = _preempted_request()
+    first = request.queue_time_ms()
+    total = request.total_queue_time_ms()
+    # queue_time_ms is time to *first* admission and must not move when a request yields.
+    assert first is not None and first >= 10
+    assert total >= first + 20
+    assert total == pytest_approx(first + request.preempted_wait_time_ms())
+
+
+def test_generation_time_keeps_the_stall_and_decode_time_removes_it() -> None:
+    request = _preempted_request()
+    wall = request.generation_time_ms()
+    stall = request.stall_time_ms()
+    decode = request.decode_time_ms()
+    # The stall covers both the parked wait and the rebuild, and both fall between the
+    # first and last token, so wall clock must contain them and decode time must not.
+    assert stall >= 30
+    assert wall >= stall
+    assert decode == pytest_approx(wall - stall)
+    assert decode < stall  # three tokens of real decoding, ~30ms of stall
+
+
+def test_mean_inter_token_latency_excludes_the_preemption_gap() -> None:
+    request = _preempted_request()
+    mean_itl = request.mean_inter_token_latency_ms()
+    assert mean_itl is not None
+    # Raw gaps contain one ~30ms hole; the reported mean must not be dominated by it.
+    raw_gaps = [
+        (b - a) / 1_000_000
+        for a, b in zip(request.token_timestamps_ns, request.token_timestamps_ns[1:])
+    ]
+    assert max(raw_gaps) >= 30
+    assert mean_itl < max(raw_gaps)
+    assert mean_itl == pytest_approx(request.decode_time_ms() / 2)
+
+
+def test_latency_report_exposes_every_field_a_soak_needs() -> None:
+    report = _preempted_request().latency_report()
+    assert set(report) == {
+        "queue_ms", "total_queue_ms", "ttft_ms", "generation_ms",
+        "decode_ms", "stall_ms", "mean_itl_ms", "output_tokens",
+    }
+    assert report["output_tokens"] == 3
+    assert report["total_queue_ms"] > report["queue_ms"]
+    assert report["generation_ms"] > report["decode_ms"]
+
+
+def test_an_unstarted_request_reports_no_latency_rather_than_zero() -> None:
+    from engine.runtime import GenerationRequest
+
+    request = GenerationRequest("r-fresh", prompt_token_count=2, max_new_tokens=2,
+                                prompt_token_ids=[1, 2])
+    report = request.latency_report()
+    assert report["queue_ms"] is None and report["total_queue_ms"] is None
+    assert report["ttft_ms"] is None and report["decode_ms"] is None
+    assert report["stall_ms"] == 0.0
+    assert report["mean_itl_ms"] is None

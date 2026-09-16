@@ -458,6 +458,37 @@ class ContinuousBatchingEngine:
             self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
         return False
 
+    def stats_snapshot(self) -> dict[str, object]:
+        """Cheap, GPU-free view of engine state for the metrics endpoint.
+
+        Called from the worker thread only. Every value is a plain int or float so the
+        result can be handed to another thread and read without touching live
+        scheduler containers, which the worker mutates continuously.
+        """
+        blocks = self.block_manager.snapshot()
+        used = int(blocks["used_blocks"])
+        total = int(blocks["num_blocks"])
+        reserved = len(self._graph_dummy_blocks)
+        usable = max(1, total - reserved)
+        cache = self.prefix_cache.snapshot()
+        return {
+            "waiting_requests": len(self.scheduler.waiting),
+            "active_requests": len(self.scheduler.active),
+            "admitted_total": self.scheduler.admission_count,
+            "rejected_total": self.scheduler.rejected_count,
+            "preemptions_total": self.scheduler.preemption_count,
+            "progress_epoch": self.scheduler.progress_epoch,
+            "kv_blocks_total": total,
+            "kv_blocks_reserved": reserved,
+            "kv_blocks_used": used,
+            "kv_utilization": (used - reserved) / usable,
+            "prefix_cache_blocks": int(cache.get("cached_blocks", 0)),
+            "prefix_cache_hits": int(cache.get("hits", 0)),
+            "prefix_cache_misses": int(cache.get("misses", 0)),
+            "recomputed_tokens_total": self.scheduler.recomputed_tokens_total,
+            "recompute_ms_total": self.scheduler.recompute_ns_total / 1_000_000,
+        }
+
     def recompute_report(self) -> dict[str, object]:
         """Aggregate recompute cost, including requests still in flight.
 

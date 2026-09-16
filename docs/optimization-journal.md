@@ -1596,3 +1596,27 @@ showed the hard-coded `num_blocks=12` that the fix replaces. Worth recording bec
 run was otherwise informative - 16/19 passing, including D6-3 with the strengthened
 assertion that a request which actually yielded came back through the prefix path.
 Verification step added to the workflow: `grep -c "_pressure_blocks"` before spending GPU time.
+
+
+### Metrics accounting fix before the soak harness
+
+Gate 1B's own counters were verified by the T4 run - per-request sums reconciled exactly
+with the engine report. The pre-existing latency metrics were not, and Gate 1 had broken
+them: `admitted_ns` now records only the first admission, so `queue_ms` stopped counting a
+preempted request's second wait, while `generation_ms` silently absorbed it. On the measured
+run d6-3's 664 ms park was missing from one number and buried inside the other, with no way
+to separate them.
+
+Fixed before the soak rather than after, because the soak's whole output is percentiles over
+these fields. Requests now report `queue_ms` and `total_queue_ms`, `generation_ms` and
+`decode_ms`, plus `stall_ms` and a mean ITL that excludes the preemption gap. Engine stats
+(`kv_utilization`, queue depth, preemptions, progress epoch, prefix hit counts) are published
+by the worker every 100 ms and served from `/health` and `/ready`.
+
+Still unmeasured, deliberately: end-to-end latency under load. That is the soak harness's job
+and should not be built twice. Also outstanding is the decode-step re-baseline against the
+~39 ms flat measurement, which now has two named suspects rather than a general suspicion -
+Gate 1B added a per-step `sorted(active, ...)` to `decode_step`, and Gate 1 added a per-row
+capacity check to metadata staging plus two mask computations in each write kernel. All are
+small, but the step is host-overhead-bound, which is exactly where small per-step Python
+costs show up.

@@ -114,6 +114,12 @@ class ContinuousBatchingService:
         self._completed_count = 0
         self._cancelled_count = 0
         self._failed_count = 0
+        # Engine stats are produced by the worker and copied here, never read across
+        # threads from live scheduler containers: the worker mutates those every step,
+        # so an HTTP handler iterating them could raise mid-iteration.
+        self._engine_stats: dict[str, object] = {}
+        self._engine_stats_at = 0.0
+        self._stats_interval_s = 0.1
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -262,10 +268,24 @@ class ContinuousBatchingService:
         for _, handle in completed:
             handle._complete()
 
-    def snapshot(self) -> dict[str, int | bool]:
-        """Return thread-safe service counters without touching GPU engine state."""
+    def _publish_engine_stats(self, *, force: bool = False) -> None:
+        """Copy a plain-data engine snapshot for other threads. Worker thread only."""
+        now = monotonic()
+        if not force and now - self._engine_stats_at < self._stats_interval_s:
+            return
+        try:
+            stats = self.engine.stats_snapshot()
+        except Exception:
+            # Metrics must never be able to stop generation.
+            return
         with self._lock:
-            return {
+            self._engine_stats = dict(stats)
+            self._engine_stats_at = now
+
+    def snapshot(self) -> dict[str, object]:
+        """Thread-safe service counters plus the worker's last published engine stats."""
+        with self._lock:
+            snapshot: dict[str, object] = {
                 "active_handles": len(self._active),
                 "pending_submissions": self._inbox.qsize(),
                 "completed_requests": self._completed_count,
@@ -274,6 +294,8 @@ class ContinuousBatchingService:
                 "worker_failed": self._fatal_error is not None,
                 "draining": self._draining.is_set(),
             }
+            snapshot.update(self._engine_stats)
+            return snapshot
 
     def _fail_all(self, error: BaseException, *, mark_fatal: bool = True) -> None:
         if mark_fatal:
@@ -297,7 +319,9 @@ class ContinuousBatchingService:
                 if self.engine.has_unfinished_requests:
                     self.engine.step()
                     self._publish_completed()
+                    self._publish_engine_stats()
                     continue
+                self._publish_engine_stats(force=True)
                 self._wake.wait(0.05)
                 self._wake.clear()
         except BaseException as error:  # engine-level failure: make it observable, then stop
