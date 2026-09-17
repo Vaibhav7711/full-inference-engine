@@ -95,7 +95,8 @@ def main() -> int:
         print(f"\n=== {label} ({args.repeats} runs) ===")
         repeated = run_repeated(make_engine, config, repeats=args.repeats, label=label)
         arms[label] = repeated
-        for metric in ("latency.itl_p50", "latency.ttft_p50", "waste_ratio"):
+        for metric in ("latency.itl_p50", "latency.ttft_p50", "waste_ratio",
+                       "mean_decode_batch", "mean_context_tokens"):
             stats = repeated.summary(metric)
             if stats.get("n"):
                 print(f"  {metric:24s} median={stats['median']:.3f}  "
@@ -106,6 +107,16 @@ def main() -> int:
             # Expected here: this configuration is roomy and barely cancels, by design,
             # so that the measurement reflects generation rather than churn.
             print(f"  (coverage gaps, not failures: {len(repeated.coverage_gaps)})")
+
+    for label, arm in arms.items():
+        batch = arm.summary("mean_decode_batch").get("median", 0)
+        context = arm.summary("mean_context_tokens").get("median", 0)
+        print(f"\n{label} operating point: decode batch ~{batch:.1f}, "
+              f"context ~{context:.0f} tokens")
+        print(f"  compare its ITL against the roofline cell nearest that point:")
+        print(f"  python -m benchmarks.kernels.roofline --measured-itl-ms "
+              f"{arm.summary('latency.itl_p50').get('median', 0):.2f} "
+              f"--itl-batch {max(1, round(batch))} --itl-context {max(1, round(context))}")
 
     labels = [label for label, _ in SETTINGS[args.setting]]
     baseline, variant = arms[labels[0]], arms[labels[1]]

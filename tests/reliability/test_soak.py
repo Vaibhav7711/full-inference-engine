@@ -251,3 +251,22 @@ def test_repeated_runs_report_spread_so_single_numbers_are_not_trusted():
     assert 0.0 <= itl["spread"] < 10.0
     # Spread is the point of this test: a comparison must be able to see its own noise.
     assert "spread" in repeated.summary("delivered_tokens")
+
+
+@cuda
+@requires_cuda
+def test_soak_records_the_decode_operating_point_for_roofline_comparison():
+    """A latency number is uncomparable to any floor without batch and context alongside it."""
+    result = run_soak(
+        _engine(num_blocks=160, max_active=8),
+        SoakConfig(duration_s=6.0, concurrency=8, seed=30, cancel_probability=0.0,
+                   prefix_tokens=(96, 160), suffix_tokens=(16, 64), max_new_tokens=(32, 64)),
+    )
+    _report("operating-point", result)
+    print(f"  decode batch ~{result.mean_decode_batch:.1f}  "
+          f"context ~{result.mean_context_tokens:.0f} tokens")
+    assert result.violations == []
+    assert 0 < result.mean_decode_batch <= 8
+    # Prompts are 112-224 tokens before generation, so the mean context must land in a
+    # plausible band - a zero or a wild value means the sampler is reading the wrong thing.
+    assert 50 < result.mean_context_tokens < 400

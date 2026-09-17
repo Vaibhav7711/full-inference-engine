@@ -1792,3 +1792,48 @@ lands between 5.5 and 7.6 ms depending on achieved bandwidth, putting the measur
 (CUDA graphs on) at **2.1x to 2.8x the floor** rather than the 3.9x claimed earlier. The
 script reports the real figure and the absolute headroom in ms, which is what an
 optimisation target has to be.
+
+
+### Validated target (Tesla T4, Qwen3-0.6B FP16)
+
+Measured, not quoted:
+
+| probe | achieved |
+|---|---|
+| read-only sweep | 271.4 GB/s |
+| fp16 GEMV (decode pattern) | **258.8 GB/s** |
+| STREAM-style copy | 240.6 GB/s |
+
+258.8 GB/s is 81% of the T4's 320 GB/s spec figure, inside the usual 70-85% band for
+memory-bound kernels, and the probes order as they should (a copy pays write-allocate, a
+read-only sweep does not). Bytes read per decode step: 880.9 MB of transformer layers plus
+311.2 MB of tied `lm_head` = **1192.1 MB**, independent of batch.
+
+**Weight-only floor: 4.61 ms/step.** Adding KV traffic:
+
+| decode batch | 128 ctx | 512 ctx | 2048 ctx |
+|---|---|---|---|
+| 1 | 4.66 | 4.83 | 5.51 |
+| 4 | 4.83 | 5.51 | 8.24 |
+| 8 | 5.06 | 6.42 | 11.87 |
+| 16 | 5.51 | 8.24 | 19.13 |
+
+The headline ratio from the first run is **not trustworthy**, because the reference cell was
+guessed. The script was told batch 8 / 512 context; the A/B workload built prompts of 20-224
+tokens plus up to 64 generated, so real context was closer to 100-250, and closed-loop
+concurrency 8 does not mean decode batch 8 - requests in prefill are not decoding. The
+plausible cells put 15.50 ms at roughly **3x the floor with about 10 ms/token of headroom**,
+rather than the 2.4x and 9.08 ms printed.
+
+Rather than guess again, the operating point is now measured: `stats_snapshot` reports
+`decode_batch` and `decode_mean_context`, the soak averages them across sampled steps, and
+the A/B prints the exact `roofline.py` command line for each arm's real operating point.
+
+**What the headroom is likely made of**, as the agenda for item 6 rather than a conclusion:
+per-step Python in `_prepare_decode_metadata` (a scalar-write loop over block tables), the
+64 KB host-to-device block-table copy per step, work outside the captured graphs, and the
+batched decode kernel reading each GQA group once per query head - twice over for this
+model. That last one is now quantifiable: at batch 16 / 2048 context the ideal KV read is
+3758 MB against 1192 MB of weights, so doubling it adds roughly 14 ms to a 19 ms floor. At
+short context it is a rounding error; at long context it is the single largest cost in the
+step.

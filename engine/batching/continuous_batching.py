@@ -471,9 +471,20 @@ class ContinuousBatchingEngine:
         reserved = len(self._graph_dummy_blocks)
         usable = max(1, total - reserved)
         cache = self.prefix_cache.snapshot()
+        # The decode operating point: how many sequences a step actually advances, and how
+        # much KV each carries. A roofline comparison is meaningless without both, because
+        # the floor moves with context length as well as batch.
+        decoding = [
+            request for request in self.scheduler.active.values()
+            if request.state is RequestState.DECODING and request.allocation is not None
+        ]
+        context_tokens = sum(r.allocation.sequence_length for r in decoding)
         return {
             "waiting_requests": len(self.scheduler.waiting),
             "active_requests": len(self.scheduler.active),
+            "decode_batch": len(decoding),
+            "decode_context_tokens": context_tokens,
+            "decode_mean_context": context_tokens / len(decoding) if decoding else 0.0,
             "admitted_total": self.scheduler.admission_count,
             "rejected_total": self.scheduler.rejected_count,
             "preemptions_total": self.scheduler.preemption_count,

@@ -72,6 +72,12 @@ class SoakResult:
     peak_kv_utilization: float = 0.0
     peak_waiting: int = 0
     peak_active: int = 0
+    # Mean decode operating point, weighted by sampled steps. Quoting a latency number
+    # without these makes it uncomparable to any floor.
+    mean_decode_batch: float = 0.0
+    mean_context_tokens: float = 0.0
+    _batch_samples: list[float] = field(default_factory=list, repr=False)
+    _context_samples: list[float] = field(default_factory=list, repr=False)
     prefix_cache: dict[str, float] = field(default_factory=dict)
     # Correctness: the engine did something it must never do. Always a failure.
     violations: list[str] = field(default_factory=list)
@@ -110,6 +116,8 @@ class SoakResult:
             "recompute_tokens_per_delivered_token": self.waste_ratio,
             "peak_kv_utilization": self.peak_kv_utilization,
             "peak_waiting": self.peak_waiting, "peak_active": self.peak_active,
+            "mean_decode_batch": self.mean_decode_batch,
+            "mean_context_tokens": self.mean_context_tokens,
             "prefix_cache": self.prefix_cache, "violations": self.violations,
             "coverage_gaps": self.coverage_gaps,
         }
@@ -310,8 +318,14 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
             )
             result.peak_waiting = max(result.peak_waiting, int(stats["waiting_requests"]))
             result.peak_active = max(result.peak_active, int(stats["active_requests"]))
+            if stats.get("decode_batch"):
+                result._batch_samples.append(float(stats["decode_batch"]))
+                result._context_samples.append(float(stats["decode_mean_context"]))
 
     result.wall_s = perf_counter() - started
+    if result._batch_samples:
+        result.mean_decode_batch = sum(result._batch_samples) / len(result._batch_samples)
+        result.mean_context_tokens = sum(result._context_samples) / len(result._context_samples)
     for request in submitted:
         result.counts[request.state.name] += 1
         if request.finish_reason:
@@ -401,7 +415,7 @@ class RepeatedResult:
         metrics = [
             "latency.itl_p50", "latency.itl_p99", "latency.ttft_p50",
             "latency.total_queue_p50", "waste_ratio", "delivered_tokens",
-            "peak_kv_utilization",
+            "peak_kv_utilization", "mean_decode_batch", "mean_context_tokens",
         ]
         return {
             "label": self.label, "runs": len(self.runs), "ok": self.ok,
