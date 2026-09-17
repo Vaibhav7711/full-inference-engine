@@ -43,17 +43,25 @@ def _report(name, result):
     print(f"\n[{name}] {result.wall_s:.1f}s  steps={result.steps}  "
           f"submitted={result.submitted}  counts={dict(result.counts)}")
     print(f"  cancelled_from={dict(result.cancelled_from)}")
+    print(f"  finish_reasons={dict(result.finish_reasons)}")
+    print(f"  delivered_tokens={result.delivered_tokens}  waste_ratio={result.waste_ratio:.2f}")
     print(f"  latency_ms={result.latency}")
     print(f"  recompute={result.recompute}")
     print(f"  prefix_cache={result.prefix_cache}  peak_kv={result.peak_kv_utilization:.2f}")
     if result.violations:
         print(f"  VIOLATIONS={result.violations}")
+    if result.coverage_gaps:
+        print(f"  coverage_gaps={result.coverage_gaps}")
 
 
 @cuda
 @requires_cuda
 def test_soak_mixed_arrivals_leaves_no_leaked_pages():
-    """Baseline: random arrivals, shared prefixes, cancellations from every state."""
+    """Baseline: random arrivals, shared prefixes, cancellations across the lifecycle.
+
+    Asserts correctness only. Whether the random injector reaches every state in one run
+    is a workload question, tested separately below.
+    """
     result = run_soak(_engine(), SoakConfig(duration_s=6.0, arrival_rate_per_s=25.0, seed=1))
     _report("mixed", result)
     assert result.submitted > 0
@@ -61,6 +69,30 @@ def test_soak_mixed_arrivals_leaves_no_leaked_pages():
     assert result.counts["FINISHED"] > 0
     assert result.counts["CANCELLED"] > 0
     assert result.prefix_cache["hits"] > 0, "shared prefixes never hit the cache"
+
+
+@cuda
+@requires_cuda
+def test_soak_cancels_from_every_lifecycle_state_when_given_the_chance():
+    """The coverage test proper: a workload built so every state is reachable.
+
+    Long prompts keep requests in PREFILLING across steps, a tight pool produces parked
+    PREEMPTED requests, oversubscription fills WAITING, and a high cancel probability
+    gives the injector enough attempts to reach all four.
+    """
+    result = run_soak(
+        _engine(num_blocks=40, max_active=6, prefix_cache_blocks=4),
+        SoakConfig(duration_s=12.0, arrival_rate_per_s=20.0, seed=11,
+                   cancel_probability=0.6, prefix_tokens=(160, 320),
+                   suffix_tokens=(32, 128), max_new_tokens=(32, 96)),
+    )
+    _report("coverage", result)
+    assert result.violations == []
+    missed = [state for state in ("WAITING", "PREFILLING", "DECODING", "PREEMPTED")
+              if not result.cancelled_from[state]]
+    assert not missed, (
+        f"never cancelled from {missed}; observed={dict(result.states_observed)}"
+    )
 
 
 @cuda
@@ -217,3 +249,5 @@ def test_repeated_runs_report_spread_so_single_numbers_are_not_trusted():
     itl = repeated.summary("latency.itl_p50")
     assert itl["n"] == 3 and itl["median"] > 0
     assert 0.0 <= itl["spread"] < 10.0
+    # Spread is the point of this test: a comparison must be able to see its own noise.
+    assert "spread" in repeated.summary("delivered_tokens")

@@ -102,6 +102,10 @@ def main() -> int:
                       f"[{stats['min']:.3f}, {stats['max']:.3f}]  spread={stats['spread']:.1%}")
         if not repeated.ok:
             print(f"  INVARIANT VIOLATIONS: {[v for r in repeated.runs for v in r.violations]}")
+        elif repeated.coverage_gaps:
+            # Expected here: this configuration is roomy and barely cancels, by design,
+            # so that the measurement reflects generation rather than churn.
+            print(f"  (coverage gaps, not failures: {len(repeated.coverage_gaps)})")
 
     labels = [label for label, _ in SETTINGS[args.setting]]
     baseline, variant = arms[labels[0]], arms[labels[1]]

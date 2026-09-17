@@ -73,11 +73,21 @@ class SoakResult:
     peak_waiting: int = 0
     peak_active: int = 0
     prefix_cache: dict[str, float] = field(default_factory=dict)
+    # Correctness: the engine did something it must never do. Always a failure.
     violations: list[str] = field(default_factory=list)
+    # Workload: this run did not exercise something it could have. Says nothing about the
+    # engine - a short run with a low cancel probability simply may not reach every state.
+    # Kept apart from violations so a clean engine never reports a correctness failure for
+    # a statistical accident, which is how people learn to ignore a suite.
+    coverage_gaps: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.violations
+
+    @property
+    def fully_covered(self) -> bool:
+        return not self.coverage_gaps
 
     @property
     def waste_ratio(self) -> float:
@@ -101,6 +111,7 @@ class SoakResult:
             "peak_kv_utilization": self.peak_kv_utilization,
             "peak_waiting": self.peak_waiting, "peak_active": self.peak_active,
             "prefix_cache": self.prefix_cache, "violations": self.violations,
+            "coverage_gaps": self.coverage_gaps,
         }
         return payload
 
@@ -337,7 +348,13 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
         if result.states_observed[state] and not result.cancelled_from[state]
     ]
     if uncovered:
-        result.violations.append(f"states reached but never cancelled from: {uncovered}")
+        result.coverage_gaps.append(
+            f"states reached but never cancelled from: {uncovered}"
+        )
+    if not result.recompute.get("preemptions"):
+        result.coverage_gaps.append("no preemption occurred: pool was not under pressure")
+    if not result.counts["REJECTED"]:
+        result.coverage_gaps.append("no admission rejection occurred")
     return result
 
 
@@ -351,6 +368,10 @@ class RepeatedResult:
     @property
     def ok(self) -> bool:
         return all(run.ok for run in self.runs)
+
+    @property
+    def coverage_gaps(self) -> list[str]:
+        return sorted({gap for run in self.runs for gap in run.coverage_gaps})
 
     def series(self, path: str) -> list[float]:
         """Pull one metric from every run. Dotted path, e.g. 'latency.itl_p50'."""
@@ -386,6 +407,7 @@ class RepeatedResult:
             "label": self.label, "runs": len(self.runs), "ok": self.ok,
             "summary": {metric: self.summary(metric) for metric in metrics},
             "violations": [v for run in self.runs for v in run.violations],
+            "coverage_gaps": self.coverage_gaps,
         }
 
 
@@ -443,8 +465,12 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result.to_dict(), indent=2, default=str))
     print(f"\nSaved -> {out}")
+    if result.coverage_gaps:
+        print("\nCoverage gaps (workload, not correctness):")
+        for gap in result.coverage_gaps:
+            print(f"  - {gap}")
     if result.ok:
-        print("SOAK PASS: engine drained with every KV page accounted for.")
+        print("\nSOAK PASS: engine drained with every KV page accounted for.")
         return 0
     print("SOAK FAIL:")
     for violation in result.violations:

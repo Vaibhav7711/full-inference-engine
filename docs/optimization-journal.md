@@ -1703,3 +1703,48 @@ one setting varied, pool, concurrency, workload, seeds and model object held ide
 each arm repeated, and a verdict that returns "unresolved" whenever the median change is
 within run-to-run spread. The CUDA-graph question is worth answering properly - it is just
 not answered yet.
+
+
+### First supported performance claim: CUDA graphs cut median ITL 2.8x
+
+`benchmarks/reliability/ab.py --setting cuda_graphs --repeats 5 --duration 8 --concurrency 8`,
+Colab T4, Qwen3-0.6B FP16, closed-loop at concurrency 8, `num_blocks=256`, `max_active=8`,
+`max_waiting_requests=64`, `cancel_probability=0.02`. Only `cuda_graph_batch_sizes` differs
+between arms; pool, workload, seeds and model object are identical.
+
+| metric | graphs off | graphs on | change | run-to-run spread | verdict |
+|---|---|---|---|---|---|
+| ITL p50 | 43.71 ms | 15.50 ms | -64.5% | 12.7% | real, 5x the noise |
+| TTFT p50 | 70.70 ms | 43.62 ms | -38.3% | 10.4% | real |
+| ITL p99 | - | - | -32.4% | 89.8% | **unresolved** |
+
+Supported claim: CUDA graphs cut *median* inter-token latency by 2.8x. The earlier
+"2.2-4.6x" is withdrawn - it compared configurations differing in three settings at once.
+The p99 effect is genuinely unresolved at five repeats; tail latency needs more samples or
+a longer run before anything is said about it.
+
+The TTFT improvement is almost certainly a consequence rather than a cause: graphs do not
+touch prefill, but at fixed concurrency a faster decode retires requests sooner, so a new
+request waits less. Not worth claiming as a prefill effect.
+
+Context: 15.50 ms still sits about 3.9x above the ~4 ms T4 bandwidth floor for this model,
+so graphs removed a large share of the per-step host overhead measured earlier but not all
+of it.
+
+### Coverage is not correctness: a self-inflicted false alarm
+
+The first version of the soak filed "states reached but never cancelled from" as an
+invariant violation, alongside "you leaked a KV page". It is not the same kind of statement.
+Whether a random injector at `cancel_probability=0.02` happens to catch a request in
+`PREFILLING` during a four-second run is a fact about the workload, not about the engine.
+The result was three tests failing on a correct engine, and the A/B printing
+`INVARIANT VIOLATIONS` on clean runs - the precise way a suite teaches people to ignore it.
+
+`SoakResult` now carries `violations` (correctness, always a failure) and `coverage_gaps`
+(this run did not exercise something) separately; `ok` depends only on the former.
+Coverage gaps now also record "no preemption occurred" and "no admission rejection
+occurred", which are useful signals that a configuration is not testing what it intended.
+One dedicated test asserts full cancellation coverage, with a workload built to make every
+state reachable: long prompts to keep requests in `PREFILLING` across steps, a tight pool
+to park `PREEMPTED` requests, oversubscription to fill `WAITING`, and a high cancel
+probability to give the injector enough attempts.

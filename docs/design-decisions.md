@@ -493,6 +493,23 @@ record before it is considered complete.
   open-loop arm.
 
 
+### DD-036 — Separate correctness violations from workload coverage gaps
+
+- **Decision:** `SoakResult.violations` holds properties the engine must never break;
+  `SoakResult.coverage_gaps` holds things a particular run did not exercise. `ok` depends
+  only on violations. Tests assert `violations == []` unconditionally; exactly one test
+  asserts cancellation coverage, and it supplies a workload engineered to reach every
+  state.
+- **Why:** filing them together made a correct engine report `INVARIANT VIOLATIONS` when a
+  four-second run at a 2% cancel probability failed to catch a request mid-prefill. Three
+  tests failed for a statistical accident. A suite that fails for reasons unrelated to
+  correctness gets ignored, which costs more than the coverage it was buying.
+- **Code:** `benchmarks/reliability/soak.py`, `benchmarks/reliability/ab.py`,
+  `tests/reliability/test_soak.py`.
+- **Tradeoff:** coverage can now silently regress, since most tests no longer fail on it.
+  Mitigated by the dedicated coverage test and by printing gaps in every report.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,
