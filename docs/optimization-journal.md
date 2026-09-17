@@ -2164,3 +2164,37 @@ until prompt length became a swept variable.
 1.64x at ~128 tokens. The residual fixed overhead in the decode step is amortised by the
 larger KV read. The remaining 3.22 ms/token of decode headroom identified earlier is real
 but small beside a prefill step running 22.5x off its own floor.
+
+
+## D2: tiled causal prefill kernel
+
+The kernel being replaced runs on grid `(batch, q_heads, query_len)` — one program per
+query token per head — and every program walks the KV prefix from zero. A 128-token chunk
+with 16 heads is 2,048 programs re-reading the same keys and values. Across 28 layers at a
+mean chunk start of 912 that is **28.67 GB of KV traffic per prefill step**, where a tiled
+kernel with BLOCK_M=64 needs 0.462 GB: **62x less**. Scores were also computed with
+`tl.sum(q * k, axis=-1)` on CUDA cores, so the tensor cores never ran.
+
+The attention arithmetic is 26.8 GFLOP, about 0.41 ms on tensor cores. The work was never
+the problem.
+
+`engine/kernels/tiled_paged_prefill.py` is FlashAttention-2 structure over paged KV: one
+program per tile of BLOCK_M queries, `tl.dot` for both matmuls, online softmax with an fp32
+accumulator, and a per-tile causal bound so early tiles stream far less KV than late ones.
+The page gather is the one real deviation from contiguous FlashAttention.
+
+Recorded because it is easy to get wrong: masked scores use a finite `-1e30` sentinel
+rather than `-inf`. A fully padded query row would otherwise make the softmax rescale
+evaluate `(-inf) - (-inf)` and produce NaN; with a finite sentinel the rescale is `exp(0)`
+and masked probabilities are zeroed explicitly.
+
+Seven correctness tests run before any speed claim: a dense fp32 reference over five
+(start, chunk) shapes, agreement with the kernel being replaced, padded rows exactly zero
+and finite, five tile shapes agreeing, the fp32-PV path agreeing with the tensor-core path,
+and multi-query grouping at both geometry edges.
+
+Measured two ways. `benchmarks/kernels/prefill_attention_ab.py` times the kernel alone and
+fits `b` on the Phase B axis — necessary because a 2x kernel win is a fraction of a step and
+disappears into step-level noise. `ab.py --setting prefill_kernel` measures the in-engine
+effect with the usual repeats and spread check. Target: `b` <= 0.05 ms/token against the old
+kernel's 0.405.

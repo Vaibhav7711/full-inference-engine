@@ -250,3 +250,81 @@ the larger KV read. Decode is not the problem.
 3. **D3.** Re-run the B1 sweep and check `b` against that target. A result outside it is
    reported, not accepted.
 4. **D4.** Graph the prefill path only if `a` is still material after D1 and D2.
+
+
+---
+
+# Phase D2 — tiled causal prefill kernel
+
+## Diagnosis
+
+The kernel being replaced launches on grid `(batch, q_heads, query_len)` — **one program
+per query token per head** — and each program walks the KV prefix from position zero.
+Scores are computed as `tl.sum(q[None, :] * keys, axis=1)`: an elementwise multiply and
+reduction on CUDA cores, so the tensor cores are never used.
+
+For a 128-token chunk at a mean start of 912 in an 1824-token prompt, across 28 layers:
+
+| | KV traffic per prefill step | at 258.8 GB/s |
+|---|---|---|
+| current per-token kernel | **28.67 GB** | 110.8 ms |
+| tiled, BLOCK_M=32 | 0.910 GB | 3.5 ms |
+| tiled, BLOCK_M=64 | **0.462 GB** | 1.8 ms |
+| tiled, BLOCK_M=128 | 0.239 GB | 0.9 ms |
+
+The attention arithmetic itself is 26.8 GFLOP, about 0.41 ms on tensor cores. The work was
+never the problem; re-reading the same keys 128 times was.
+
+The naive DRAM model predicts 0.87 ms/token against a measured 0.405. The difference is
+L2: one layer's KV for one kv_head is 228 KB and all 8 heads fit the T4's 4 MB cache, so
+consecutive query tokens hit cache. The redundancy is real but partly absorbed — which is
+why the measured cost is 22.5x the floor rather than 48x.
+
+## The replacement
+
+`engine/kernels/tiled_paged_prefill.py`, standard FlashAttention-2 structure adapted to
+paged KV:
+
+- one program per (row, head, tile of BLOCK_M query tokens)
+- `tl.dot` for QK^T and PV, so scoring runs on tensor cores
+- online softmax with an fp32 accumulator
+- per-tile causal bound: a tile streams KV only up to the last position its rows can see,
+  so early tiles do far less work than late ones
+- bounds-checked page gather, matching the guarantee the KV write kernels make
+
+One subtlety worth recording: masked scores use a finite sentinel (`-1e30`) rather than
+`-inf`. A padded query row has every score masked, and `-inf` would make the online-softmax
+rescale evaluate `(-inf) - (-inf)` = NaN. With a finite sentinel the rescale is `exp(0) = 1`
+and the row's probabilities are forced to exact zeros explicitly.
+
+## Verification before speed
+
+`tests/kernels/test_tiled_paged_prefill.py`, seven tests:
+
+- against a dense fp32 reference built by gathering the same pages, over five
+  (start, chunk) shapes including ragged chunks, unaligned prefixes and mixed batches
+- against the per-token kernel it replaces, at four shapes
+- padded rows are exactly zero and never NaN
+- five tile shapes produce the same result
+- the fp32-PV path agrees with the tensor-core path
+- multi-query grouping at kv_heads = 1 and kv_heads = q_heads
+- tiles below `tl.dot`'s 16-element minimum are rejected
+
+## Measurement
+
+`benchmarks/kernels/prefill_attention_ab.py` times the kernel alone across chunk sizes and
+fits `ms = a + b * chunk_tokens` on the same axis Phase B used, scaled by 28 layers. A
+kernel-level harness matters here because a 2x kernel win is a fraction of a whole step and
+is easy to lose in step-level noise. `--sweep-tiles` searches BLOCK_M, BLOCK_N and warp
+count, since the right tile shape on sm75 is not the one the FlashAttention tutorials use
+on Ampere.
+
+The in-engine effect is measured separately as `ab.py --setting prefill_kernel`, which
+binds on any profile.
+
+## Target and prediction
+
+`b` <= 0.05 ms/token, 2.8x the compute floor. From the traffic model, BLOCK_M=64 should
+land near 0.03. The old kernel's `b` is 0.405.
+
+A result above 0.05 is reported as a miss, not accepted quietly.

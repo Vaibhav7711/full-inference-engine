@@ -41,6 +41,7 @@ from engine.kernels.paged_decode_batched import (
 )
 from engine.kernels.paged_decode_config import select_paged_decode_config
 from engine.kernels.paged_prefill import paged_prefill
+from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
 
@@ -74,6 +75,13 @@ class _PrefillContext:
     chunk_lens: torch.Tensor
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
+    # Which fp16 prefill attention kernel to run. The tiled kernel loads each KV tile once
+    # per tile of queries; the original loads the whole prefix once per query token. Kept
+    # switchable so the two can be A/B'd in-engine and the old path stays available until
+    # the new one has a token-identity gate behind it.
+    tiled_prefill: bool = True
+    prefill_block_m: int = 64
+    prefill_block_n: int = 64
 
 
 _PREFILL_CTX: Optional[_PrefillContext] = None
@@ -161,10 +169,17 @@ def chunked_prefill_attention_forward(
             key, value, key_pool, value_pool, ctx.block_tables,
             ctx.chunk_lens, ctx.start_positions,
         )
-        out = paged_prefill(
-            query, key_pool, value_pool, ctx.block_tables,
-            ctx.start_positions, ctx.chunk_lens, scale=scaling,
-        )
+        if ctx.tiled_prefill:
+            out = tiled_paged_prefill(
+                query, key_pool, value_pool, ctx.block_tables,
+                ctx.start_positions, ctx.chunk_lens, scale=scaling,
+                block_m=ctx.prefill_block_m, block_n=ctx.prefill_block_n,
+            )
+        else:
+            out = paged_prefill(
+                query, key_pool, value_pool, ctx.block_tables,
+                ctx.start_positions, ctx.chunk_lens, scale=scaling,
+            )
     else:
         from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
         write_prefill_int8_kv_batched(
@@ -197,6 +212,9 @@ class ContinuousBatchingEngine:
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
+                 tiled_prefill: bool = True,
+                 prefill_block_m: int = 64,
+                 prefill_block_n: int = 64,
                  max_prefill_tokens_per_iteration: int = 128,
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,
@@ -225,6 +243,9 @@ class ContinuousBatchingEngine:
         self.block_size = block_size
         self.max_active = max_active
         self.prefill_chunk_size = prefill_chunk_size
+        self.tiled_prefill = tiled_prefill
+        self.prefill_block_m = prefill_block_m
+        self.prefill_block_n = prefill_block_n
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
         self.max_waiting_requests = max_waiting_requests
         self.prefix_cache_blocks = prefix_cache_blocks
@@ -738,6 +759,9 @@ class ContinuousBatchingEngine:
         _set_prefill_ctx(_PrefillContext(
             self.key_pool, self.value_pool, block_tables, starts, chunk_lens,
             self.key_scale_pool, self.value_scale_pool,
+            tiled_prefill=self.tiled_prefill,
+            prefill_block_m=self.prefill_block_m,
+            prefill_block_n=self.prefill_block_n,
         ))
         try:
             out = self.model(

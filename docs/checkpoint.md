@@ -117,7 +117,7 @@ A/B comparison list for that reason.
 | Prefill chunk A/B (128 vs 512) | **void**: non-binding, both arms fit a ~122-token prompt in one chunk |
 | Prefill investigation (Phase B sweep) | **accepted**: `step_ms = 21.13 + 0.405*chunk`, R²=0.998 |
 | Phase D1 — decouple prefill budget from chunk size | **next**, scheduling only |
-| Phase D2 — tiled causal prefill kernel | **next**, the real fix |
+| Phase D2 — tiled causal prefill kernel | **built**, pending GPU gate |
 
 ---
 

@@ -46,6 +46,11 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("chunk_32", {"prefill_chunk_size": 32,
                       "max_prefill_tokens_per_iteration": 32}),
     ],
+    # The Phase D2 change: tiled attention versus the per-query-token kernel.
+    "prefill_kernel": [
+        ("per_token", {"tiled_prefill": False}),
+        ("tiled", {"tiled_prefill": True}),
+    ],
     # If a prefill step costs the same at 128 and 512 tokens, its cost is per-invocation
     # overhead rather than work, and no scheduling change can reduce it.
     "prefill_chunk_large": [
