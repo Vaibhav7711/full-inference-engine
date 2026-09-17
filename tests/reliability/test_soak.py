@@ -270,3 +270,31 @@ def test_soak_records_the_decode_operating_point_for_roofline_comparison():
     # Prompts are 112-224 tokens before generation, so the mean context must land in a
     # plausible band - a zero or a wild value means the sampler is reading the wrong thing.
     assert 50 < result.mean_context_tokens < 400
+
+
+@cuda
+@requires_cuda
+def test_itl_percentiles_are_taken_over_token_gaps_not_request_means():
+    """A tail computed from per-request averages is not a tail.
+
+    Averaging inside each request first hides every hiccup: one 200 ms stall in a 60-token
+    response moves that request's mean by 3 ms. With a few dozen requests per run, a
+    percentile over those means is effectively the slowest request's average.
+    """
+    result = run_soak(
+        _engine(num_blocks=160, max_active=8),
+        SoakConfig(duration_s=6.0, concurrency=8, seed=31, cancel_probability=0.0,
+                   max_new_tokens=(24, 64)),
+    )
+    _report("itl-tail", result)
+    latency = result.latency
+    print(f"  itl p50={latency['itl_p50']:.2f} p99={latency['itl_p99']:.2f} "
+          f"p999={latency['itl_p999']:.2f} over {latency['itl_samples']} gaps "
+          f"(request-mean p50={latency['itl_request_mean_p50']:.2f})")
+    assert result.violations == []
+    # Percentiles over gaps need far more samples than there are requests; that is the
+    # entire point of the change.
+    assert latency["itl_samples"] > result.counts["FINISHED"] * 5
+    assert latency["itl_p50"] > 0
+    assert latency["itl_p99"] >= latency["itl_p50"]
+    assert latency["itl_p999"] >= latency["itl_p99"]

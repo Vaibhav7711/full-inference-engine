@@ -38,7 +38,7 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
 }
 
 
-def _verdict(baseline: dict, variant: dict) -> str:
+def _verdict(baseline: dict, variant: dict) -> str:  # noqa: D401
     """Call a difference real only when it exceeds the noise in both arms."""
     if not baseline.get("n") or not variant.get("n"):
         return "no data"
@@ -122,7 +122,8 @@ def main() -> int:
     baseline, variant = arms[labels[0]], arms[labels[1]]
     print(f"\n=== {labels[1]} vs {labels[0]} ===")
     comparison = {}
-    for metric in ("latency.itl_p50", "latency.itl_p99", "latency.ttft_p50", "waste_ratio"):
+    for metric in ("latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
+                   "latency.ttft_p50", "waste_ratio"):
         verdict = _verdict(baseline.summary(metric), variant.summary(metric))
         comparison[metric] = verdict
         print(f"  {metric:24s} {verdict}")

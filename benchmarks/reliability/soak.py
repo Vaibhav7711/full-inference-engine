@@ -333,6 +333,23 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
 
     produced = [r for r in submitted if r.state is RequestState.FINISHED]
     ttfts = [r.time_to_first_token_ms() for r in produced if r.time_to_first_token_ms()]
+    # Percentiles must be taken over individual token gaps, not over per-request means.
+    # Averaging inside each request first destroys the tail - a single 200 ms hiccup in a
+    # 60-token response moves that request's mean by 3 ms and disappears. With ~20
+    # requests per run, a "p99" over request means is really just the slowest request's
+    # average, which is why it swung 70-90% between runs and never resolved.
+    gaps_all: list[float] = []
+    gaps_clean: list[float] = []
+    for request in produced:
+        stamps = request.token_timestamps_ns
+        gaps = [(b - a) / 1_000_000 for a, b in zip(stamps, stamps[1:])]
+        gaps_all.extend(gaps)
+        if not request.preempted_count:
+            # A preempted request has one gap containing its whole queue wait. That is a
+            # real stall and is reported as stall_p99, but mixing it into the token-gap
+            # tail would make every tail number a preemption detector.
+            gaps_clean.extend(gaps)
+    gaps = gaps_clean or gaps_all
     itls = [
         r.mean_inter_token_latency_ms() for r in produced
         if r.mean_inter_token_latency_ms()
@@ -341,7 +358,12 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
     stalls = [r.stall_time_ms() for r in produced]
     result.latency = {
         "ttft_p50": _percentile(ttfts, 0.50), "ttft_p99": _percentile(ttfts, 0.99),
-        "itl_p50": _percentile(itls, 0.50), "itl_p99": _percentile(itls, 0.99),
+        "itl_p50": _percentile(gaps, 0.50), "itl_p99": _percentile(gaps, 0.99),
+        "itl_p999": _percentile(gaps, 0.999),
+        "itl_samples": len(gaps),
+        "itl_p99_including_preempted": _percentile(gaps_all, 0.99),
+        # Retained for continuity with earlier runs: the median request's average gap.
+        "itl_request_mean_p50": _percentile(itls, 0.50),
         "total_queue_p50": _percentile(queues, 0.50),
         "total_queue_p99": _percentile(queues, 0.99),
         "stall_p99": _percentile(stalls, 0.99),
@@ -413,7 +435,8 @@ class RepeatedResult:
 
     def to_dict(self) -> dict:
         metrics = [
-            "latency.itl_p50", "latency.itl_p99", "latency.ttft_p50",
+            "latency.itl_p50", "latency.itl_p99", "latency.itl_samples",
+            "latency.ttft_p50",
             "latency.total_queue_p50", "waste_ratio", "delivered_tokens",
             "peak_kv_utilization", "mean_decode_batch", "mean_context_tokens",
         ]

@@ -530,6 +530,26 @@ record before it is considered complete.
   any other target rather than carried over. That is the correct behaviour.
 
 
+### DD-038 — Tail latency is percentiled over individual token gaps, never over request means
+
+- **Decision:** `itl_p50`, `itl_p99` and `itl_p999` are computed across every inter-token
+  gap in the run. Gaps belonging to preempted requests are excluded from the headline
+  figures and surfaced as `itl_p99_including_preempted`; `itl_samples` reports how many
+  gaps a percentile rests on.
+- **Why:** the previous implementation averaged gaps within each request and then
+  percentiled those averages. That is a summary of typical requests, not a tail: a single
+  200 ms hiccup inside a 60-token response shifts its mean by 3 ms and disappears. With
+  about twenty requests per run, `p99` was effectively one sample, which is why it showed
+  70-90% run-to-run spread while `p50` sat at 6-9% - and why two A/B experiments both
+  measured a consistent -33% that the machinery correctly refused to call real.
+- **Rejected — more repeats to resolve the p99.** The estimator was wrong, not
+  under-sampled. Adding runs would have bought a stable measurement of the wrong quantity.
+- **Code:** `benchmarks/reliability/soak.py`, `benchmarks/reliability/ab.py`.
+- **Tradeoff:** excluding preempted requests from the headline tail means a config with
+  heavy preemption reports an optimistic tail unless `stall_p99` is read alongside it.
+  Both are printed in every report.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

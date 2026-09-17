@@ -1837,3 +1837,46 @@ model. That last one is now quantifiable: at batch 16 / 2048 context the ideal K
 3758 MB against 1192 MB of weights, so doubling it adds roughly 14 ms to a 19 ms floor. At
 short context it is a rounding error; at long context it is the single largest cost in the
 step.
+
+
+### Validated: CUDA graphs remove 72% of per-step overhead; 10.2 ms/token remains
+
+Second independent A/B, five runs per arm, now with the operating point measured rather
+than assumed. The effect replicates almost exactly: -64.5% in the first experiment,
+-63.8% in the second.
+
+| arm | decode batch | context | floor | measured ITL p50 | multiple | overhead above floor |
+|---|---|---|---|---|---|---|
+| graphs off | 6.9 | 133 | 5.01 ms | 41.93 ms | 8.4x | 36.92 ms |
+| graphs on | 7.5 | 125 | 5.02 ms | 15.19 ms | **3.0x** | **10.17 ms** |
+
+CUDA graphs removed 26.75 ms of 36.92 ms of overhead - 72% of everything above the memory
+floor. The remaining 10.17 ms/token is the validated optimisation target.
+
+The earlier "2.4x, 9.08 ms headroom" is corrected: it used a guessed 512-token context,
+which inflated the floor by 28%. The conclusion is robust to the remaining uncertainty -
+context varied 35-55% between runs, but that moves the floor only from 5.02 to 5.24 ms,
+because at ~130 tokens KV traffic is under 10% of the weight read.
+
+TTFT fell 38.0% with spread of only 1.4-3.2%, the tightest measurement in the set. It is
+still a consequence rather than a cause: graphs do not touch prefill, but at fixed
+concurrency a faster decode retires requests sooner.
+
+### Why itl_p99 never resolved: it was not a tail
+
+Both A/B runs reported `itl_p99` as unresolved, with run-to-run spread of 70-90% against a
+consistent -33% median change. That spread was an artefact of how the percentile was
+computed: over *per-request mean* inter-token latency, not over individual token gaps.
+
+Averaging inside each request first destroys exactly what a tail measures. One 200 ms
+hiccup in a 60-token response moves that request's mean by 3 ms and vanishes. With roughly
+twenty requests per run, a "p99" over twenty means is the slowest request's average - a
+single sample, which is why it swung wildly while p50 held at 6-9%.
+
+Percentiles are now taken over every individual token gap, which is hundreds to thousands
+of samples per run instead of tens. Gaps from preempted requests are excluded from the
+headline tail, because one of their gaps contains the whole queue wait and would turn every
+tail number into a preemption detector; that stall is already reported separately as
+`stall_p99`, and `itl_p99_including_preempted` keeps the combined view. `itl_samples` is
+reported so the sample count behind a percentile is visible, and `itl_request_mean_p50`
+retains continuity with earlier runs.
