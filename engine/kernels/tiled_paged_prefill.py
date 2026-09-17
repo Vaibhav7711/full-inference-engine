@@ -35,7 +35,7 @@ def _tiled_paged_prefill_kernel(
     stride_vb, stride_vs, stride_vh, stride_vd,
     stride_ob, stride_oh, stride_ot, stride_od,
     stride_btb, stride_btl,
-    num_q_heads, num_kv_heads, scale, max_blocks, num_pool_blocks,
+    num_q_heads, num_kv_heads, scale, max_blocks, num_pool_blocks, query_len,
     BLOCK_SIZE: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     PV_IN_FP32: tl.constexpr,
@@ -58,7 +58,14 @@ def _tiled_paged_prefill_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     offs_n = tl.arange(0, BLOCK_N)
 
+    # Two different bounds, previously conflated. `row_valid` is *logical*: which rows
+    # carry a real token this chunk, used for masking the computation. `in_tensor` is
+    # *physical*: which rows exist in the padded [B,H,Q,D] output at all, used for the
+    # store. Masking the store by the logical bound leaves padded rows holding whatever
+    # `torch.empty_like` allocated, which the kernel this replaces never did - it stored
+    # unconditionally with an already-zeroed result.
     row_valid = offs_m < chunk_len
+    in_tensor = offs_m < query_len
     # Absolute position of each query row in the sequence: the chunk starts at `start`.
     q_pos = start + offs_m
     kv_head = q_head // (num_q_heads // num_kv_heads)
@@ -135,7 +142,7 @@ def _tiled_paged_prefill_kernel(
     out_base = out_ptr + batch * stride_ob + q_head * stride_oh
     tl.store(
         out_base + offs_m[:, None] * stride_ot + offs_d[None, :] * stride_od,
-        result.to(out_ptr.dtype.element_ty), mask=row_valid[:, None],
+        result.to(out_ptr.dtype.element_ty), mask=in_tensor[:, None],
     )
 
 
@@ -187,7 +194,7 @@ def tiled_paged_prefill(
         query, key_pages, value_pages, out, block_tables, start_positions, chunk_lens,
         *query.stride(), *key_pages.stride(), *value_pages.stride(), *out.stride(),
         *block_tables.stride(), q_heads, kv_heads, scale,
-        block_tables.shape[1], key_pages.shape[0],
+        block_tables.shape[1], key_pages.shape[0], query_len,
         BLOCK_SIZE=block_size, HEAD_DIM=head_dim,
         BLOCK_M=block_m, BLOCK_N=block_n, PV_IN_FP32=pv_in_fp32,
         num_warps=num_warps, num_stages=num_stages,

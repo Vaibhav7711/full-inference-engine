@@ -189,3 +189,36 @@ def test_rejects_tiles_below_the_tl_dot_minimum():
     query, kp, vp, tables, start_t, chunk_t = _build(1, 16, 8, [0], [64], seed=1)
     with pytest.raises(ValueError):
         tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t, block_m=8)
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("query_len,block_m", [(17, 16), (100, 64), (33, 32), (8, 64)])
+def test_every_row_of_the_output_is_written_even_when_tiles_overhang(query_len, block_m):
+    """The store bound is the tensor, not the chunk.
+
+    Masking the store by logical validity leaves padded rows holding whatever the output
+    allocation contained; masking it by nothing writes past the end of the tensor when
+    query_len is not a multiple of BLOCK_M. Both bounds are needed and they differ.
+    """
+    query, kp, vp, tables, start_t, chunk_t = _build(
+        1, 16, 8, [0], [query_len], seed=13)
+    poison = torch.full_like(query, float("nan"))
+    out = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t,
+                              block_m=block_m, block_n=32)
+    assert torch.isfinite(out).all(), "some row of the output was never written"
+    assert out.shape == poison.shape
+
+
+@cuda
+@requires_cuda
+def test_padded_rows_are_zero_with_a_short_chunk_in_a_wide_batch():
+    """A row whose chunk is far shorter than the batch's query width."""
+    query, kp, vp, tables, start_t, chunk_t = _build(
+        3, 16, 8, [0, 0, 0], [128, 8, 1], seed=17)
+    out = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t)
+    assert torch.isfinite(out).all()
+    assert torch.count_nonzero(out[1, :, 8:]) == 0
+    assert torch.count_nonzero(out[2, :, 1:]) == 0
+    # The full row is untouched by its neighbours' padding.
+    assert torch.count_nonzero(out[0]) > 0

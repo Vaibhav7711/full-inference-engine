@@ -2220,3 +2220,33 @@ produced seventeen identical tracebacks and buried the numerical questions the s
 written to answer. Every kernel test file now opens with a sub-second smoke test that
 builds and runs the kernel on a tiny input, so a build failure costs one test and the
 expensive correctness work is never reached on a kernel that cannot compile.
+
+
+### D2 second GPU run: the kernel is numerically correct; one store-mask bug
+
+The kernel compiles and every numerical test passes - both compile smoke tests, all five
+dense fp32 reference shapes (including ragged chunks, unaligned prefixes and mixed
+batches), and all four agreement checks against the kernel it replaces. The algorithm is
+right.
+
+One real bug, caught by exactly the test written for it. The store was masked by
+`row_valid`, the *logical* bound - which rows carry a real token this chunk - so rows that
+are padding were never written at all, and the output comes from `torch.empty_like`. The
+uniform `1.5318e-05` values in the failure dump were allocator leftovers, not computation.
+The kernel this replaces stored unconditionally with an already-zeroed result, so it
+guaranteed zeros; that guarantee was lost.
+
+The fix is not simply to drop the mask. Two different bounds had been conflated:
+
+- `row_valid = offs_m < chunk_len` - logical, for the causal masking and the computation
+- `in_tensor = offs_m < query_len` - physical, for the store
+
+Dropping the mask entirely would write past the end of the output whenever `query_len` is
+not a multiple of `BLOCK_M`, which is every ragged chunk. Both bounds are needed and they
+are not the same number. The store now uses the physical bound, with `result` already
+zeroed by the logical one.
+
+Two tests added: one that poisons the output shape and asserts every row is finite
+afterwards across four (query_len, BLOCK_M) combinations chosen so the last tile overhangs,
+and one with a three-row batch of widely different chunk lengths asserting each row's
+padding is zero and its neighbours are untouched.
