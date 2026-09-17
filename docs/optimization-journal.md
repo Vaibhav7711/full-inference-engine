@@ -2126,3 +2126,41 @@ Also instrumented: `prefill_sdpa_calls` / `prefill_chunked_calls` and their toke
 because the engine keeps an SDPA fast path for batches of complete fresh prompts and a
 resumable chunk path for everything else. A measured prefill cost cannot be attributed to
 an implementation without knowing which one ran, and until now it was assumed.
+
+
+## Phase B result: the prefill kernel is 22.5x off the compute floor
+
+One 6.6-minute session, three sweeps, `results/prefill_sweep.json`. Full analysis and the
+prediction scorecard in `docs/experiment-plan-prefill.md` (Phase C).
+
+`step_ms = 21.13 + 0.40519 * chunk_tokens`, R^2 = 0.998. The fixed per-invocation cost is
+21.13 ms; the marginal cost is **0.405 ms per prefill token, 22.5x the 0.018 ms/token dense
+compute floor**. Compute is 55% of a chunk-64 step, 71% at chunk 128 and 91% at chunk 512.
+
+**The prediction that mattered was wrong.** `b` was predicted at 0.02-0.10 ms/token and
+measured at 0.405. That single coefficient decides which of two very different fixes gets
+built, and the pre-registered tie-break ("both thresholds met, do the graph work first")
+rested on the assumption that `b` was small. Graphing prefill removes at most `a`, capping
+the gain at 28.9% at chunk 128; a tiled kernel reaching `b` = 0.05 would cut the step 62%.
+The override is recorded in the plan with its reasoning, because silently revising a
+pre-registered rule is the failure mode pre-registration is meant to prevent.
+
+**A free win the script misreported.** B3's verdict asked whether packing four chunks into
+one step makes that step cheaper. It cannot - the step does four times the work. Against
+four separate steps: 55.37 ms versus 186.32 ms, **3.4x cheaper per unit work**. So the
+fixed cost amortises across chunks from different requests, while a larger chunk from one
+request costs linearly more. Two different knobs that had been conflated:
+`prefill_chunk_size` bounds one request's slice, `max_prefill_tokens_per_iteration` bounds
+the step. Raising only the latter already shows prefill share 61.0% → 45.4% and TTFT
+496 → 472 ms at `chat`.
+
+**Every earlier prefill number understated the problem.** At ~122-token prompts the
+expected gap is 17.17 ms; at `chat` (~656) it is 36.01 ms and at `long` (~1824) 63.32 ms.
+TTFT at `long` is **12.5 seconds** - the headline number for realistic prompts, invisible
+until prompt length became a swept variable.
+
+**Decode is not the problem, and is better at long context than short.** At batch 7 with
+1824 tokens of context the floor is 10.26 ms against 13.36 ms measured - **1.30x**, versus
+1.64x at ~128 tokens. The residual fixed overhead in the decode step is amortised by the
+larger KV read. The remaining 3.22 ms/token of decode headroom identified earlier is real
+but small beside a prefill step running 22.5x off its own floor.

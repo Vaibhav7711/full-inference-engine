@@ -75,6 +75,8 @@ Listed so they cannot resurface. Each was wrong for a different reason.
 | p999 null result shows the tail is prefill | guaranteed by the design: both arms run identical un-graphed prefill |
 | smaller chunks trade ITL for TTFT | no such trade at 32-128 tokens; cost is fixed per invocation, so smaller chunks lose on both |
 | chunk 512 vs 128 shows cost is fixed above 128 | non-binding: the workload's ~122-token prompts fit one chunk in both arms |
+| prefill cost is fixed per invocation | true only for 32-128 tokens; the fitted marginal cost is 0.405 ms/token and dominates above chunk 64 |
+| packing chunks does not amortise the fixed cost | the script compared a packed step against a single-chunk step rather than against four separate steps; packing is 3.4x cheaper per unit work |
 
 ---
 
@@ -113,21 +115,22 @@ A/B comparison list for that reason.
 | Measured roofline | **accepted** |
 | Prefill chunk A/B (128 vs 32) | **accepted**: cost is fixed per invocation |
 | Prefill chunk A/B (128 vs 512) | **void**: non-binding, both arms fit a ~122-token prompt in one chunk |
-| Prefill investigation (Phase B sweep) | **next** — pre-registered in `docs/experiment-plan-prefill.md`, one session |
+| Prefill investigation (Phase B sweep) | **accepted**: `step_ms = 21.13 + 0.405*chunk`, R²=0.998 |
+| Phase D1 — decouple prefill budget from chunk size | **next**, scheduling only |
+| Phase D2 — tiled causal prefill kernel | **next**, the real fix |
 
 ---
 
 ## 5. Open questions
 
-1. **Is prefill launch-bound or compute-bound?** Established only for 32-128 tokens, where
-   cost is fixed. The 128-vs-512 run was non-binding and is void. Re-run as
-   `--setting prefill_chunk_large --prompt-profile chat`. Estimated crossover is near
-   1000-2000 tokens: at ~122 tokens prompt compute is ~2.25 ms of a 42 ms step (~5%); at
-   2048 tokens it is ~38 ms and would dominate.
-1b. **Is the whole prefill picture representative?** No. Everything measured used
-   ~122-token prompts; real chat traffic is 500-4000. At a 128 budget a 2048-token prompt
-   needs 16 chunks, ~670 ms of prefill per request if cost stays fixed. **Re-establish
-   every prefill conclusion on `--prompt-profile chat` before it guides design.**
+1. ~~Is prefill launch-bound or compute-bound?~~ **Answered: both, and compute dominates.**
+   `a`=21.13 ms fixed, `b`=0.405 ms/token (22.5x floor). See `docs/experiment-plan-prefill.md`.
+1b. ~~Is the prefill picture representative?~~ **Answered: no, it understated by 3.7x.**
+   Now measured across three prompt profiles.
+1c. **What `b` is achievable with a tiled kernel?** Target 0.05 ms/token (2.8x floor).
+   Unknown until D2 is built; D3 checks it against that target.
+1d. **What budget value?** D1 needs a sweep of `max_prefill_tokens_per_iteration` at fixed
+   `prefill_chunk_size`; B3 tested only 1x and 4x.
 2. **Which prefill path does this workload take?** The SDPA fast path applies only when
    every request in the batch is fresh *and* its chunk covers the whole prompt
    (`docs/understanding-journal.md`, Layer 7). With ~120-token prompts against a 128 budget

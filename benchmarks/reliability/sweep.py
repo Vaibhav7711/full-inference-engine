@@ -163,12 +163,23 @@ def main() -> int:
         one, four = (p["prefill_step_p50_ms"].get("median", 0.0) for p in points)
         noise = max(p["prefill_step_p50_ms"].get("spread", 0.0) for p in points)
         if one > 0:
-            change = (four - one) / one
-            print(f"\n  packing 4 chunks into one step: {change:+.1%} step cost "
+            # A packed step does four chunks' worth of work, so it must cost more than a
+            # single-chunk step. The question is whether it costs less than four of them:
+            # that is what tells you the fixed cost amortises across chunks in a step.
+            separate = 4 * one
+            amortisation = separate / four if four else 0.0
+            print(f"\n  one packed step {four:.2f} ms vs four separate steps "
+                  f"{separate:.2f} ms  ->  {amortisation:.2f}x cheaper per unit work "
                   f"(spread {noise:.1%})")
-            print("  a divides with chunks per step" if change < -noise
-                  else "  a does not divide: fixed cost is per chunk, not per step")
-        results["runs"]["B3"] = {"points": points}
+            if amortisation > 1 + noise:
+                print(f"  a amortises across chunks in a step: raise "
+                      f"max_prefill_tokens_per_iteration above prefill_chunk_size")
+            else:
+                print("  a does not amortise: fixed cost is per chunk, not per step")
+            results_b3_extra = {"packed_ms": four, "separate_ms": separate,
+                                "amortisation": amortisation}
+        results["runs"]["B3"] = {"points": points,
+                                 **(results_b3_extra if one > 0 else {})}
 
     results["wall_s"] = perf_counter() - started
     out = Path(args.out)

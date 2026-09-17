@@ -149,3 +149,104 @@ output length, which the profiles do not vary.
 - No conclusions from `short` prompts. They sit below the compute crossover, estimated near
   1000-2000 tokens, so they cannot distinguish the two hypotheses.
 - No new A/B settings without a binding check.
+
+
+---
+
+# Phase C — decision, recorded
+
+Phase B ran in one 6.6-minute session. `results/prefill_sweep.json`.
+
+## B1 fit
+
+```
+step_ms = 21.13 + 0.40519 * chunk_tokens      R^2 = 0.998
+```
+
+| chunk | fixed `a` | compute `b*n` | compute share |
+|---|---|---|---|
+| 64 | 21.13 ms | 25.9 ms | 55% |
+| 128 | 21.13 ms | 51.9 ms | 71% |
+| 512 | 21.13 ms | 207.5 ms | 91% |
+
+`b` = 0.405 ms/token is **22.5x the 0.018 ms/token dense compute floor**.
+
+## Prediction scorecard
+
+| # | predicted | measured | verdict |
+|---|---|---|---|
+| 1 | `a` 25-35 ms | 21.13 ms | near miss, below range |
+| 2 | `b` 0.02-0.10 ms/token | **0.405** | **wrong by 4x — and it decides the fix** |
+| 3 | share 0.20 / 0.45-0.60 / >0.75 | 0.219 / 0.642 / 0.710 | right, right, slightly low |
+| 4 | `a` partly divisible when packed | 3.4x cheaper per unit work | right |
+| 5 | interruption much worse on chat | gap 17.2 → 36.0 → 63.3 ms | right |
+
+## Decision: kernel first, overriding the pre-registered tie-break
+
+The rule said "both thresholds met → do the graph work first, it is a smaller change and
+its gain is estimable." That tie-break was justified on **effort**, not on the coefficients,
+because `b` was expected to be small. It is not. Sizing both fixes at chunk 128 on long
+prompts, against a modelled 72.99 ms step:
+
+| fix | resulting step | cut |
+|---|---|---|
+| graph the prefill path (removes all of `a`) | 51.9 ms | 28.9% |
+| tiled kernel, `b` → 0.10 (5.6x floor) | 33.9 ms | 53.5% |
+| tiled kernel, `b` → 0.05 (2.8x floor) | 27.5 ms | 62.3% |
+| tiled kernel, `b` → 0.02 (1.1x floor) | 23.7 ms | 67.5% |
+
+Graphing caps the gain at 28.9% and cannot go further; the kernel is the majority of the
+cost at every chunk size above 64. **Overriding a pre-registered rule is exactly what
+pre-registration exists to prevent, so this override is recorded with its reasoning rather
+than applied silently:** the rule's ordering clause rested on an assumption about `b` that
+the data refuted, while its threshold clauses held.
+
+## B3 — the free win the script mis-read
+
+The verdict line asked whether packing four chunks into one step makes the *step* cheaper.
+It cannot: the step does four times the work. The right comparison is against four separate
+steps.
+
+| | cost |
+|---|---|
+| one packed step (4 chunks) | 55.37 ms |
+| four separate steps | 186.32 ms |
+| **amortisation** | **3.4x cheaper per unit work** |
+
+So `a` amortises strongly across chunks belonging to *different requests* in the same step,
+even though a larger chunk from *one* request costs linearly more. Those are different
+knobs and had been conflated: `prefill_chunk_size` bounds one request's slice,
+`max_prefill_tokens_per_iteration` bounds the step. B3 already shows the effect end to end
+at `chat`: prefill share 61.0% → 45.4%, expected gap 33.45 → 31.10 ms, TTFT 496 → 472 ms.
+The script has been corrected to report amortisation.
+
+## B2 — the short-prompt measurements understated everything
+
+| profile | mean prompt | decode step | prefill step | share | expected gap | TTFT |
+|---|---|---|---|---|---|---|
+| short | ~122 | 8.32 ms | 48.71 ms | 21.9% | 17.17 ms | 82 ms |
+| chat | ~656 | 11.91 ms | 49.57 ms | 64.2% | 36.01 ms | 656 ms |
+| long | ~1824 | 13.36 ms | 85.99 ms | 71.0% | 63.32 ms | **12467 ms** |
+
+The expected gap is 3.7x worse at realistic chat lengths than the ~122-token figure that
+every earlier prefill conclusion rested on. TTFT at `long` is **12.5 seconds**, which is
+the headline number for this engine on realistic prompts and was completely invisible
+before this sweep.
+
+**The decode path, by contrast, is in better shape at long context than at short.** At
+batch 7 with 1824 tokens the floor is 10.26 ms against a measured 13.36 ms — **1.30x**,
+against 1.64x at short context. Whatever fixed overhead remains in decode is amortised by
+the larger KV read. Decode is not the problem.
+
+## Phase D — what gets built
+
+1. **D1 (cheap, scheduling only).** Decouple `max_prefill_tokens_per_iteration` from
+   `prefill_chunk_size` and raise the budget. Both are already separate constructor
+   parameters that merely share a default, so this is a default change plus a sweep to pick
+   the value. Expected: the B3 effect, 3.4x amortisation of `a`.
+2. **D2 (the real fix).** Replace the per-token-GEMV chunk kernel with a tiled `tl.dot`
+   causal prefill over paged KV. Target `b` ≤ 0.05 ms/token (2.8x floor), predicted to cut
+   a chunk-128 step 62%.
+3. **D3.** Re-run the B1 sweep and check `b` against that target. A result outside it is
+   reported, not accepted.
+4. **D4.** Graph the prefill path only if `a` is still material after D1 and D2.
