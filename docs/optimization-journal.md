@@ -2198,3 +2198,25 @@ fits `b` on the Phase B axis — necessary because a 2x kernel win is a fraction
 disappears into step-level noise. `ab.py --setting prefill_kernel` measures the in-engine
 effect with the usual repeats and spread check. Target: `b` <= 0.05 ms/token against the old
 kernel's 0.405.
+
+
+### D2 first GPU run: the kernel did not compile
+
+Seventeen of eighteen tests failed with one error repeated: Triton cannot read a plain
+module-level Python global from inside a `@triton.jit` function. The masked-score sentinel
+was declared as a module constant and had to be a kernel-local (or a `tl.constexpr`
+instance). Nothing to do with the algorithm - the kernel never built.
+
+Reviewing the rest of the file for anything else unverifiable without a device turned up a
+second fault that would have failed immediately afterwards: the optional fp32 PV
+accumulation used a broadcast-and-reduce, `tl.sum(probs[:, :, None] * values[None, :, :])`,
+which materialises a `[BLOCK_M, BLOCK_N, HEAD_DIM]` intermediate - 2 MB per program at
+64x64x128. It is now a `tl.dot` on fp32 operands like the fast path.
+
+The process lesson is the useful part. There is no CUDA device in the authoring
+environment, so a Triton kernel ships compile-unchecked and the first GPU run *is* its
+compile gate. That is acceptable, but the failure mode is not: one compilation error
+produced seventeen identical tracebacks and buried the numerical questions the suite was
+written to answer. Every kernel test file now opens with a sub-second smoke test that
+builds and runs the kernel on a tiny input, so a build failure costs one test and the
+expensive correctness work is never reached on a kernel that cannot compile.

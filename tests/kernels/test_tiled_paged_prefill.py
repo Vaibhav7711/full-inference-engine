@@ -23,6 +23,33 @@ HEAD_DIM = 128
 BLOCK_SIZE = 16
 
 
+@cuda
+@requires_cuda
+def test_kernel_compiles_and_runs():
+    """Fast first gate: Triton compiles the kernel at all.
+
+    This exists because a compilation error otherwise surfaces identically in every test
+    in the file, burying whatever the real numerical question was under seventeen copies
+    of the same traceback. It also runs in a fraction of a second, so the expensive
+    correctness tests are never reached on a kernel that cannot build.
+    """
+    query, kp, vp, tables, start_t, chunk_t = _build(1, 16, 8, [0], [32], seed=0)
+    out = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t,
+                              block_m=16, block_n=32)
+    assert out.shape == query.shape
+    assert torch.isfinite(out).all()
+
+
+@cuda
+@requires_cuda
+def test_fp32_pv_variant_compiles():
+    """The alternate accumulation path compiles too; it is a separate specialisation."""
+    query, kp, vp, tables, start_t, chunk_t = _build(1, 16, 8, [0], [32], seed=0)
+    out = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t,
+                              block_m=16, block_n=32, pv_in_fp32=True)
+    assert torch.isfinite(out).all()
+
+
 def _build(batch, q_heads, kv_heads, starts, chunks, num_pages=512, seed=0, shuffle=True):
     """A paged KV pool with deliberately scattered page assignments."""
     generator = torch.Generator(device="cuda").manual_seed(seed)

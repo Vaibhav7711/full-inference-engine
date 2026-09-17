@@ -208,6 +208,11 @@ Found while checking for duplication:
 - Reference comparisons use a separately loaded, unpatched checkpoint under `stock_rope()`.
 - No performance claim without repeats, a single varied variable, and a spread check.
 - Choose the statistic before reading it: medians hide changes in population mix.
+- **Triton kernels cannot be validated before they reach the GPU.** There is no CUDA device
+  in the authoring environment, so a kernel ships compile-unchecked and the first GPU run
+  is its compile gate. Every kernel test file therefore opens with a sub-second smoke test
+  that just builds and runs the kernel, so a compilation error costs one failing test
+  rather than burying the real numerical questions under N copies of the same traceback.
 - **Plan the whole investigation before the first run.** Three GPU sessions were spent on
   questions whose answers could not change what gets built, or on treatments that could not
   take effect. A multi-question investigation gets a written plan with pre-registered

@@ -27,13 +27,6 @@ import torch
 import triton
 import triton.language as tl
 
-# Masked scores use a large finite sentinel rather than -inf. A padded query row has every
-# score masked, and -inf would make (m_i - m_new) evaluate to (-inf) - (-inf) = NaN in the
-# online-softmax rescale. With a finite sentinel the rescale is exp(0) = 1 and the row's
-# probabilities are forced to exact zeros below.
-_NEG = -1.0e30
-
-
 @triton.jit
 def _tiled_paged_prefill_kernel(
     q_ptr, kp_ptr, vp_ptr, out_ptr, bt_ptr, starts_ptr, chunks_ptr,
@@ -47,6 +40,13 @@ def _tiled_paged_prefill_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     PV_IN_FP32: tl.constexpr,
 ):
+    # Masked scores use a large finite sentinel rather than -inf. A padded query row has
+    # every score masked, and -inf would make (m_i - m_new) evaluate to (-inf) - (-inf) =
+    # NaN in the online-softmax rescale. With a finite sentinel the rescale is exp(0) = 1
+    # and the row's probabilities are forced to exact zeros below. Declared inside the
+    # kernel: Triton can only read module globals that are tl.constexpr instances.
+    neg = -1.0e30
+
     batch = tl.program_id(0)
     q_head = tl.program_id(1)
     tile = tl.program_id(2)
@@ -69,7 +69,7 @@ def _tiled_paged_prefill_kernel(
         mask=row_valid[:, None], other=0.0,
     )
 
-    m_i = tl.full([BLOCK_M], _NEG, dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], neg, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
@@ -101,14 +101,14 @@ def _tiled_paged_prefill_kernel(
             (positions[None, :] <= q_pos[:, None])
             & valid_n[None, :] & row_valid[:, None]
         )
-        scores = tl.where(visible, scores, _NEG)
+        scores = tl.where(visible, scores, neg)
 
         tile_max = tl.max(scores, axis=1)
         new_max = tl.maximum(m_i, tile_max)
         alpha = tl.exp(m_i - new_max)
         probs = tl.exp(scores - new_max[:, None])
         # Force exact zeros: with a finite sentinel the masked entries would otherwise
-        # carry exp(_NEG - new_max), which is tiny but not zero, and a fully masked row
+        # carry exp(neg - new_max), which is tiny but not zero, and a fully masked row
         # would accumulate weight it should not have.
         probs = tl.where(visible, probs, 0.0)
 
@@ -120,9 +120,11 @@ def _tiled_paged_prefill_kernel(
 
         acc = acc * alpha[:, None]
         if PV_IN_FP32:
-            # Matches the reference kernel's fp32 PV accumulation exactly, at the cost of
-            # running this matmul on CUDA cores instead of tensor cores.
-            acc += tl.sum(probs[:, :, None] * values.to(tl.float32)[None, :, :], axis=1)
+            # Matches the reference kernel's fp32 PV accumulation, at the cost of running
+            # this matmul on CUDA cores instead of tensor cores. A broadcast-and-reduce
+            # would materialise a [BLOCK_M, BLOCK_N, HEAD_DIM] intermediate - 2 MB per
+            # program at 64x64x128 - so it has to be a dot as well.
+            acc += tl.dot(probs, values.to(tl.float32))
         else:
             acc += tl.dot(probs.to(values.dtype), values)
         l_i = l_i * alpha + tl.sum(probs, axis=1)
