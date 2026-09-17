@@ -96,7 +96,9 @@ def main() -> int:
         repeated = run_repeated(make_engine, config, repeats=args.repeats, label=label)
         arms[label] = repeated
         for metric in ("latency.itl_p50", "latency.ttft_p50", "waste_ratio",
-                       "mean_decode_batch", "mean_context_tokens"):
+                       "mean_decode_batch", "mean_context_tokens",
+                       "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
+                       "step_timing.prefill_step_fraction"):
             stats = repeated.summary(metric)
             if stats.get("n"):
                 print(f"  {metric:24s} median={stats['median']:.3f}  "
@@ -123,7 +125,8 @@ def main() -> int:
     print(f"\n=== {labels[1]} vs {labels[0]} ===")
     comparison = {}
     for metric in ("latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
-                   "latency.ttft_p50", "waste_ratio"):
+                   "latency.ttft_p50", "step_timing.decode_step_p50_ms",
+                   "step_timing.prefill_step_p50_ms", "waste_ratio"):
         verdict = _verdict(baseline.summary(metric), variant.summary(metric))
         comparison[metric] = verdict
         print(f"  {metric:24s} {verdict}")

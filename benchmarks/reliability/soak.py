@@ -76,6 +76,12 @@ class SoakResult:
     # without these makes it uncomparable to any floor.
     mean_decode_batch: float = 0.0
     mean_context_tokens: float = 0.0
+    # Step-duration distributions split by what the step actually did. A decode-only step
+    # is the engine at its best; a step that also prefills is what every decoding sequence
+    # pays for someone else's prompt.
+    step_timing: dict[str, float] = field(default_factory=dict)
+    _decode_step_ms: list[float] = field(default_factory=list, repr=False)
+    _prefill_step_ms: list[float] = field(default_factory=list, repr=False)
     _batch_samples: list[float] = field(default_factory=list, repr=False)
     _context_samples: list[float] = field(default_factory=list, repr=False)
     prefix_cache: dict[str, float] = field(default_factory=dict)
@@ -118,6 +124,7 @@ class SoakResult:
             "peak_waiting": self.peak_waiting, "peak_active": self.peak_active,
             "mean_decode_batch": self.mean_decode_batch,
             "mean_context_tokens": self.mean_context_tokens,
+            "step_timing": self.step_timing,
             "prefix_cache": self.prefix_cache, "violations": self.violations,
             "coverage_gaps": self.coverage_gaps,
         }
@@ -300,7 +307,13 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
                 in_flight.pop(victim.request_id, None)
 
         if engine.has_unfinished_requests:
+            step_started = perf_counter()
             engine.step()
+            elapsed_ms = (perf_counter() - step_started) * 1000
+            if getattr(engine, "last_step_prefill_tokens", 0):
+                result._prefill_step_ms.append(elapsed_ms)
+            elif getattr(engine, "last_step_decode_rows", 0):
+                result._decode_step_ms.append(elapsed_ms)
             result.steps += 1
         elif not accepting:
             break
@@ -370,6 +383,23 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
         "stall_max": max(stalls) if stalls else 0.0,
     }
     result.delivered_tokens = sum(len(r.output_token_ids) for r in submitted)
+    decode_ms, prefill_ms = result._decode_step_ms, result._prefill_step_ms
+    total_steps = len(decode_ms) + len(prefill_ms)
+    result.step_timing = {
+        "decode_only_steps": len(decode_ms),
+        "prefill_steps": len(prefill_ms),
+        "prefill_step_fraction": len(prefill_ms) / total_steps if total_steps else 0.0,
+        "decode_step_p50_ms": _percentile(decode_ms, 0.50),
+        "decode_step_p99_ms": _percentile(decode_ms, 0.99),
+        "prefill_step_p50_ms": _percentile(prefill_ms, 0.50),
+        "prefill_step_p99_ms": _percentile(prefill_ms, 0.99),
+        # How much longer a sequence waits for its next token when the step it is riding
+        # also carries someone else's prefill.
+        "prefill_penalty_p50_ms": (
+            _percentile(prefill_ms, 0.50) - _percentile(decode_ms, 0.50)
+            if decode_ms and prefill_ms else 0.0
+        ),
+    }
     result.recompute = dict(engine.recompute_report())
     result.prefix_cache = {
         k: v for k, v in engine.prefix_cache.snapshot().items()
@@ -439,6 +469,8 @@ class RepeatedResult:
             "latency.ttft_p50",
             "latency.total_queue_p50", "waste_ratio", "delivered_tokens",
             "peak_kv_utilization", "mean_decode_batch", "mean_context_tokens",
+            "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
+            "step_timing.prefill_step_fraction", "step_timing.prefill_penalty_p50_ms",
         ]
         return {
             "label": self.label, "runs": len(self.runs), "ok": self.ok,

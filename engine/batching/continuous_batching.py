@@ -236,6 +236,12 @@ class ContinuousBatchingEngine:
         cfg = model.config
         self.num_layers = cfg.num_hidden_layers
         self.max_model_len = getattr(cfg, "max_position_embeddings", None)
+        # Step accounting: a prefill-carrying iteration and a decode-only iteration cost
+        # very different amounts, and mixing them makes any latency percentile a blend.
+        self.prefill_steps = 0
+        self.decode_only_steps = 0
+        self.last_step_prefill_tokens = 0
+        self.last_step_decode_rows = 0
         self.num_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
         self.num_q_heads = cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
@@ -496,6 +502,8 @@ class ContinuousBatchingEngine:
             "prefix_cache_blocks": int(cache.get("cached_blocks", 0)),
             "prefix_cache_hits": int(cache.get("hits", 0)),
             "prefix_cache_misses": int(cache.get("lookups", 0)) - int(cache.get("hits", 0)),
+            "prefill_steps": self.prefill_steps,
+            "decode_only_steps": self.decode_only_steps,
             "recomputed_tokens_total": self.scheduler.recomputed_tokens_total,
             "recompute_ms_total": self.scheduler.recompute_ns_total / 1_000_000,
         }
@@ -760,7 +768,13 @@ class ContinuousBatchingEngine:
 
     @torch.inference_mode()
     def step(self) -> None:
-        """Run one decode-first scheduling iteration under the prefill budget."""
+        """Run one decode-first scheduling iteration under the prefill budget.
+
+        A step that also prefills costs every decoding sequence a longer gap between its
+        tokens, because the prefill forward runs in the same iteration. The counters and
+        `last_step_prefill_tokens` let a benchmark separate those gaps from pure decode
+        gaps instead of inferring the split from a skewed distribution.
+        """
         decoding = [
             request for request in self.scheduler.active.values()
             if request.state is RequestState.DECODING
@@ -772,8 +786,13 @@ class ContinuousBatchingEngine:
             if request.remaining_prefill_tokens == 0:
                 self._complete_prefill(request, request.cached_next_token_id)
         plans = self._plan_prefill_chunks()
+        self.last_step_prefill_tokens = sum(count for _, count in plans)
+        self.last_step_decode_rows = len(decoding)
         if plans:
             self.prefill_chunks(plans)
+            self.prefill_steps += 1
+        elif decoding:
+            self.decode_only_steps += 1
 
     # ------------------------------------------------------------------
     # D2: one batched decode step over all active sequences

@@ -550,6 +550,24 @@ record before it is considered complete.
   Both are printed in every report.
 
 
+### DD-039 — Time steps by what they did, not just how long they took
+
+- **Decision:** `step()` records whether an iteration carried prefill
+  (`last_step_prefill_tokens`, `prefill_steps`, `decode_only_steps`), and the soak times
+  each call and reports decode-only and prefill-carrying step distributions separately,
+  plus `prefill_penalty_p50_ms`.
+- **Why:** a latency percentile over token gaps blends two populations with very different
+  costs. The engine's decode step and the interruption a sequence suffers when its step
+  also prefills someone else's prompt are different quantities, and optimising against
+  their blend optimises against neither. The percentile gradient (-75% at p50, -35% at p99,
+  unresolved at p999) strongly suggested the tail is prefill, but suggestion is not
+  measurement.
+- **Code:** `engine/batching/continuous_batching.py`, `benchmarks/reliability/soak.py`,
+  `benchmarks/reliability/ab.py`.
+- **Tradeoff:** one `perf_counter` pair per step in the benchmark harness only; the engine
+  counters are two integer assignments and are always on.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

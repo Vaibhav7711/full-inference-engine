@@ -1880,3 +1880,58 @@ tail number into a preemption detector; that stall is already reported separatel
 `stall_p99`, and `itl_p99_including_preempted` keeps the combined view. `itl_samples` is
 reported so the sample count behind a percentile is visible, and `itl_request_mean_p50`
 retains continuity with earlier runs.
+
+
+## Revised target: the decode step is 1.64x the memory floor
+
+Third A/B, with `itl_p50` now taken over individual token gaps rather than per-request
+means. The headline number moved a long way, and in the right direction.
+
+| arm | decode batch | context | floor | ITL p50 | multiple | overhead |
+|---|---|---|---|---|---|---|
+| graphs off | 6.9 | 137 | 5.02 ms | 32.98 ms | 6.6x | 27.96 ms |
+| graphs on | 7.5 | 124 | 5.02 ms | **8.24 ms** | **1.64x** | **3.22 ms** |
+
+CUDA graphs remove 24.74 of 27.96 ms of overhead above the floor: **88%**, not the 72%
+computed from the old estimator. A pure decode step now costs only 64% more than the bytes
+it must move.
+
+Every earlier figure in this section is superseded. The chain of corrections, kept because
+each was a different kind of error:
+
+1. **3.9x above a 4 ms floor** - spec bandwidth quoted as achieved, KV traffic omitted.
+2. **2.4x, 9.08 ms headroom** - measured bandwidth, but a guessed 512-token context that
+   inflated the floor 28%.
+3. **3.0x, 10.17 ms headroom** - real operating point, but ITL percentiled over
+   per-request means, which inflated the measurement 84%.
+4. **1.64x, 3.22 ms headroom** - percentiles over individual token gaps.
+
+Only the last is defensible. The engine's decode path is in far better shape than any
+earlier number implied.
+
+### The percentile gradient points at prefill
+
+| percentile | graphs on vs off | spread | verdict |
+|---|---|---|---|
+| p50 | -75.0% | 6.9% | real |
+| p99 | -35.0% | 25.7% | real |
+| p999 | -2.4% | 64.2% | unresolved |
+
+Graphs help the median enormously, the tail moderately, and the extreme tail not at all.
+That is exactly the signature of a tail composed of work graphs do not capture: the decode
+path is graphed, prefill is not. So the deeper into the tail, the more of what is being
+measured is a prefill forward interrupting decode, and the less a decode-path optimisation
+can do about it.
+
+That also explains the 84% gap between the median gap (8.24 ms) and the median
+per-request mean (15.19 ms). Most gaps are pure decode steps; a minority ride a step that
+also prefills, and those drag every average up.
+
+**This is inference from a pattern, not a measurement**, so it is now instrumented rather
+than asserted. `ContinuousBatchingEngine` counts `prefill_steps` and `decode_only_steps`
+and exposes `last_step_prefill_tokens`; the soak times every `step()` call and reports
+`decode_step_p50_ms`, `prefill_step_p50_ms`, the fraction of steps that carry prefill, and
+`prefill_penalty_p50_ms` - how much longer a sequence waits for its next token when the
+step it is riding also carries someone else's prompt. If the pattern holds, the penalty is
+the number that justifies the prefill work in items 2 and 4; if it does not, something else
+is producing the tail and that is worth knowing before optimising the wrong thing.

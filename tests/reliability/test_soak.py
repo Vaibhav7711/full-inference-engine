@@ -298,3 +298,34 @@ def test_itl_percentiles_are_taken_over_token_gaps_not_request_means():
     assert latency["itl_p50"] > 0
     assert latency["itl_p99"] >= latency["itl_p50"]
     assert latency["itl_p999"] >= latency["itl_p99"]
+
+
+@cuda
+@requires_cuda
+def test_prefill_steps_are_measured_separately_from_decode_steps():
+    """Measure the prefill interruption instead of inferring it from a skewed tail.
+
+    A step that also prefills advances every decoding sequence *and* runs a prefill
+    forward, so each of those sequences waits longer for its next token. Percentiles over
+    token gaps blend the two; this separates them.
+    """
+    result = run_soak(
+        _engine(num_blocks=160, max_active=8, cuda_graph_batch_sizes=(1, 2, 4, 8)),
+        SoakConfig(duration_s=8.0, concurrency=8, seed=40, cancel_probability=0.0,
+                   max_new_tokens=(24, 64)),
+    )
+    _report("step-kinds", result)
+    timing = result.step_timing
+    print(f"  decode-only steps={timing['decode_only_steps']} "
+          f"p50={timing['decode_step_p50_ms']:.2f}ms p99={timing['decode_step_p99_ms']:.2f}ms")
+    print(f"  prefill steps={timing['prefill_steps']} "
+          f"({timing['prefill_step_fraction']:.1%}) "
+          f"p50={timing['prefill_step_p50_ms']:.2f}ms p99={timing['prefill_step_p99_ms']:.2f}ms")
+    print(f"  prefill penalty p50={timing['prefill_penalty_p50_ms']:.2f}ms")
+    assert result.violations == []
+    assert timing["decode_only_steps"] > 0 and timing["prefill_steps"] > 0
+    # A prefill-carrying step does strictly more work than a decode-only step.
+    assert timing["prefill_step_p50_ms"] > timing["decode_step_p50_ms"]
+    # The decode-only p50 is the engine's true per-step cost; it must be close to the
+    # token-gap median, which is what a caller sees on an uninterrupted step.
+    assert timing["decode_step_p50_ms"] == pytest.approx(result.latency["itl_p50"], rel=0.5)
