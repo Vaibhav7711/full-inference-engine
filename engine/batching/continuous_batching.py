@@ -242,6 +242,14 @@ class ContinuousBatchingEngine:
         self.decode_only_steps = 0
         self.last_step_prefill_tokens = 0
         self.last_step_decode_rows = 0
+        # Which prefill implementation ran. The SDPA fast path and the resumable chunk
+        # path have different cost structures, so a measured prefill cost cannot be
+        # attributed to either without knowing which one produced it.
+        self.prefill_sdpa_calls = 0
+        self.prefill_chunked_calls = 0
+        self.prefill_sdpa_tokens = 0
+        self.prefill_chunked_tokens = 0
+        self.last_step_prefill_path = ""
         self.num_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
         self.num_q_heads = cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
@@ -504,6 +512,10 @@ class ContinuousBatchingEngine:
             "prefix_cache_misses": int(cache.get("lookups", 0)) - int(cache.get("hits", 0)),
             "prefill_steps": self.prefill_steps,
             "decode_only_steps": self.decode_only_steps,
+            "prefill_sdpa_calls": self.prefill_sdpa_calls,
+            "prefill_chunked_calls": self.prefill_chunked_calls,
+            "prefill_sdpa_tokens": self.prefill_sdpa_tokens,
+            "prefill_chunked_tokens": self.prefill_chunked_tokens,
             "recomputed_tokens_total": self.scheduler.recomputed_tokens_total,
             "recompute_ms_total": self.scheduler.recompute_ns_total / 1_000_000,
         }
@@ -669,8 +681,14 @@ class ContinuousBatchingEngine:
             request.prefilled_token_count == 0 and count == request.prefill_token_count
             for request, count in plans
         ):
+            self.prefill_sdpa_calls += 1
+            self.prefill_sdpa_tokens += sum(count for _, count in plans)
+            self.last_step_prefill_path = "sdpa"
             self.prefill_batch([request for request, _ in plans])
             return
+        self.prefill_chunked_calls += 1
+        self.prefill_chunked_tokens += sum(count for _, count in plans)
+        self.last_step_prefill_path = "chunked"
 
         viable_plans = []
         for request, count in plans:
@@ -788,6 +806,7 @@ class ContinuousBatchingEngine:
         plans = self._plan_prefill_chunks()
         self.last_step_prefill_tokens = sum(count for _, count in plans)
         self.last_step_decode_rows = len(decoding)
+        self.last_step_prefill_path = ""
         if plans:
             self.prefill_chunks(plans)
             self.prefill_steps += 1

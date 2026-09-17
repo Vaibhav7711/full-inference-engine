@@ -2087,3 +2087,42 @@ consequences:
 
 `ab.py` gains `--prompt-profile short|chat|long` (mean ~122, ~656, ~1824 tokens). Every
 prefill conclusion should be re-established on `chat` before any of it guides design.
+
+
+## Prefill investigation: planned as one sweep instead of a chain of A/Bs
+
+Four GPU sessions went into the prefill question and three produced nothing usable: a
+CUDA-graph comparison whose p999 arm ran identical un-graphed prefill on both sides, a
+chunk 512-vs-128 comparison where both arms fit every prompt in a single chunk, and a first
+chunk A/B whose 49% regression was invisible to the statistic being read. Each fault was
+visible before the run. The cause was procedural rather than technical: each session was
+designed from the previous session's result, so no design ever got reviewed against the
+whole question.
+
+`docs/experiment-plan-prefill.md` pre-registers the rest of the investigation - the model
+being fitted, three sweeps, predictions written before the data, and a decision rule fixed
+in advance. `benchmarks/reliability/sweep.py` runs the whole Phase B matrix in one session
+against one model load.
+
+**The model.** A prefill-carrying step is assumed to cost `a + b * chunk_tokens`, where `a`
+is per-invocation cost (kernel launches over 28 layers, metadata staging, the decode the
+step also performs) and `b` is marginal cost per prefill token. Fitting a line across four
+chunk sizes reads off both, instead of asking a binary question that can return null for
+uninteresting reasons. Reference: the dense compute floor is ~0.018 ms/token at the T4's
+~65 TFLOPS, so `b` near that means the kernel is near roofline and `b` several times that
+means the kernel is the problem.
+
+**Why it binds.** B1 sweeps chunk 64/128/256/512 on the `long` profile (~1824-token
+prompts), which needs 29/15/8/4 chunks respectively - every arm is a distinct treatment,
+checked before the run rather than discovered after.
+
+**Decision rule, fixed in advance.** `a` > 20 ms with `b` < 0.05 means launch-bound: pad
+prefill to bucketed shapes and capture it in CUDA graphs, as decode already is. `b` > 0.1
+ms/token means the chunk kernel is off the roofline: replace the per-token GEMV with a
+tiled causal prefill. Both means do the graph work first, being smaller and with a gain
+estimable from the decode precedent. Neither means profile before designing anything.
+
+Also instrumented: `prefill_sdpa_calls` / `prefill_chunked_calls` and their token counts,
+because the engine keeps an SDPA fast path for batches of complete fresh prompts and a
+resumable chunk path for everything else. A measured prefill cost cannot be attributed to
+an implementation without knowing which one ran, and until now it was assumed.

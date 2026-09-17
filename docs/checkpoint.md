@@ -113,7 +113,7 @@ A/B comparison list for that reason.
 | Measured roofline | **accepted** |
 | Prefill chunk A/B (128 vs 32) | **accepted**: cost is fixed per invocation |
 | Prefill chunk A/B (128 vs 512) | **void**: non-binding, both arms fit a ~122-token prompt in one chunk |
-| Prefill A/B on realistic prompt lengths | **next** |
+| Prefill investigation (Phase B sweep) | **next** — pre-registered in `docs/experiment-plan-prefill.md`, one session |
 
 ---
 
@@ -205,3 +205,8 @@ Found while checking for duplication:
 - Reference comparisons use a separately loaded, unpatched checkpoint under `stock_rope()`.
 - No performance claim without repeats, a single varied variable, and a spread check.
 - Choose the statistic before reading it: medians hide changes in population mix.
+- **Plan the whole investigation before the first run.** Three GPU sessions were spent on
+  questions whose answers could not change what gets built, or on treatments that could not
+  take effect. A multi-question investigation gets a written plan with pre-registered
+  predictions and a fixed decision rule (`docs/experiment-plan-prefill.md` is the model),
+  and runs as one sweep rather than a chain of A/Bs.
