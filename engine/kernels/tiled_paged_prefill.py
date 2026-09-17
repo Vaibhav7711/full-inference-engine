@@ -28,6 +28,8 @@ import triton
 import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
+from engine.kernels.device import prefill_tile_defaults
+
 @triton.jit
 def _tiled_paged_prefill_kernel(
     q_ptr, kp_ptr, vp_ptr, out_ptr, bt_ptr, starts_ptr, chunks_ptr,
@@ -39,7 +41,7 @@ def _tiled_paged_prefill_kernel(
     num_q_heads, num_kv_heads, scale, max_blocks, num_pool_blocks, query_len,
     BLOCK_SIZE: tl.constexpr, HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    PV_IN_FP32: tl.constexpr,
+    PV_IN_FP32: tl.constexpr, TRANSPOSED_K_LOAD: tl.constexpr,
 ):
     # Masked scores use a large finite sentinel rather than -inf. A padded query row has
     # every score masked, and -inf would make (m_i - m_new) evaluate to (-inf) - (-inf) =
@@ -98,13 +100,25 @@ def _tiled_paged_prefill_kernel(
         physical = tl.load(table + logical * stride_btl, mask=table_ok, other=-1)
         valid_n = table_ok & (physical >= 0) & (physical < num_pool_blocks)
 
-        kv_offset = (
-            physical[:, None] * stride_kb + offsets[:, None] * stride_ks
-            + kv_head * stride_kh + offs_d[None, :] * stride_kd
-        )
-        keys = tl.load(kp_ptr + kv_offset, mask=valid_n[:, None], other=0.0)
-
-        scores = tl.dot(q, tl.trans(keys)) * scale
+        # Two ways to feed K to `tl.dot`, with opposite costs, so both are measurable.
+        # KV is stored [page, slot, head, dim] with dim contiguous, so a [BLOCK_N,
+        # HEAD_DIM] load is coalesced and a [HEAD_DIM, BLOCK_N] one is strided by
+        # stride_ks. Contiguous FlashAttention builds its pointer block pre-transposed for
+        # free; a paged gather cannot, so the transpose is paid on one side or the other.
+        if TRANSPOSED_K_LOAD:
+            kt_offset = (
+                physical[None, :] * stride_kb + offsets[None, :] * stride_ks
+                + kv_head * stride_kh + offs_d[:, None] * stride_kd
+            )
+            keys = tl.load(kp_ptr + kt_offset, mask=valid_n[None, :], other=0.0)
+            scores = tl.dot(q, keys) * scale
+        else:
+            kv_offset = (
+                physical[:, None] * stride_kb + offsets[:, None] * stride_ks
+                + kv_head * stride_kh + offs_d[None, :] * stride_kd
+            )
+            keys = tl.load(kp_ptr + kv_offset, mask=valid_n[:, None], other=0.0)
+            scores = tl.dot(q, tl.trans(keys)) * scale
         visible = (
             (positions[None, :] <= q_pos[:, None])
             & valid_n[None, :] & row_valid[:, None]
@@ -156,11 +170,12 @@ def tiled_paged_prefill(
     chunk_lens: torch.Tensor,
     *,
     scale: float | None = None,
-    block_m: int = 64,
-    block_n: int = 64,
-    num_warps: int = 4,
-    num_stages: int = 2,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     pv_in_fp32: bool = False,
+    transposed_k_load: bool = False,
 ) -> torch.Tensor:
     """Attend each padded query chunk to its paged prefix plus its own causal region.
 
@@ -178,6 +193,15 @@ def tiled_paged_prefill(
         raise ValueError("block tables must have shape [B,max_blocks]")
     if start_positions.shape != (batch,) or chunk_lens.shape != (batch,):
         raise ValueError("start positions and chunk lengths must have shape [B]")
+    # Launch parameters come from the device and the workload, not constants. Warps must
+    # scale with the accumulator and BLOCK_M with the query length, or the grid collapses
+    # - see engine/kernels/device.py.
+    defaults = prefill_tile_defaults(head_dim=head_dim, query_len=query_len)
+    stages_were_chosen_here = num_stages is None
+    block_m = defaults["block_m"] if block_m is None else block_m
+    block_n = defaults["block_n"] if block_n is None else block_n
+    num_warps = defaults["num_warps"] if num_warps is None else num_warps
+    num_stages = defaults["num_stages"] if num_stages is None else num_stages
     if block_m < 16 or block_n < 16:
         raise ValueError("tl.dot requires tiles of at least 16 in each dimension")
     if scale is None:
@@ -191,27 +215,46 @@ def tiled_paged_prefill(
     chunk_lens = chunk_lens.contiguous().to(dtype=torch.int32, device=query.device)
     out = torch.empty_like(query)
     grid = (batch, q_heads, triton.cdiv(query_len, block_m))
-    try:
-        _tiled_paged_prefill_kernel[grid](
-            query, key_pages, value_pages, out, block_tables, start_positions, chunk_lens,
-            *query.stride(), *key_pages.stride(), *value_pages.stride(), *out.stride(),
-            *block_tables.stride(), q_heads, kv_heads, scale,
-            block_tables.shape[1], key_pages.shape[0], query_len,
-            BLOCK_SIZE=block_size, HEAD_DIM=head_dim,
-            BLOCK_M=block_m, BLOCK_N=block_n, PV_IN_FP32=pv_in_fp32,
-            num_warps=num_warps, num_stages=num_stages,
-        )
-    except OutOfResources as error:
-        # Q, K and V tiles all pass through shared memory - mma.sync reads its operands
-        # from registers filled by ldmatrix out of smem - and K/V are multi-buffered for
-        # the pipelined loop. How Triton actually schedules that varies by shape, so the
-        # requirement is not predictable from the tile dimensions alone; it is reported
-        # here rather than estimated.
-        raise OutOfResources(
-            getattr(error, "required", 0), getattr(error, "limit", 0),
-            f"shared memory for BLOCK_M={block_m}, BLOCK_N={block_n}, "
-            f"HEAD_DIM={head_dim}, num_stages={num_stages}"
-            f"{', fp32 PV (doubles the V tile)' if pv_in_fp32 else ''}. "
-            f"Halve BLOCK_M or BLOCK_N, or drop num_stages to 1",
-        ) from error
+    # Shallower pipelining always needs less shared memory, so stepping down terminates.
+    # Only a depth this module chose is stepped; an explicit one is honoured or reported.
+    attempts = list(range(num_stages, 0, -1)) if stages_were_chosen_here else [num_stages]
+    for index, stages in enumerate(attempts):
+        try:
+            return _launch(
+                grid, query, key_pages, value_pages, out, block_tables, start_positions,
+                chunk_lens, q_heads, kv_heads, scale, block_size, head_dim, query_len,
+                block_m, block_n, num_warps, stages, pv_in_fp32, transposed_k_load,
+            )
+        except OutOfResources as error:
+            if index + 1 < len(attempts):
+                continue
+            # Q, K and V all pass through shared memory - mma.sync reads its operands from
+            # registers filled by ldmatrix out of smem - and K/V are multi-buffered. How
+            # Triton schedules that varies by shape, so the requirement is reported here
+            # rather than estimated: an upper bound reproduces some shapes exactly and
+            # mispredicts others.
+            raise OutOfResources(
+                getattr(error, "required", 0), getattr(error, "limit", 0),
+                f"shared memory for BLOCK_M={block_m}, BLOCK_N={block_n}, "
+                f"HEAD_DIM={head_dim}, num_stages={stages}"
+                f"{', fp32 PV (doubles the V tile)' if pv_in_fp32 else ''}. "
+                f"Halve BLOCK_M or BLOCK_N",
+            ) from error
+    raise AssertionError("unreachable: the attempt list is never empty")
+
+
+def _launch(grid, query, key_pages, value_pages, out, block_tables, start_positions,
+            chunk_lens, q_heads, kv_heads, scale, block_size, head_dim, query_len,
+            block_m, block_n, num_warps, num_stages, pv_in_fp32, transposed_k_load):
+    """One launch at a fixed pipeline depth, so the caller can step the depth down."""
+    _tiled_paged_prefill_kernel[grid](
+        query, key_pages, value_pages, out, block_tables, start_positions, chunk_lens,
+        *query.stride(), *key_pages.stride(), *value_pages.stride(), *out.stride(),
+        *block_tables.stride(), q_heads, kv_heads, scale,
+        block_tables.shape[1], key_pages.shape[0], query_len,
+        BLOCK_SIZE=block_size, HEAD_DIM=head_dim,
+        BLOCK_M=block_m, BLOCK_N=block_n, PV_IN_FP32=pv_in_fp32,
+        TRANSPOSED_K_LOAD=transposed_k_load,
+        num_warps=num_warps, num_stages=num_stages,
+    )
     return out

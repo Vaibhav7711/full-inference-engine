@@ -117,7 +117,7 @@ A/B comparison list for that reason.
 | Prefill chunk A/B (128 vs 512) | **void**: non-binding, both arms fit a ~122-token prompt in one chunk |
 | Prefill investigation (Phase B sweep) | **accepted**: `step_ms = 21.13 + 0.405*chunk`, R²=0.998 |
 | Phase D1 — decouple prefill budget from chunk size | **next**, scheduling only |
-| Phase D2 — tiled causal prefill kernel | **built**, pending GPU gate |
+| Phase D2 — tiled causal prefill kernel | **failed**: 0.3x, 0.2% of tensor-core peak. Grid collapses to 64 blocks on 40 SMs at chunk 64 — tiling the query dimension trades away the parallelism it was meant to buy. Diagnosing with spills, occupancy and an SDPA upper bound. |
 
 ---
 
@@ -208,6 +208,10 @@ Found while checking for duplication:
 - Reference comparisons use a separately loaded, unpatched checkpoint under `stock_rope()`.
 - No performance claim without repeats, a single varied variable, and a spread check.
 - Choose the statistic before reading it: medians hide changes in population mix.
+- **Everything checkable without a GPU is checked without a GPU.** Launch grids, register
+  budgets, shared-memory bounds, tile feasibility and whether an experiment's treatment
+  binds are arithmetic, not hardware questions.
+  `tests/kernels/test_kernel_static_checks.py` is the first stage of `scripts/verify.py`.
 - **Triton kernels cannot be validated before they reach the GPU.** There is no CUDA device
   in the authoring environment, so a kernel ships compile-unchecked and the first GPU run
   is its compile gate. Every kernel test file therefore opens with a sub-second smoke test

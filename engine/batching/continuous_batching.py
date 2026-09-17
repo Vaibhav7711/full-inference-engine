@@ -80,8 +80,8 @@ class _PrefillContext:
     # switchable so the two can be A/B'd in-engine and the old path stays available until
     # the new one has a token-identity gate behind it.
     tiled_prefill: bool = True
-    prefill_block_m: int = 64
-    prefill_block_n: int = 64
+    prefill_block_m: int | None = None
+    prefill_block_n: int | None = None
 
 
 _PREFILL_CTX: Optional[_PrefillContext] = None
@@ -213,8 +213,8 @@ class ContinuousBatchingEngine:
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
                  tiled_prefill: bool = True,
-                 prefill_block_m: int = 64,
-                 prefill_block_n: int = 64,
+                 prefill_block_m: int | None = None,
+                 prefill_block_n: int | None = None,
                  max_prefill_tokens_per_iteration: int = 128,
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,

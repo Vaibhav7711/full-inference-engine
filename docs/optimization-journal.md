@@ -2288,3 +2288,75 @@ than tile size.
 
 **Usable tile space on sm_75 at HEAD_DIM=128:** `BLOCK_M <= 64`, `BLOCK_N <= 64`. The
 default 64x64 sits at the edge of what fits.
+
+
+## D2 result: the tiled kernel is 3x SLOWER, and it is broken rather than badly suited
+
+Colab T4, batch 4, 16 q heads, 8 kv heads, prefix 896, one layer:
+
+| chunk | per-token kernel | tiled kernel | speedup |
+|---|---|---|---|
+| 64 | 5.429 ms | 19.104 ms | **0.3x** |
+| 128 | 11.423 ms | 37.905 ms | 0.3x |
+| 256 | 25.576 ms | 79.081 ms | 0.3x |
+| 512 | 57.905 ms | 177.397 ms | 0.3x |
+
+Fitted marginal cost went the wrong way: `b` = 0.83 ms/token for the old kernel and **2.49
+for the new one**, 138x the compute floor against 46x. The Phase D2 target of `b <= 0.05`
+is missed by fifty times.
+
+Both kernels do the same total work, so putting each against its own hardware peak settles
+what kind of failure this is:
+
+| | FLOPs | time | achieved | share of that hardware's peak |
+|---|---|---|---|---|
+| per-token, CUDA cores | 1.88 GFLOP | 5.43 ms | 0.35 TFLOPS | **4.3%** of ~8.1 TFLOPS |
+| tiled, tensor cores | 2.01 GFLOP | 19.10 ms | 0.11 TFLOPS | **0.2%** of ~65 TFLOPS |
+
+The tiled kernel uses hardware 8x faster and gets 3.5x less done - roughly 28x off. A
+correct FlashAttention-style kernel beats naive attention on every GPU it has been measured
+on, so this is an implementation defect, not evidence that tiling is unsuited here. An
+earlier draft of this entry blamed L2 residency; that was rationalisation and is withdrawn.
+
+### The largest cause was computable before the kernel was written
+
+The grid is `(batch, heads, ceil(query_len / BLOCK_M))`. At the benchmark's chunk of 64
+with `BLOCK_M=64` that is `4 x 16 x 1 = 64` blocks on 40 SMs: most SMs get one block of 128
+threads against 1024 of capacity, roughly 12% occupancy and nothing to hide memory latency
+behind. The per-token kernel launches 4,096 blocks, 102 per SM.
+
+This is structural to *chunked* prefill and is exactly what FlashAttention's design assumes
+away. FA takes its parallelism from long query sequences; a prefill chunk is 64-512 tokens,
+so a large `BLOCK_M` can collapse the grid to a single tile per (row, head). **Tiling the
+query dimension trades away the parallelism that was paying for the redundant reads.** The
+design was imported without checking that its central assumption held.
+
+It is not the whole story - at chunk 512 the grid is 512 blocks, 12.8 per SM, and the
+kernel is still 3x slower - so the remainder is now measured rather than guessed.
+
+### One suspect eliminated with no run
+
+The benchmark builds page tables with `torch.arange`, so pages are already sequential and
+gather addresses contiguous. Coalescing of the page lookup is not implicated.
+
+### Three defaults corrected, all off-GPU arithmetic
+
+- **`num_warps` scales with the accumulator.** `acc[BLOCK_M, head_dim]` fp32 plus the score
+  tile is 48 KB at 64x128; across 4 warps that is ~96 registers per thread before any
+  temporaries. 8 warps halves it.
+- **`BLOCK_M` scales with query length**, 32 below 256 tokens, so the grid keeps enough
+  tiles to fill the device.
+- **The K-load layout is a swept flag, not a hunch.** KV is stored `[page, slot, head, dim]`
+  with `dim` contiguous, so a `[BLOCK_N, HEAD_DIM]` load is coalesced and a
+  `[HEAD_DIM, BLOCK_N]` one is strided. Contiguous FlashAttention pre-transposes its
+  pointer block for free; a paged gather cannot, so the transpose is paid on one side or
+  the other and which is cheaper is empirical.
+
+### Instrumentation, so the next run decides rather than another argument
+
+A dense SDPA reference is added as an upper bound - the same attention on pages gathered
+into contiguous tensors, gather outside the timed region. Any Triton kernel far below that
+is losing to its own implementation rather than to the problem. The sweep reports Triton's
+`n_regs`, `n_spills` and shared bytes per variant, covers `num_stages` and the K layout,
+prints the grid size and blocks per SM, and states plainly when no configuration beats the
+kernel it replaces - in which case the honest outcome is to delete it rather than tune it.

@@ -179,8 +179,12 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("roofline requires CUDA")
         return 1
-    device_name = torch.cuda.get_device_name(0)
-    print(f"device: {device_name}")
+    from engine.kernels.device import current_device
+
+    profile = current_device()
+    device_name = profile.name if profile else torch.cuda.get_device_name(0)
+    print(f"device: {profile}")
+    print("  every number below is specific to this device and must not be carried over")
 
     probes = measure_bandwidth(args.probe_mb)
     print("\nachieved bandwidth")
@@ -228,6 +232,7 @@ def main() -> int:
 
     payload = {
         "device": device_name,
+        "device_profile": profile.to_dict() if profile else None,
         "probes": [{**asdict(p), "gb_per_s": p.gb_per_s} for p in probes],
         "achieved_gb_per_s": achieved,
         "weight_bytes": asdict(weights),
