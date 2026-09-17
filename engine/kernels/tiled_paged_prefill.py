@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 @triton.jit
 def _tiled_paged_prefill_kernel(
@@ -190,13 +191,27 @@ def tiled_paged_prefill(
     chunk_lens = chunk_lens.contiguous().to(dtype=torch.int32, device=query.device)
     out = torch.empty_like(query)
     grid = (batch, q_heads, triton.cdiv(query_len, block_m))
-    _tiled_paged_prefill_kernel[grid](
-        query, key_pages, value_pages, out, block_tables, start_positions, chunk_lens,
-        *query.stride(), *key_pages.stride(), *value_pages.stride(), *out.stride(),
-        *block_tables.stride(), q_heads, kv_heads, scale,
-        block_tables.shape[1], key_pages.shape[0], query_len,
-        BLOCK_SIZE=block_size, HEAD_DIM=head_dim,
-        BLOCK_M=block_m, BLOCK_N=block_n, PV_IN_FP32=pv_in_fp32,
-        num_warps=num_warps, num_stages=num_stages,
-    )
+    try:
+        _tiled_paged_prefill_kernel[grid](
+            query, key_pages, value_pages, out, block_tables, start_positions, chunk_lens,
+            *query.stride(), *key_pages.stride(), *value_pages.stride(), *out.stride(),
+            *block_tables.stride(), q_heads, kv_heads, scale,
+            block_tables.shape[1], key_pages.shape[0], query_len,
+            BLOCK_SIZE=block_size, HEAD_DIM=head_dim,
+            BLOCK_M=block_m, BLOCK_N=block_n, PV_IN_FP32=pv_in_fp32,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+    except OutOfResources as error:
+        # Q, K and V tiles all pass through shared memory - mma.sync reads its operands
+        # from registers filled by ldmatrix out of smem - and K/V are multi-buffered for
+        # the pipelined loop. How Triton actually schedules that varies by shape, so the
+        # requirement is not predictable from the tile dimensions alone; it is reported
+        # here rather than estimated.
+        raise OutOfResources(
+            getattr(error, "required", 0), getattr(error, "limit", 0),
+            f"shared memory for BLOCK_M={block_m}, BLOCK_N={block_n}, "
+            f"HEAD_DIM={head_dim}, num_stages={num_stages}"
+            f"{', fp32 PV (doubles the V tile)' if pv_in_fp32 else ''}. "
+            f"Halve BLOCK_M or BLOCK_N, or drop num_stages to 1",
+        ) from error
     return out

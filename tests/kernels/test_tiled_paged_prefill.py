@@ -13,6 +13,8 @@ import math
 import pytest
 import torch
 
+from triton.runtime.errors import OutOfResources
+
 from engine.kernels.paged_prefill import paged_prefill
 from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
 
@@ -21,6 +23,21 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 
 HEAD_DIM = 128
 BLOCK_SIZE = 16
+
+
+def _run_or_skip(*args, **kwargs):
+    """Run the kernel, or skip when this device cannot hold the requested tile.
+
+    Q, K and V all pass through shared memory and K/V are multi-buffered, so a tile that
+    fits a 100 KB Ada SM will not fit a 64 KB Turing one. The exact requirement depends on
+    Triton's pipelining decisions and is not predictable from the dimensions, so the shape
+    is attempted and the runtime's own verdict is trusted. Skipping here keeps a hardware
+    limit from being reported as a numerical failure.
+    """
+    try:
+        return tiled_paged_prefill(*args, **kwargs)
+    except OutOfResources as error:
+        pytest.skip(f"tile does not fit this device: {error}")
 
 
 @cuda
@@ -45,8 +62,8 @@ def test_kernel_compiles_and_runs():
 def test_fp32_pv_variant_compiles():
     """The alternate accumulation path compiles too; it is a separate specialisation."""
     query, kp, vp, tables, start_t, chunk_t = _build(1, 16, 8, [0], [32], seed=0)
-    out = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t,
-                              block_m=16, block_n=32, pv_in_fp32=True)
+    out = _run_or_skip(query, kp, vp, tables, start_t, chunk_t,
+                       block_m=16, block_n=32, pv_in_fp32=True)
     assert torch.isfinite(out).all()
 
 
@@ -153,20 +170,33 @@ def test_padded_rows_are_zero_and_never_nan():
 @requires_cuda
 @pytest.mark.parametrize("block_m,block_n", [(16, 32), (32, 64), (64, 64), (64, 32), (128, 64)])
 def test_tile_shape_does_not_change_the_result(block_m, block_n):
+    """Tiling is a scheduling choice; it must not change the numbers.
+
+    Shapes too large for the device under test are skipped rather than failed - a 64 KB
+    Turing SM cannot hold what a 100 KB Ada one can, and that is not a defect in the
+    kernel.
+    """
     query, kp, vp, tables, start_t, chunk_t = _build(2, 16, 8, [0, 300], [128, 128], seed=5)
     baseline = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t,
                                    block_m=64, block_n=64)
-    variant = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t,
-                                  block_m=block_m, block_n=block_n)
+    variant = _run_or_skip(query, kp, vp, tables, start_t, chunk_t,
+                           block_m=block_m, block_n=block_n)
     torch.testing.assert_close(variant.float(), baseline.float(), rtol=2e-2, atol=2e-2)
 
 
 @cuda
 @requires_cuda
 def test_fp32_pv_path_agrees_with_the_tensor_core_path():
+    """Cross-check the tensor-core PV accumulation against an fp32 one.
+
+    Run at a smaller tile than the default: converting V to fp32 doubles that operand, and
+    both dot operands must be resident simultaneously, so the default 64x64 needs 80 KB on
+    a device with 64 KB. The comparison is about numerics, not about tile size.
+    """
     query, kp, vp, tables, start_t, chunk_t = _build(1, 16, 8, [256], [128], seed=9)
-    fast = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t)
-    exact = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t, pv_in_fp32=True)
+    tile = {"block_m": 32, "block_n": 32}
+    fast = tiled_paged_prefill(query, kp, vp, tables, start_t, chunk_t, **tile)
+    exact = _run_or_skip(query, kp, vp, tables, start_t, chunk_t, pv_in_fp32=True, **tile)
     torch.testing.assert_close(fast.float(), exact.float(), rtol=3e-2, atol=3e-2)
 
 

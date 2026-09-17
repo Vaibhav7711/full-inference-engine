@@ -2250,3 +2250,41 @@ Two tests added: one that poisons the output shape and asserts every row is fini
 afterwards across four (query_len, BLOCK_M) combinations chosen so the last tile overhangs,
 and one with a three-row batch of widely different chunk lengths asserting each row's
 padding is zero and its neighbours are untouched.
+
+
+### D2 third GPU run: 23/25, both failures are shared memory, not correctness
+
+Every numerical test passes - the dense fp32 reference across all five shapes, agreement
+with the kernel being replaced across all four, padded rows, tile overhang, multi-query
+grouping, and the working tile shapes. The two failures are `OutOfResources: shared memory`
+from test *parameters* the T4 cannot hold.
+
+`BLOCK_M=128, BLOCK_N=64` needs 98,304 bytes against a 65,536 limit. That figure is exactly
+Q(128x128xfp16 = 32 KB) + K(64x128xfp16 x 2 stages = 32 KB) + V(same = 32 KB), which says
+Q, K and V all pass through shared memory - `mma.sync` reads operands from registers filled
+by `ldmatrix` out of smem, so nothing avoids it - and K/V are double-buffered for the
+pipelined loop. Doubling `BLOCK_M` doubles the Q tile alone.
+
+`pv_in_fp32` at the default 64x64 needs 81,920 bytes: converting V to fp32 doubles that
+operand and both `tl.dot` operands must be resident together.
+
+**A correction.** Earlier in this conversation these were attributed to register pressure
+from the fp32 accumulator. They are shared memory, and the arithmetic above identifies the
+Q tile. The register explanation was wrong.
+
+**And a second correction, about method.** The obvious next move was to encode a
+shared-memory model so infeasible shapes could be rejected up front. That model reproduces
+the 128x64 figure exactly and then mispredicts the fp32 case, and it claims 64x64 fp16
+should not fit when it demonstrably does. Triton's allocation depends on pipeliner
+decisions that vary by shape, so it is not a function of the tile dimensions. The runtime
+already reports the exact requirement, so the code now catches rather than predicts: the
+wrapper re-raises with the reported numbers plus what to reduce, and tests call
+`_run_or_skip`, which attempts the shape and skips on the runtime's verdict. That keeps a
+hardware limit from being reported as a numerical failure, and keeps the suite portable to
+the 4060, where a ~100 KB SM will hold shapes a 64 KB Turing one will not.
+
+The fp32 PV cross-check now runs at 32x32, since the comparison is about numerics rather
+than tile size.
+
+**Usable tile space on sm_75 at HEAD_DIM=128:** `BLOCK_M <= 64`, `BLOCK_N <= 64`. The
+default 64x64 sits at the edge of what fits.
