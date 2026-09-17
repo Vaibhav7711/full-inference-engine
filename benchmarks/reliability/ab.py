@@ -46,6 +46,14 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("chunk_32", {"prefill_chunk_size": 32,
                       "max_prefill_tokens_per_iteration": 32}),
     ],
+    # If a prefill step costs the same at 128 and 512 tokens, its cost is per-invocation
+    # overhead rather than work, and no scheduling change can reduce it.
+    "prefill_chunk_large": [
+        ("chunk_128", {"prefill_chunk_size": 128,
+                       "max_prefill_tokens_per_iteration": 128}),
+        ("chunk_512", {"prefill_chunk_size": 512,
+                       "max_prefill_tokens_per_iteration": 512}),
+    ],
     "prefill_chunk_small": [
         ("chunk_128", {"prefill_chunk_size": 128,
                        "max_prefill_tokens_per_iteration": 128}),
@@ -142,7 +150,8 @@ def main() -> int:
         print(f"\n=== {label} ({args.repeats} runs) ===")
         repeated = run_repeated(make_engine, config, repeats=args.repeats, label=label)
         arms[label] = repeated
-        for metric in ("latency.itl_p50", "latency.ttft_p50", "waste_ratio",
+        for metric in ("step_timing.expected_gap_ms", "latency.itl_p50",
+                       "latency.ttft_p50", "waste_ratio",
                        "mean_decode_batch", "mean_context_tokens",
                        "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
                        "step_timing.prefill_step_fraction"):
@@ -171,7 +180,12 @@ def main() -> int:
     baseline, variant = arms[labels[0]], arms[labels[1]]
     print(f"\n=== {labels[1]} vs {labels[0]} ===")
     comparison = {}
-    for metric in ("latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
+    # expected_gap_ms leads because it is the only latency metric sensitive to a change
+    # in the *mix* of step kinds. A median over token gaps is not: when prefill rose from
+    # 22.7% to 46.9% of steps, itl_p50 stayed inside noise because the median gap was
+    # still a decode step, while the average gap worsened 49%.
+    for metric in ("step_timing.expected_gap_ms", "step_timing.prefill_share_of_gap",
+                   "latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
                    "latency.ttft_p50", "step_timing.decode_step_p50_ms",
                    "step_timing.prefill_step_p50_ms",
                    "step_timing.prefill_step_fraction",

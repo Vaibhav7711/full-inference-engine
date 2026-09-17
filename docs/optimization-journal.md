@@ -1989,3 +1989,55 @@ The soak now also reports the decomposition directly - `expected_gap_ms`,
 `expected_gap_from_decode_ms`, `expected_gap_from_prefill_ms`, `prefill_share_of_gap` -
 with a test asserting it reconstructs the observed per-request mean. If those three
 measured quantities stop reconciling, one of them is wrong.
+
+
+## Measured: prefill step cost is fixed per invocation, not proportional to work
+
+`ab.py --setting prefill_chunk --repeats 5 --duration 8 --concurrency 8 --cuda-graphs`.
+
+| | chunk 128 | chunk 32 | change |
+|---|---|---|---|
+| prefill step p50 | 42.541 ms | 41.502 ms | -2.4%, **unresolved** |
+| prefill step fraction | 22.7% | 46.9% | +106.5% |
+| decode step p50 | 8.046 ms | 8.043 ms | unchanged |
+| ITL p50 | 8.149 ms | 8.462 ms | +3.8%, unresolved |
+| TTFT p50 | 43.05 ms | 125.85 ms | **+192.3%** |
+| expected gap (computed) | 15.88 ms | 23.73 ms | **+49.5%** |
+
+**Four times less prefill work per step made the step 2.4% cheaper, inside the noise.** The
+~34 ms a prefill-carrying step costs above a decode-only step is therefore fixed
+per-invocation overhead, not work proportional to the tokens processed.
+
+Consequences:
+
+- **Smaller chunks are strictly worse here.** Same cost per interruption, twice as many
+  interruptions, 49% worse average gap, nearly 3x the TTFT. The ITL-versus-TTFT trade the
+  experiment was designed to map does not exist at these sizes, so this is not a QoS
+  question (item 6) - there is no curve to choose a point on.
+- **No scheduling change can fix it.** Chunk budgets, decode-first ordering and admission
+  policy all move *when* prefill runs, never what an invocation costs. The target is the
+  prefill path itself.
+
+**A median cannot see this.** `itl_p50` moved +3.8% and was correctly called unresolved,
+because with 46.9% prefill steps the median gap is still a decode step - the statistic is
+blind to a doubling in how often the expensive step occurs. Only the frequency-weighted
+`expected_gap_ms` shows the 49.5% regression. It was computed in the soak but missing from
+the A/B's comparison list; it now leads that list, because it is the only latency metric
+sensitive to a change in the *mix* of step kinds rather than the cost of one kind.
+
+**Why the cost is probably launch overhead.** A prefill step's excess over a decode step is
+36.5 ms with CUDA graphs on and 35.9 ms with them off - identical, confirming prefill is
+entirely ungraphed and untouched by graphs. That excess is close to the 27.8 ms graphs
+removed from the decode step (35.999 -> 8.202 ms), which was eager per-layer kernel-launch
+cost. The hypothesis is that prefill is paying the same bill decode used to.
+
+If that holds, the fix follows from it: a fixed chunk size produces fixed tensor shapes,
+which are capturable. Padding every prefill to a small set of bucketed shapes would make
+the prefill path graphable exactly as decode is. That is a real design change, not a tuning
+knob, and it should not be started before the hypothesis is tested.
+
+**Next measurement, not next optimisation:** `--setting prefill_chunk_large` (128 vs 512).
+If a prefill step still costs ~42 ms at 512 tokens, the cost is per-invocation and the
+launch-overhead hypothesis stands. If it rises roughly fourfold, there is a real compute
+component and the per-token-GEMV chunk kernel flagged in the code review is implicated
+instead. The two lead to different work, so the measurement comes first.
