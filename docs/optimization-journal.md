@@ -1748,3 +1748,47 @@ One dedicated test asserts full cancellation coverage, with a workload built to 
 state reachable: long prompts to keep requests in `PREFILLING` across steps, a tight pool
 to park `PREEMPTED` requests, oversubscription to fill `WAITING`, and a high cancel
 probability to give the injector enough attempts.
+
+
+## A measured optimisation target, not a quoted one
+
+`benchmarks/kernels/roofline.py` derives the decode-step floor from two things measured on
+the GPU in front of us, because both had been asserted rather than checked:
+
+- **Achieved bandwidth**, from probes on the device: a STREAM-style copy, a read-only
+  sweep, and an fp16 matrix-vector product. The GEMV probe is the one the floor is built
+  on, because it *is* the decode pattern - read an enormous matrix, touch a tiny vector,
+  write almost nothing. Buffers are 512 MB, far past the T4's 4 MB L2, so nothing is
+  served from cache; a small-matrix microbenchmark would have flattered the number.
+- **Bytes per step**, from the loaded checkpoint's own parameters. Qwen3-0.6B: ~881 MB of
+  transformer layers plus ~311 MB of `lm_head` = ~1192 MB. The embedding table is excluded
+  because a decode step gathers one row per sequence, but `lm_head` is included in full -
+  and in this model it is *tied* to that same table, so the memory is read one row at a
+  time for input embeddings and swept entirely for logits.
+
+Two corrections to what had been said earlier in this project:
+
+- **Spec bandwidth was quoted as if achieved.** The T4's 320 GB/s sticker figure produced
+  a 3.72 ms floor. Real memory-bound kernels reach some fraction of the sticker number, and
+  which fraction is exactly what was being hand-waved. Earlier in the project 256 GB/s was
+  used for the speculative-decoding estimate and 320 GB/s later for the roofline, without
+  the switch being flagged. The probe settles it per-device.
+- **KV traffic was omitted, and it is not small.** At batch 8 with 512 tokens of context
+  the KV read is ~470 MB against ~1192 MB of weights - 40% more traffic, and a materially
+  higher floor. At batch 16 with 2048 tokens it is ~3758 MB, three times the weights, so a
+  long-context decode step is KV-bound rather than weight-bound. That reframes the
+  known kernel inefficiency (the batched decode kernel reads each GQA group once per query
+  head, twice over for this model) from a minor waste into the dominant cost at long
+  context.
+
+A third correction, caught in the script before it ran: inter-token latency must be
+compared against **step time**, not step time divided by batch. One step advances every
+active sequence by exactly one token, so the gap a caller sees between their tokens is one
+step regardless of how many sequences share it. Dividing by batch answers a throughput
+question instead, and would have understated the floor eightfold at concurrency 8.
+
+Projected answer, pending the run: with weights + KV at batch 8 / 512 context, the floor
+lands between 5.5 and 7.6 ms depending on achieved bandwidth, putting the measured 15.50 ms
+(CUDA graphs on) at **2.1x to 2.8x the floor** rather than the 3.9x claimed earlier. The
+script reports the real figure and the absolute headroom in ms, which is what an
+optimisation target has to be.

@@ -510,6 +510,26 @@ record before it is considered complete.
   Mitigated by the dedicated coverage test and by printing gaps in every report.
 
 
+### DD-037 — The optimisation target is measured on this device, never quoted from a datasheet
+
+- **Decision:** the decode-step floor comes from `benchmarks/kernels/roofline.py`: achieved
+  bandwidth probed on the present GPU (an fp16 GEMV, the decode pattern, over buffers far
+  larger than L2) and bytes counted from the loaded checkpoint's parameters, including
+  `lm_head` in full and excluding the gathered embedding table. KV traffic is added per
+  (batch, context) point. Measured ITL is compared against step time, because one step
+  advances every sequence by one token.
+- **Why:** "4 ms" had been repeated several times in this project as if established. It
+  came from dividing a spec bandwidth figure by an estimated parameter count, with KV
+  traffic ignored and two different bandwidth assumptions used in different places without
+  flagging the switch. An optimisation target that cannot be reproduced is not a target.
+- **Rejected — a fixed efficiency factor on spec bandwidth (70%, 85%).** The factor is the
+  disputed quantity; assuming it moves the argument rather than settling it. A probe costs
+  seconds.
+- **Code:** `benchmarks/kernels/roofline.py`, `tests/kernels/test_roofline.py`.
+- **Tradeoff:** the floor becomes device-specific, so it must be re-measured on an L4 or
+  any other target rather than carried over. That is the correct behaviour.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,
