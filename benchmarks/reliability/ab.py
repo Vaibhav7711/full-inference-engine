@@ -23,9 +23,11 @@ from benchmarks.reliability.soak import SoakConfig, run_repeated
 
 # Each arm is (label, engine keyword overrides). Everything not listed is shared.
 SETTINGS: dict[str, list[tuple[str, dict]]] = {
+    # Graph buckets are clamped to max_active at build time, so this list is an upper
+    # bound rather than a fixed configuration.
     "cuda_graphs": [
         ("graphs_off", {"cuda_graph_batch_sizes": None}),
-        ("graphs_on", {"cuda_graph_batch_sizes": (1, 2, 4, 8)}),
+        ("graphs_on", {"cuda_graph_batch_sizes": (1, 2, 4, 8, 16, 32, 64)}),
     ],
     "prefix_cache": [
         ("cache_off", {"prefix_cache_blocks": 0}),
@@ -51,6 +53,31 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
                       "max_prefill_tokens_per_iteration": 16}),
     ],
 }
+
+
+def graph_buckets(max_active: int) -> tuple[int, ...]:
+    """Powers of two up to `max_active`, which the engine requires buckets to respect.
+
+    Hard-coding a bucket list couples the benchmark to one concurrency setting; the engine
+    rejects any bucket above `max_active`, and it does so at construction time, several
+    frames inside the repeat loop where the message is hard to place.
+    """
+    buckets = tuple(size for size in (1, 2, 4, 8, 16, 32, 64) if size <= max_active)
+    return buckets or (1,)
+
+
+def _clamp_graph_buckets(settings: dict, max_active: int) -> dict:
+    """Keep any explicitly requested buckets inside the engine's contract."""
+    requested = settings.get("cuda_graph_batch_sizes")
+    if requested is None:
+        return settings
+    kept = tuple(size for size in requested if 1 <= size <= max_active)
+    settings = dict(settings)
+    if kept:
+        settings["cuda_graph_batch_sizes"] = kept
+    else:
+        settings.pop("cuda_graph_batch_sizes")
+    return settings
 
 
 def _verdict(baseline: dict, variant: dict) -> str:  # noqa: D401
@@ -97,7 +124,7 @@ def main() -> int:
         max_waiting_requests=args.max_waiting, prefix_cache_blocks=64,
     )
     if args.cuda_graphs:
-        shared["cuda_graph_batch_sizes"] = (1, 2, 4, 8, 16)
+        shared["cuda_graph_batch_sizes"] = graph_buckets(args.max_active)
     config = SoakConfig(
         duration_s=args.duration, concurrency=args.concurrency, seed=args.seed,
         cancel_probability=0.02,  # low: this measures generation, not cancellation
@@ -105,7 +132,7 @@ def main() -> int:
 
     arms = {}
     for label, overrides in SETTINGS[args.setting]:
-        settings = {**shared, **overrides}
+        settings = _clamp_graph_buckets({**shared, **overrides}, args.max_active)
 
         def make_engine(settings=settings):
             return ContinuousBatchingEngine(
