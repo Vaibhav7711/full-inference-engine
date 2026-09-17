@@ -1659,3 +1659,47 @@ work rather than failing after it.
 `tests/reliability/test_soak.py` holds six seeded short soaks for the T4, including the
 long-generation configuration that the removed preemption-count limit would have failed,
 and one test that deliberately strands an allocation to prove the audit can fail.
+
+
+### Item 1 GPU gate: invariants held, first conclusions retracted
+
+Six soaks pass on Colab T4, zero invariant violations, with peak KV utilisation reaching
+1.00 in four of five configurations. The accounting identity - every page in use belongs to
+an engine reservation or the prefix cache - held under real pressure, real cancellation and
+real preemption. That is item 1's pass criterion and it is met.
+
+Three conclusions drawn from that first run are **withdrawn**, for reasons that are mostly
+not about sample size:
+
+- **"CUDA graphs cut inter-token latency 2.2-4.6x."** Unsupported. The graph-enabled
+  configurations also differ in `max_active` (4 vs 8), pool size, and - decisively - in what
+  survived: the `oversized` arm rejected or cancelled 112 of 114 requests, so its sequences
+  were short and its attention read less KV per token. The 7.6 ms there is partly short
+  sequences, not graphs. Three variables moved at once.
+- **"Recompute costs 2.4-3.4 rebuilt tokens per delivered token."** The denominator was
+  modelled, not measured: finished requests multiplied by a guessed average `max_new_tokens`,
+  plus an assumed half-budget for cancelled ones. The engine knows the real figure and was
+  never asked. `SoakResult.delivered_tokens` now sums actual output lengths.
+- **Single run per configuration on shared hardware.** Repeating one fixed configuration
+  four times shows ITL p50 varying by 11% while the waste ratio varies by 220% (0.88 to
+  5.20, a 6x swing on seed alone). One preemption of one long prompt dominates that ratio.
+  Latency and waste need entirely different sample sizes before either supports a claim.
+
+Two real gaps the run exposed:
+
+- **Open loop above service rate measures the queue, not the engine.** Arrivals at 25-30/s
+  against an engine retiring roughly 4-15/s produced TTFT medians of 2.6-25.6 s, essentially
+  all of it queueing (`total_queue_p50` tracks `ttft_p50` almost exactly). It also distorted
+  everything downstream: the cancellation injector hit `WAITING` 170 times out of 204 in the
+  pressure arm, so that soak largely measured cancelling queued requests. `SoakConfig`
+  now has a `concurrency` setting for closed-loop operation, which is what any run whose
+  numbers will be compared against another engine must use.
+- **Backpressure was never exercised.** Every soak engine left `max_waiting_requests`
+  unset, so the queue was unbounded and `QUEUE_FULL` never fired once. Now covered by
+  `test_soak_bounded_queue_applies_backpressure_instead_of_growing_without_limit`.
+
+`benchmarks/reliability/ab.py` replaces the accidental comparison with a controlled one:
+one setting varied, pool, concurrency, workload, seeds and model object held identical,
+each arm repeated, and a verdict that returns "unresolved" whenever the median change is
+within run-to-run spread. The CUDA-graph question is worth answering properly - it is just
+not answered yet.

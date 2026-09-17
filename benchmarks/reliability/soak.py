@@ -18,7 +18,7 @@ import argparse
 import json
 import random
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -37,7 +37,14 @@ _CANCEL_TARGETS = ("WAITING", "PREFILLING", "DECODING", "PREEMPTED")
 @dataclass(frozen=True)
 class SoakConfig:
     duration_s: float = 30.0
+    # Open loop: arrivals are independent of completions. Realistic for public traffic,
+    # but if the rate exceeds what the engine can retire, the queue grows without bound
+    # and every latency number degenerates into a measure of queue depth.
     arrival_rate_per_s: float = 20.0
+    # Closed loop: hold exactly this many requests in flight, submitting a replacement
+    # as each one ends. Self-limiting, so latency reflects the engine rather than the
+    # backlog. Set this for any run whose numbers will be compared against another engine.
+    concurrency: int | None = None
     shared_prefixes: int = 3
     prefix_tokens: tuple[int, int] = (16, 128)
     suffix_tokens: tuple[int, int] = (4, 96)
@@ -54,12 +61,14 @@ class SoakResult:
     steps: int = 0
     wall_s: float = 0.0
     submitted: int = 0
+    mode: str = "open-loop"
     counts: Counter = field(default_factory=Counter)
     finish_reasons: Counter = field(default_factory=Counter)
     cancelled_from: Counter = field(default_factory=Counter)
     states_observed: Counter = field(default_factory=Counter)
     latency: dict[str, float] = field(default_factory=dict)
     recompute: dict[str, float] = field(default_factory=dict)
+    delivered_tokens: int = 0
     peak_kv_utilization: float = 0.0
     peak_waiting: int = 0
     peak_active: int = 0
@@ -70,14 +79,26 @@ class SoakResult:
     def ok(self) -> bool:
         return not self.violations
 
+    @property
+    def waste_ratio(self) -> float:
+        """Prompt tokens rebuilt per output token actually delivered to a caller.
+
+        Counted from real output lengths across every request, finished or cancelled -
+        a cancelled request's tokens were still produced and still cost KV pages.
+        """
+        delivered = self.delivered_tokens
+        return self.recompute.get("recomputed_tokens", 0) / delivered if delivered else 0.0
+
     def to_dict(self) -> dict:
         payload = {
             "config": self.config.__dict__, "steps": self.steps, "wall_s": self.wall_s,
-            "submitted": self.submitted, "counts": dict(self.counts),
+            "submitted": self.submitted, "mode": self.mode, "counts": dict(self.counts),
             "finish_reasons": dict(self.finish_reasons),
             "cancelled_from": dict(self.cancelled_from),
             "states_observed": dict(self.states_observed), "latency_ms": self.latency,
-            "recompute": self.recompute, "peak_kv_utilization": self.peak_kv_utilization,
+            "recompute": self.recompute, "delivered_tokens": self.delivered_tokens,
+            "recompute_tokens_per_delivered_token": self.waste_ratio,
+            "peak_kv_utilization": self.peak_kv_utilization,
             "peak_waiting": self.peak_waiting, "peak_active": self.peak_active,
             "prefix_cache": self.prefix_cache, "violations": self.violations,
         }
@@ -213,20 +234,30 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
     next_arrival = started
     index = 0
     accepting = True
+    result.mode = "closed-loop" if config.concurrency else "open-loop"
+
+    def _admit_one() -> None:
+        nonlocal index
+        request = workload.next_request(index)
+        index += 1
+        submitted.append(request)
+        result.submitted += 1
+        if engine.submit(request):
+            in_flight[request.request_id] = request
+        # A rejected submission (queue full, or larger than effective capacity) is a
+        # completed interaction, not a lost one: it stays in `submitted` for the audit.
 
     while True:
         now = perf_counter()
         elapsed = now - started
         if accepting and elapsed >= config.duration_s:
             accepting = False
-        if accepting:
+        if accepting and config.concurrency:
+            while len(in_flight) < config.concurrency:
+                _admit_one()
+        elif accepting:
             while now >= next_arrival:
-                request = workload.next_request(index)
-                index += 1
-                submitted.append(request)
-                result.submitted += 1
-                if engine.submit(request):
-                    in_flight[request.request_id] = request
+                _admit_one()
                 next_arrival += rng.expovariate(config.arrival_rate_per_s)
 
         for request in in_flight.values():
@@ -291,6 +322,7 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
         "stall_p99": _percentile(stalls, 0.99),
         "stall_max": max(stalls) if stalls else 0.0,
     }
+    result.delivered_tokens = sum(len(r.output_token_ids) for r in submitted)
     result.recompute = dict(engine.recompute_report())
     result.prefix_cache = {
         k: v for k, v in engine.prefix_cache.snapshot().items()
@@ -306,6 +338,69 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
     ]
     if uncovered:
         result.violations.append(f"states reached but never cancelled from: {uncovered}")
+    return result
+
+
+@dataclass
+class RepeatedResult:
+    """Several seeded runs of one configuration, summarised with spread."""
+
+    label: str
+    runs: list[SoakResult] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return all(run.ok for run in self.runs)
+
+    def series(self, path: str) -> list[float]:
+        """Pull one metric from every run. Dotted path, e.g. 'latency.itl_p50'."""
+        head, _, tail = path.partition(".")
+        values = []
+        for run in self.runs:
+            source = getattr(run, head)
+            value = source[tail] if tail else source
+            if value is not None:
+                values.append(float(value))
+        return values
+
+    def summary(self, path: str) -> dict[str, float]:
+        values = self.series(path)
+        if not values:
+            return {"n": 0}
+        median = _percentile(values, 0.5)
+        low, high = min(values), max(values)
+        return {
+            "n": len(values), "median": median, "min": low, "max": high,
+            # Relative spread. Above ~0.2 on shared hardware, treat differences between
+            # configurations as unresolved rather than real.
+            "spread": (high - low) / median if median else 0.0,
+        }
+
+    def to_dict(self) -> dict:
+        metrics = [
+            "latency.itl_p50", "latency.itl_p99", "latency.ttft_p50",
+            "latency.total_queue_p50", "waste_ratio", "delivered_tokens",
+            "peak_kv_utilization",
+        ]
+        return {
+            "label": self.label, "runs": len(self.runs), "ok": self.ok,
+            "summary": {metric: self.summary(metric) for metric in metrics},
+            "violations": [v for run in self.runs for v in run.violations],
+        }
+
+
+def run_repeated(make_engine, config: SoakConfig, repeats: int = 5,
+                 label: str = "") -> RepeatedResult:
+    """Run one configuration several times on fresh engines, varying only the seed.
+
+    A fresh engine per run matters: a reused pool carries prefix-cache entries and
+    fragmentation from the previous run, which is exactly the state a comparison is
+    trying to hold constant.
+    """
+    result = RepeatedResult(label=label or f"soak-{config.seed}")
+    for offset in range(repeats):
+        seeded = replace(config, seed=config.seed + offset)
+        result.runs.append(run_soak(make_engine(), seeded))
     return result
 
 

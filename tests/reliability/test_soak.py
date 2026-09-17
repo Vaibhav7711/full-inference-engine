@@ -150,3 +150,70 @@ def test_invariant_checker_detects_a_deliberately_leaked_page():
     engine.scheduler.active.pop(request.request_id, None)
     violations = check_invariants(engine, [request])
     assert any("leak" in v or "non-terminal" in v for v in violations), violations
+
+
+@cuda
+@requires_cuda
+def test_soak_closed_loop_holds_every_invariant():
+    """Closed loop: a fixed number in flight, so latency reflects the engine not the queue."""
+    result = run_soak(
+        _engine(num_blocks=128, max_active=8),
+        SoakConfig(duration_s=6.0, concurrency=8, seed=6, cancel_probability=0.05),
+    )
+    _report("closed-loop", result)
+    assert result.mode == "closed-loop"
+    assert result.violations == []
+    assert result.counts["FINISHED"] > 0
+    assert result.delivered_tokens > 0
+    # Closed loop is self-limiting, so queueing must not dominate as it does open-loop.
+    assert result.peak_waiting <= 8
+
+
+@cuda
+@requires_cuda
+def test_soak_bounded_queue_applies_backpressure_instead_of_growing_without_limit():
+    """Open loop above service rate must reject, not accumulate an unbounded backlog.
+
+    Every earlier soak left `max_waiting_requests` unset, so the queue grew without limit
+    and the QUEUE_FULL path was never exercised at all.
+    """
+    engine = _engine(num_blocks=64, max_active=4, max_waiting_requests=16)
+    result = run_soak(
+        engine,
+        SoakConfig(duration_s=6.0, arrival_rate_per_s=60.0, seed=7,
+                   cancel_probability=0.02, max_new_tokens=(16, 64)),
+    )
+    _report("backpressure", result)
+    assert result.violations == []
+    assert result.peak_waiting <= 16, "queue exceeded its bound"
+    assert result.finish_reasons["QUEUE_FULL"] > 0, "backpressure never engaged"
+    # Backpressure is an admission decision: nothing may die after doing work.
+    assert result.finish_reasons.get("KV_POOL_EXHAUSTED", 0) == 0
+
+
+@cuda
+@requires_cuda
+def test_repeated_runs_report_spread_so_single_numbers_are_not_trusted():
+    """Any metric compared between configurations must first be compared against noise."""
+    from benchmarks.reliability.soak import run_repeated
+
+    model, tok = _load()
+
+    def make_engine():
+        from engine.batching.continuous_batching import ContinuousBatchingEngine
+        return ContinuousBatchingEngine(
+            model, tok, "cuda", num_blocks=128, block_size=16, max_active=8,
+            prefix_cache_blocks=16, max_waiting_requests=64,
+        )
+
+    repeated = run_repeated(
+        make_engine,
+        SoakConfig(duration_s=4.0, concurrency=8, seed=20, cancel_probability=0.02),
+        repeats=3, label="spread-check",
+    )
+    for metric in ("latency.itl_p50", "latency.ttft_p50", "waste_ratio", "delivered_tokens"):
+        print(f"  {metric:22s} {repeated.summary(metric)}")
+    assert repeated.ok, [v for r in repeated.runs for v in r.violations]
+    itl = repeated.summary("latency.itl_p50")
+    assert itl["n"] == 3 and itl["median"] > 0
+    assert 0.0 <= itl["spread"] < 10.0

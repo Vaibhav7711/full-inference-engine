@@ -459,6 +459,40 @@ record before it is considered complete.
   configuration never enters it and is not penalised.
 
 
+### DD-034 — Compare configurations only through repeated, single-variable, closed-loop runs
+
+- **Decision:** any claim that one engine setting beats another must come from
+  `benchmarks/reliability/ab.py`: exactly one setting varied, everything else identical
+  (pool, concurrency, workload, seeds, model object), each arm repeated, closed-loop, and a
+  verdict that reports "unresolved" when the median change falls within the larger arm's
+  run-to-run spread.
+- **Why:** the first soak produced a plausible and wrong conclusion. Its configurations
+  differed in three ways simultaneously, so a latency gap got attributed to CUDA graphs when
+  short sequences in a heavily-rejected arm explain part of it. Repetition then showed the
+  waste ratio swinging 6x on seed alone, while latency moved only 11% - so a single number
+  supports a claim for one metric and not the other, and nothing distinguishes the two cases
+  without measuring spread.
+- **Rejected — comparing soak configurations against each other.** They exist to stress
+  different failure paths, which is precisely why they differ in more than one setting.
+  They are reliability fixtures, not benchmarks.
+- **Code:** `benchmarks/reliability/ab.py`, `benchmarks/reliability/soak.py`.
+- **Tradeoff:** an A/B costs repeats x arms x duration, minutes rather than seconds, so it
+  gates conclusions rather than every change.
+
+### DD-035 — Latency runs are closed-loop; open-loop runs are reliability tests only
+
+- **Decision:** `SoakConfig.concurrency` holds a fixed number of requests in flight. Any run
+  whose latency will be quoted or compared uses it. Open-loop Poisson arrivals remain, for
+  overload and backpressure behaviour.
+- **Why:** open-loop arrivals above the service rate make the queue grow without bound, and
+  every latency percentile degenerates into a measure of backlog - measured TTFT medians of
+  2.6-25.6 s that were almost entirely queueing. It also biases everything else: most
+  cancellations landed on queued requests rather than generating ones.
+- **Code:** `benchmarks/reliability/soak.py`.
+- **Evidence:** `total_queue_p50` tracked `ttft_p50` to within a few percent in every
+  open-loop arm.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,
