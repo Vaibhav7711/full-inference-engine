@@ -329,3 +329,32 @@ def test_prefill_steps_are_measured_separately_from_decode_steps():
     # The decode-only p50 is the engine's true per-step cost; it must be close to the
     # token-gap median, which is what a caller sees on an uninterrupted step.
     assert timing["decode_step_p50_ms"] == pytest.approx(result.latency["itl_p50"], rel=0.5)
+
+
+@cuda
+@requires_cuda
+def test_gap_decomposition_reconstructs_the_observed_latency():
+    """The frequency-weighted decomposition must agree with the measured distribution.
+
+    If decode-step cost, prefill-step cost and prefill frequency do not reconstruct the
+    average gap a caller experiences, one of the three is being measured wrong.
+    """
+    result = run_soak(
+        _engine(num_blocks=160, max_active=8, cuda_graph_batch_sizes=(1, 2, 4, 8)),
+        SoakConfig(duration_s=8.0, concurrency=8, seed=41, cancel_probability=0.0,
+                   max_new_tokens=(24, 64)),
+    )
+    _report("decomposition", result)
+    timing = result.step_timing
+    print(f"  expected gap {timing['expected_gap_ms']:.2f} ms = "
+          f"{timing['expected_gap_from_decode_ms']:.2f} decode + "
+          f"{timing['expected_gap_from_prefill_ms']:.2f} prefill "
+          f"({timing['prefill_share_of_gap']:.1%} from prefill)")
+    assert result.violations == []
+    # Reconstruction must land near the measured per-request mean, which is the average
+    # gap each caller actually saw.
+    observed = result.latency["itl_request_mean_p50"]
+    assert timing["expected_gap_ms"] == pytest.approx(observed, rel=0.4), (
+        f"decomposition {timing['expected_gap_ms']:.2f} does not reconstruct {observed:.2f}"
+    )
+    assert 0.0 <= timing["prefill_share_of_gap"] <= 1.0

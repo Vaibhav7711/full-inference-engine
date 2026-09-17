@@ -400,6 +400,20 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
             if decode_ms and prefill_ms else 0.0
         ),
     }
+    if decode_ms and prefill_ms:
+        # Frequency-weighted decomposition of the average gap a caller experiences. The
+        # penalty matters in proportion to how often a step carries prefill, so neither
+        # the per-step cost nor the fraction means much alone.
+        decode_p50 = _percentile(decode_ms, 0.50)
+        penalty = _percentile(prefill_ms, 0.50) - decode_p50
+        share = len(prefill_ms) / (len(decode_ms) + len(prefill_ms))
+        expected = decode_p50 + share * penalty
+        result.step_timing.update({
+            "expected_gap_ms": expected,
+            "expected_gap_from_decode_ms": decode_p50,
+            "expected_gap_from_prefill_ms": share * penalty,
+            "prefill_share_of_gap": (share * penalty) / expected if expected else 0.0,
+        })
     result.recompute = dict(engine.recompute_report())
     result.prefix_cache = {
         k: v for k, v in engine.prefix_cache.snapshot().items()
@@ -471,6 +485,7 @@ class RepeatedResult:
             "peak_kv_utilization", "mean_decode_batch", "mean_context_tokens",
             "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
             "step_timing.prefill_step_fraction", "step_timing.prefill_penalty_p50_ms",
+            "step_timing.expected_gap_ms", "step_timing.prefill_share_of_gap",
         ]
         return {
             "label": self.label, "runs": len(self.runs), "ok": self.ok,

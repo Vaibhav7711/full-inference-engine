@@ -35,6 +35,21 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("fp16_kv", {"kv_cache_dtype": "fp16"}),
         ("int8_kv", {"kv_cache_dtype": "int8"}),
     ],
+    # Smaller chunks mean a prefill-carrying step interrupts decoding for less time, at
+    # the cost of spreading a prompt over more steps and so delaying its first token.
+    # This is the ITL-versus-TTFT trade that any QoS policy has to choose a point on.
+    "prefill_chunk": [
+        ("chunk_128", {"prefill_chunk_size": 128,
+                       "max_prefill_tokens_per_iteration": 128}),
+        ("chunk_32", {"prefill_chunk_size": 32,
+                      "max_prefill_tokens_per_iteration": 32}),
+    ],
+    "prefill_chunk_small": [
+        ("chunk_128", {"prefill_chunk_size": 128,
+                       "max_prefill_tokens_per_iteration": 128}),
+        ("chunk_16", {"prefill_chunk_size": 16,
+                      "max_prefill_tokens_per_iteration": 16}),
+    ],
 }
 
 
@@ -65,6 +80,9 @@ def main() -> int:
     parser.add_argument("--max-active", type=int, default=8)
     parser.add_argument("--max-waiting", type=int, default=64)
     parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="enable graphs in both arms; required to study prefill, "
+                             "since an ungraphed decode path swamps the effect")
     parser.add_argument("--out", default="results/soak_ab.json")
     args = parser.parse_args()
 
@@ -78,6 +96,8 @@ def main() -> int:
         num_blocks=args.num_blocks, block_size=16, max_active=args.max_active,
         max_waiting_requests=args.max_waiting, prefix_cache_blocks=64,
     )
+    if args.cuda_graphs:
+        shared["cuda_graph_batch_sizes"] = (1, 2, 4, 8, 16)
     config = SoakConfig(
         duration_s=args.duration, concurrency=args.concurrency, seed=args.seed,
         cancel_probability=0.02,  # low: this measures generation, not cancellation
@@ -126,7 +146,9 @@ def main() -> int:
     comparison = {}
     for metric in ("latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
                    "latency.ttft_p50", "step_timing.decode_step_p50_ms",
-                   "step_timing.prefill_step_p50_ms", "waste_ratio"):
+                   "step_timing.prefill_step_p50_ms",
+                   "step_timing.prefill_step_fraction",
+                   "step_timing.prefill_penalty_p50_ms", "waste_ratio"):
         verdict = _verdict(baseline.summary(metric), variant.summary(metric))
         comparison[metric] = verdict
         print(f"  {metric:24s} {verdict}")

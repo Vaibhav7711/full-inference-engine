@@ -1935,3 +1935,57 @@ and exposes `last_step_prefill_tokens`; the soak times every `step()` call and r
 step it is riding also carries someone else's prompt. If the pattern holds, the penalty is
 the number that justifies the prefill work in items 2 and 4; if it does not, something else
 is producing the tail and that is worth knowing before optimising the wrong thing.
+
+
+## Measured: half of inter-token latency is one caller waiting on another caller's prompt
+
+Step-kind instrumentation, five runs per arm, CUDA-graph A/B.
+
+| | graphs off | graphs on | change |
+|---|---|---|---|
+| decode-only step p50 | 35.999 ms | **8.202 ms** | -77.2% |
+| prefill-carrying step p50 | 71.896 ms | **44.658 ms** | -37.9% |
+| prefill step fraction | 21.7% | 22.6% | - |
+
+**My earlier bracket was wrong by a factor of 20 to 200.** Reasoning from the percentile
+gradient, I put prefill-carrying steps between 0.1% and 1% of all steps. They are 22.6%.
+The inference assumed prefill occupied the extreme tail; at 22.6% it sits above roughly
+p77, so p99 is prefill-dominated rather than "partly prefill".
+
+With the counters, the percentiles line up exactly. A prefill-carrying step runs the decode
+for every active sequence *and then* the prefill forward, so graphs accelerate its decode
+half and it improves 37.9% - which is the p99 improvement of 37.4% to within noise. p50 is
+decode-only steps at -77.2%, matching `itl_p50` at -77.3%. Nothing about the distribution
+is mysterious once steps are labelled.
+
+**Cost.** A prefill-carrying step costs 36.5 ms more than a decode-only step, 5.4x. At a
+22.6% share the frequency-weighted average gap is
+`0.774 x 8.202 + 0.226 x 44.658 = 16.44 ms`, which reconstructs the independently measured
+per-request mean of 15.19 ms. Removing the decode work inside those steps leaves the pure
+interruption at `0.226 x 36.456 = 8.24 ms/token`: **half of all user-visible inter-token
+latency**.
+
+**This reorders the plan.** The decode path has 3.22 ms/token of headroom above the memory
+floor after CUDA graphs. Prefill interruption costs 8.24 ms/token. Prefill is the larger
+target by 2.6x, and it is item 2 in the delivery order rather than item 6, so the ordering
+already had it right for reasons that are now measured rather than assumed.
+
+Two things to establish before optimising it:
+
+- **Is 44.7 ms reasonable for this prefill?** Prompts average ~124 tokens against a 128
+  chunk budget, so one chunk. A rough floor: the same 1192 MB weight read (4.61 ms) plus
+  ~154 GFLOP of prompt compute (~2.4 ms at the T4's fp16 rate), plus the 8.2 ms decode the
+  step also performs, is about 15 ms. Measured 44.7 ms is roughly 3x that. The code review
+  flagged the chunked-prefill kernel as a per-token GEMV that reloads the whole K/V prefix
+  per query token on CUDA cores; whether this workload takes that path or the SDPA batched
+  path needs checking before blaming it.
+- **Does smaller chunking help?** Shrinking the chunk makes each interruption shorter but
+  spreads a prompt over more steps, delaying its first token. That is the ITL-versus-TTFT
+  trade a QoS policy (item 4) has to pick a point on. `ab.py` gains `prefill_chunk`
+  (128 vs 32) and `prefill_chunk_small` (128 vs 16) settings, and a `--cuda-graphs` flag,
+  because studying prefill against an ungraphed decode path would drown the effect.
+
+The soak now also reports the decomposition directly - `expected_gap_ms`,
+`expected_gap_from_decode_ms`, `expected_gap_from_prefill_ms`, `prefill_share_of_gap` -
+with a test asserting it reconstructs the observed per-request mean. If those three
+measured quantities stop reconciling, one of them is wrong.
