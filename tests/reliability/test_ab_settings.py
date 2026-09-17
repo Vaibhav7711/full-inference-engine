@@ -42,3 +42,45 @@ def test_every_declared_setting_survives_clamping_at_common_concurrencies() -> N
                 assert buckets is None or all(s <= max_active for s in buckets), (
                     name, label, max_active, buckets
                 )
+
+
+# ------------------------------------------------ pre-flight: can the treatment take effect?
+from benchmarks.reliability.ab import (  # noqa: E402
+    PROMPT_PROFILES, binding_check, mean_prompt_tokens,
+)
+
+
+def test_chunk_512_versus_128_is_non_binding_on_short_prompts() -> None:
+    """The exact run that was wasted: both arms fit a ~122-token prompt in one chunk."""
+    mean_prompt = mean_prompt_tokens(PROMPT_PROFILES["short"])
+    assert 100 < mean_prompt < 140
+    problem = binding_check(SETTINGS["prefill_chunk_large"], mean_prompt)
+    assert problem is not None and "non-binding" in problem
+    assert "chunk 128 -> 1 chunk(s)" in problem and "chunk 512 -> 1 chunk(s)" in problem
+
+
+def test_chunk_512_versus_128_binds_once_prompts_exceed_the_chunk() -> None:
+    for name in ("chat", "long"):
+        mean_prompt = mean_prompt_tokens(PROMPT_PROFILES[name])
+        assert binding_check(SETTINGS["prefill_chunk_large"], mean_prompt) is None, name
+
+
+def test_chunk_32_versus_128_binds_even_on_short_prompts() -> None:
+    """This treatment was real, which is why its finding stands."""
+    mean_prompt = mean_prompt_tokens(PROMPT_PROFILES["short"])
+    assert binding_check(SETTINGS["prefill_chunk"], mean_prompt) is None
+
+
+def test_settings_without_chunk_sizes_are_not_judged_by_this_check() -> None:
+    # The check covers chunk-size binding only. It does not and cannot detect every
+    # null-by-construction design - the p999 CUDA-graph comparison was a different kind.
+    mean_prompt = mean_prompt_tokens(PROMPT_PROFILES["short"])
+    for setting in ("cuda_graphs", "prefix_cache", "kv_dtype"):
+        assert binding_check(SETTINGS[setting], mean_prompt) is None
+
+
+def test_prompt_profiles_are_ordered_and_plausible() -> None:
+    means = [mean_prompt_tokens(PROMPT_PROFILES[n]) for n in ("short", "chat", "long")]
+    assert means == sorted(means)
+    # Real chat traffic carries a system prompt plus history; the default profile does not.
+    assert means[0] < 200 and means[1] > 500 and means[2] > 1500

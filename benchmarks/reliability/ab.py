@@ -63,6 +63,47 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
 }
 
 
+# Prompt-length profiles. The default soak workload is far shorter than real chat
+# traffic, and prompt length decides whether a prefill setting has any effect at all.
+PROMPT_PROFILES: dict[str, dict] = {
+    "short": {"prefix_tokens": (16, 128), "suffix_tokens": (4, 96)},      # ~20-224
+    "chat": {"prefix_tokens": (256, 768), "suffix_tokens": (32, 256)},    # ~288-1024
+    "long": {"prefix_tokens": (1024, 2048), "suffix_tokens": (64, 512)},  # ~1088-2560
+}
+
+
+def mean_prompt_tokens(profile: dict) -> float:
+    low_p, high_p = profile["prefix_tokens"]
+    low_s, high_s = profile["suffix_tokens"]
+    return (low_p + high_p) / 2 + (low_s + high_s) / 2
+
+
+def binding_check(arms: list[tuple[str, dict]], mean_prompt: float) -> str | None:
+    """Refuse an experiment whose varied setting cannot take effect on this workload.
+
+    Two runs have already been wasted on treatments that were identical by construction:
+    a CUDA-graph arm compared against itself on the un-graphed prefill path, and chunk 512
+    versus chunk 128 on prompts averaging 122 tokens, where both fit in a single chunk. A
+    null result from a non-binding treatment looks exactly like a null result from a real
+    one, which is what makes it expensive.
+    """
+    chunk_sizes = [
+        overrides.get("prefill_chunk_size") for _, overrides in arms
+        if overrides.get("prefill_chunk_size") is not None
+    ]
+    if len(chunk_sizes) < 2:
+        return None
+    chunks_per_prompt = {size: max(1, -(-int(mean_prompt) // size)) for size in chunk_sizes}
+    if len(set(chunks_per_prompt.values())) == 1:
+        counts = ", ".join(f"chunk {k} -> {v} chunk(s)" for k, v in chunks_per_prompt.items())
+        return (
+            f"non-binding: at a mean prompt of {mean_prompt:.0f} tokens every arm needs the "
+            f"same number of chunks ({counts}), so the arms are identical treatments. "
+            f"Use --prompt-profile chat or long, or pick chunk sizes below {mean_prompt:.0f}."
+        )
+    return None
+
+
 def graph_buckets(max_active: int) -> tuple[int, ...]:
     """Powers of two up to `max_active`, which the engine requires buckets to respect.
 
@@ -115,6 +156,11 @@ def main() -> int:
     parser.add_argument("--max-active", type=int, default=8)
     parser.add_argument("--max-waiting", type=int, default=64)
     parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--prompt-profile", default="short", choices=sorted(PROMPT_PROFILES),
+                        help="prompt length distribution; prefill settings only bind when "
+                             "prompts exceed the chunk size")
+    parser.add_argument("--allow-non-binding", action="store_true",
+                        help="run even when the varied setting cannot take effect")
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="enable graphs in both arms; required to study prefill, "
                              "since an ungraphed decode path swamps the effect")
@@ -133,10 +179,20 @@ def main() -> int:
     )
     if args.cuda_graphs:
         shared["cuda_graph_batch_sizes"] = graph_buckets(args.max_active)
+    profile = PROMPT_PROFILES[args.prompt_profile]
+    mean_prompt = mean_prompt_tokens(profile)
+    problem = binding_check(SETTINGS[args.setting], mean_prompt)
+    if problem and not args.allow_non_binding:
+        print(f"refusing to run: {problem}")
+        return 2
+    if problem:
+        print(f"WARNING {problem}")
     config = SoakConfig(
         duration_s=args.duration, concurrency=args.concurrency, seed=args.seed,
         cancel_probability=0.02,  # low: this measures generation, not cancellation
+        **profile,
     )
+    print(f"workload: {args.prompt_profile} profile, mean prompt ~{mean_prompt:.0f} tokens")
 
     arms = {}
     for label, overrides in SETTINGS[args.setting]:
@@ -197,6 +253,8 @@ def main() -> int:
     payload = {
         "setting": args.setting, "repeats": args.repeats,
         "config": {**config.__dict__, **shared},
+        "prompt_profile": args.prompt_profile,
+        "mean_prompt_tokens": mean_prompt,
         "arms": {label: arm.to_dict() for label, arm in arms.items()},
         "comparison": comparison,
     }

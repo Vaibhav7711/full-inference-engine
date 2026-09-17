@@ -2041,3 +2041,49 @@ If a prefill step still costs ~42 ms at 512 tokens, the cost is per-invocation a
 launch-overhead hypothesis stands. If it rises roughly fourfold, there is a real compute
 component and the per-token-GEMV chunk kernel flagged in the code review is implicated
 instead. The two lead to different work, so the measurement comes first.
+
+
+### chunk 512 vs 128 was a non-binding experiment; the workload is too short
+
+Every metric came back unresolved, and it had to. The soak workload builds prompts of
+20-224 tokens (mean ~122), so **both arms fit every prompt in a single chunk** - 128 and
+512 are identical treatments here. The prefill fraction is the proof: 0.220 vs 0.205,
+unresolved. Had prompts exceeded 128, chunk 512 would have collapsed several prefill steps
+into one and the fraction would have fallen sharply.
+
+A simple model reproduces all three arms. With ~122-token prompts, ~32 output tokens and
+8 concurrent requests, each completed request needs *P* prefill steps and contributes about
+4 shared decode steps:
+
+| chunk | chunks per prompt | predicted fraction | measured |
+|---|---|---|---|
+| 32 | 4 | 0.50 | 0.469 |
+| 128 | 1 | 0.20 | 0.220 |
+| 512 | 1 | 0.20 | 0.205 |
+
+So the chunk 32 finding stands - that treatment was real, and fixed cost dominates in the
+32-128 range. Above 128 remains untested.
+
+**This is the second experiment run with a treatment that could not take effect**, after
+the p999 CUDA-graph comparison where both arms ran identical un-graphed prefill. A null
+result from a non-binding treatment is indistinguishable from a null result from a real
+one, which is what makes the mistake expensive. `ab.py` now runs a pre-flight
+`binding_check` that computes chunks-per-prompt for each arm and refuses to start when they
+are equal, naming the profile to switch to. It covers chunk-size binding only; it cannot
+detect every null-by-construction design.
+
+**The larger problem: the workload is not representative.** Everything measured about
+prefill - 22.6% of steps, 8.24 ms/token of interruption - was taken at ~122-token prompts.
+Real chat traffic carries a system prompt and history, typically 500-4000 tokens. Two
+consequences:
+
+- At ~122 tokens the prompt compute is roughly 146 GFLOP, about 2.25 ms on a T4, so compute
+  is ~5% of a 42 ms prefill step and fixed overhead dominates. At 2048 tokens it is about
+  2.5 TFLOP, roughly 38 ms, and would dominate instead. **The crossover is somewhere near
+  1000-2000 tokens and every measurement so far sits well below it.**
+- At a 128 budget a 2048-token prompt needs 16 chunks. If step cost is fixed at ~42 ms that
+  is ~670 ms of prefill per request, and the interruption to concurrent decoders scales with
+  it. The prefill problem is likely far worse at realistic lengths than measured.
+
+`ab.py` gains `--prompt-profile short|chat|long` (mean ~122, ~656, ~1824 tokens). Every
+prefill conclusion should be re-established on `chat` before any of it guides design.
