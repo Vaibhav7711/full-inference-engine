@@ -12,6 +12,11 @@ inference loop, request lifecycle, cache experiments, scheduling, batching,
 streaming, instrumentation, benchmarks, and correctness boundaries. `model.generate()`
 is only used as a trusted test reference, never as the engine execution path.
 
+> **Status:** see [`docs/checkpoint.md`](docs/checkpoint.md) for validated
+> measurements, retracted claims, gate status and open questions. Parts of this
+> README predate the paged-attention work and are rewritten at the
+> consolidation gate.
+
 ## Run in Google Colab
 
 Choose **Runtime → Change runtime type → GPU**, then run:
