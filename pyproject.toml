@@ -23,3 +23,6 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 include = ["engine*", "benchmarks*"]
+
+[tool.setuptools.package-data]
+"engine.server" = ["static/*.html"]

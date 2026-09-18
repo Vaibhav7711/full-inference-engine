@@ -14,11 +14,15 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+
+_DEMO_UI = Path(__file__).with_name("static") / "index.html"
 
 from engine.runtime import RequestState
 from engine.server.continuous import (
@@ -115,6 +119,10 @@ def create_app(
             service = None
 
     app = FastAPI(title="full-inference-engine", lifespan=lifespan)
+
+    @app.get("/", include_in_schema=False)
+    async def demo_ui() -> FileResponse:
+        return FileResponse(_DEMO_UI)
 
     def require_service() -> ContinuousBatchingService:
         if service is None:

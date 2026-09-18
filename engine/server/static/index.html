@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inference Engine Lab</title>
+  <style>
+    :root { color-scheme: dark; --bg:#091018; --panel:#101b27; --panel2:#142231; --line:#26384a; --text:#edf4fa; --muted:#94a8ba; --blue:#63b5ff; --green:#62d9a0; --amber:#ffca71; --red:#ff8491; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 15% 0%,#152b42 0,transparent 30rem),var(--bg); color:var(--text); font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(1440px,calc(100% - 32px)); margin:0 auto; padding:28px 0 48px; }
+    h1,h2,h3,p { margin:0; } h1 { font-size:26px; letter-spacing:-.04em; } h2 { font-size:15px; } h3 { font-size:13px; }
+    .top { display:flex; align-items:start; justify-content:space-between; gap:20px; margin-bottom:22px; }
+    .eyebrow { color:var(--blue); font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; margin-bottom:4px; }
+    .sub { max-width:720px; color:var(--muted); margin-top:7px; }
+    .chip { display:inline-flex; align-items:center; gap:7px; border:1px solid var(--line); background:rgba(16,27,39,.8); padding:7px 10px; border-radius:999px; color:var(--muted); white-space:nowrap; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--amber); box-shadow:0 0 12px currentColor; } .dot.ready { background:var(--green); } .dot.bad { background:var(--red); }
+    .grid { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(310px,.85fr); gap:16px; }
+    .panel { background:linear-gradient(145deg,rgba(20,34,49,.94),rgba(13,23,34,.94)); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 18px 48px rgba(0,0,0,.16); }
+    .panel-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:13px; }
+    textarea { display:block; resize:vertical; min-height:125px; width:100%; border:1px solid var(--line); outline:none; background:#09131d; color:var(--text); padding:12px; border-radius:9px; font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    textarea:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(99,181,255,.12); }
+    .controls { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin-top:11px; }
+    label { color:var(--muted); font-size:12px; } select,button { border-radius:8px; border:1px solid var(--line); padding:8px 10px; font:inherit; color:var(--text); background:#132131; }
+    button { cursor:pointer; font-weight:650; } button:hover:not(:disabled) { border-color:#5c89ad; background:#1a3043; } button.primary { background:#176ab3; border-color:#388dcc; } button.danger { color:#ffd1d6; } button:disabled { cursor:not-allowed; opacity:.48; }
+    .output { min-height:205px; max-height:365px; overflow:auto; background:#08111a; border:1px solid var(--line); border-radius:9px; padding:13px; margin-top:14px; white-space:pre-wrap; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .metric-row { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:10px; } .metric { background:#0b151f; border:1px solid #203244; border-radius:8px; padding:8px; } .metric b { display:block; font-size:16px; } .metric span { color:var(--muted); font-size:11px; }
+    .telemetry { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; } .telemetry div { border:1px solid #223548; border-radius:8px; padding:9px; background:#0b151f; } .telemetry b { display:block; font-size:16px; } .telemetry span { color:var(--muted); font-size:11px; }
+    .note { color:var(--muted); font-size:12px; margin-top:12px; }
+    .wide { grid-column:1 / -1; } .experiments { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; } .experiment { border:1px solid #24384b; background:#0b151f; border-radius:10px; padding:13px; } .experiment p { color:var(--muted); font-size:12px; min-height:53px; margin:6px 0 11px; } .result { margin-top:10px; color:#c7d8e6; min-height:37px; font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; }
+    .designs { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; } .design { border-left:3px solid var(--blue); background:#0c1721; padding:10px; border-radius:0 8px 8px 0; } .design p { color:var(--muted); font-size:12px; margin-top:4px; }
+    .tips { color:var(--muted); font-size:12px; margin-top:12px; } code { color:#b7dbff; }
+    @media (max-width:900px) { .grid { grid-template-columns:1fr; } .experiments,.designs { grid-template-columns:1fr; } .top { flex-direction:column; } } @media(max-width:520px){ main{width:min(100% - 20px,1440px)} .metric-row{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <div><div class="eyebrow">Interactive demo</div><h1>Inference Engine Lab</h1><p class="sub">A live view into the engine: continuous batching, paged KV memory, prefix reuse, CUDA-graph buckets, and Triton decode kernels.</p></div>
+    <div class="chip"><i id="status-dot" class="dot"></i><span id="server-status">checking engine</span></div>
+  </div>
+  <section class="grid">
+    <div class="panel">
+      <div class="panel-head"><h2>Stream one request</h2><span id="stream-state" class="chip">idle</span></div>
+      <textarea id="prompt">Explain paged KV caching in two concise paragraphs, with an example of why it helps a serving system.</textarea>
+      <div class="controls"><label>Output <select id="max-tokens"><option>32</option><option selected>64</option><option>128</option></select> tokens</label><button id="stream" class="primary">Start streaming</button><button id="cancel" class="danger" disabled>Cancel</button><button id="clear">Clear</button></div>
+      <div id="output" class="output" aria-live="polite">Response will stream here.</div>
+      <div class="metric-row"><div class="metric"><b id="ttft">—</b><span>browser TTFT</span></div><div class="metric"><b id="out-tokens">0</b><span>streamed tokens</span></div><div class="metric"><b id="finish">—</b><span>finish reason</span></div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Live engine telemetry</h2><span id="epoch" class="chip">epoch —</span></div>
+      <div class="telemetry">
+        <div><b id="active">—</b><span>active requests</span></div><div><b id="decode-batch">—</b><span>decode batch</span></div>
+        <div><b id="waiting">—</b><span>waiting requests</span></div><div><b id="context">—</b><span>mean decode context</span></div>
+        <div><b id="kv">—</b><span>KV utilization</span></div><div><b id="prefix">—</b><span>prefix hits / misses</span></div>
+        <div><b id="preemptions">—</b><span>preemptions</span></div><div><b id="completed">—</b><span>completed requests</span></div>
+      </div>
+      <p class="note">These are engine-wide counters from <code>/ready</code>. They show scheduler and memory state, not a per-request kernel trace.</p>
+    </div>
+    <div class="panel wide">
+      <div class="panel-head"><h2>Workload hooks</h2><span class="note">Real calls to this running server</span></div>
+      <div class="experiments">
+        <div class="experiment"><h3>Concurrent fan-out</h3><p>Launch equal requests together. This makes continuous batching and graph buckets visible in aggregate throughput.</p><div class="controls"><label>Requests <select id="fanout-n"><option>2</option><option>4</option><option>8</option><option selected>16</option><option>32</option></select></label><button id="run-fanout">Run</button></div><div id="fanout-result" class="result">Choose 8–16 for a clean demo.</div></div>
+        <div class="experiment"><h3>Exact prefix reuse</h3><p>Send the same long prompt twice. With prefix caching enabled, the second admission should avoid prompt prefill.</p><div class="controls"><button id="run-prefix">Run twice</button></div><div id="prefix-result" class="result">Requires prefix-cache blocks in server config.</div></div>
+        <div class="experiment"><h3>Mixed arrivals</h3><p>Stagger short, medium, and long prompts. Chunked prefill preserves decode progress while long work enters.</p><div class="controls"><button id="run-mixed">Run workload</button></div><div id="mixed-result" class="result">Compare TTFT and output rate, not one isolated token.</div></div>
+      </div>
+      <p class="tips">Demo guide: use 8 or 16 equal requests to see batching; try 32 to expose queueing/backpressure; repeat the exact long prefix to show cache reuse; use mixed arrivals to see why a finite prefill-token budget matters.</p>
+    </div>
+    <div class="panel wide"><div class="panel-head"><h2>What this server is choosing</h2><span class="note">Implementation choices exposed by the demo</span></div>
+      <div class="designs">
+        <div class="design"><h3>Paged KV cache</h3><p>Fixed physical blocks replace grow-and-copy cache tensors. Block tables map each request’s logical tokens into stable pool locations.</p></div>
+        <div class="design"><h3>Continuous batching</h3><p>Every iteration mixes eligible decode rows with bounded prompt chunks, so completed or new requests join without draining the batch.</p></div>
+        <div class="design"><h3>Prefix cache + COW</h3><p>Exact prompt hits share block-table prefixes. A shared final block becomes private only when the next token must be written.</p></div>
+        <div class="design"><h3>CUDA graph buckets</h3><p>Common fixed widths replay captured work. Padded dummy rows keep shapes stable while real request counts vary.</p></div>
+        <div class="design"><h3>Triton decode path</h3><p>Paged attention, KV writes, RMSNorm, RoPE, and SwiGLU avoid many small eager operations during decode.</p></div>
+        <div class="design"><h3>KV dtype dispatch</h3><p>FP16 is the default. INT8 KV is a memory-saving option for long, saturated batches where dequantization overhead can amortize.</p></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const decoder = new TextDecoder();
+let streamAbort = null;
+const longPrefix = "In a GPU inference server, a paged key-value cache stores transformer attention state in fixed-size physical blocks. Explain the allocation, block-table indirection, prefix sharing, and copy-on-write behavior with concrete serving implications.";
+const samples = ["Summarize continuous batching in one paragraph.", "Explain why a scheduler uses a prefill token budget while decode requests are live.", longPrefix + " Include a compact numerical example."];
+function fmt(value, digits = 1) { return Number.isFinite(value) ? Number(value).toFixed(digits) : "—"; }
+function pctl(values, q) { if (!values.length) return NaN; const v = [...values].sort((a,b) => a-b); return v[Math.min(v.length - 1, Math.ceil(q * v.length) - 1)]; }
+function setText(id, value) { $(id).textContent = value; }
+function setBusy(button, busy, text) { button.disabled = busy; if (busy) { button.dataset.label = button.textContent; button.textContent = text; } else button.textContent = button.dataset.label || button.textContent; }
+async function ready() {
+  try {
+    const response = await fetch("/ready", {cache:"no-store"});
+    if (!response.ok) throw new Error(); const r = await response.json();
+    $("status-dot").className = "dot ready"; setText("server-status", r.status || "ready"); setText("epoch", `epoch ${r.progress_epoch ?? "—"}`);
+    setText("active", r.active_requests ?? 0); setText("decode-batch", r.decode_batch ?? 0); setText("waiting", r.waiting_requests ?? 0);
+    setText("context", fmt(r.decode_mean_context)); setText("kv", `${fmt((r.kv_utilization || 0) * 100)}%`);
+    setText("prefix", `${r.prefix_cache_hits ?? 0} / ${r.prefix_cache_misses ?? 0}`); setText("preemptions", r.preemptions_total ?? 0); setText("completed", r.completed_requests ?? 0);
+    return r;
+  } catch (_) { $("status-dot").className = "dot bad"; setText("server-status", "unreachable"); return null; }
+}
+async function generate(prompt, maxTokens = 24) {
+  const r = await fetch("/generate", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({prompt, max_new_tokens:maxTokens})});
+  if (!r.ok) throw new Error(await r.text()); return r.json();
+}
+async function streamRequest() {
+  if (streamAbort) return; const button = $("stream"); streamAbort = new AbortController(); setBusy(button, true, "Streaming…"); $("cancel").disabled = false;
+  setText("stream-state", "live SSE"); setText("output", ""); setText("ttft", "—"); setText("out-tokens", "0"); setText("finish", "—");
+  const started = performance.now(); let first = null, count = 0, buffer = "";
+  try {
+    const response = await fetch("/generate/stream", {method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify({prompt:$("prompt").value, max_new_tokens:Number($("max-tokens").value)}), signal:streamAbort.signal});
+    if (!response.ok || !response.body) throw new Error(await response.text());
+    const reader = response.body.getReader();
+    while (true) { const {done, value} = await reader.read(); if (done) break; buffer += decoder.decode(value, {stream:true}); const frames = buffer.split("\n\n"); buffer = frames.pop();
+      for (const frame of frames) { if (!frame.startsWith("data: ")) continue; const event = JSON.parse(frame.slice(6)); if (event.text !== undefined) { if (first === null) { first = performance.now(); setText("ttft", `${fmt(first - started)} ms`); } $("output").textContent += event.text; count += 1; setText("out-tokens", count); $("output").scrollTop = $("output").scrollHeight; } if (event.finish_reason) setText("finish", event.finish_reason); }
+    }
+    if (!first) setText("finish", "empty"); setText("stream-state", "completed");
+  } catch (error) { setText("stream-state", error.name === "AbortError" ? "cancelled" : "failed"); if (error.name !== "AbortError") $("output").textContent = `Request error: ${error.message}`; }
+  finally { streamAbort = null; setBusy(button, false); $("cancel").disabled = true; ready(); }
+}
+async function fanout() {
+  const button = $("run-fanout"), n = Number($("fanout-n").value); setBusy(button, true, "Running…"); setText("fanout-result", "Submitting concurrent requests…");
+  try { const start = performance.now(); const results = await Promise.all(Array.from({length:n}, (_, i) => generate(`${samples[i % samples.length]} Request ${i + 1}.`, 24))); const ms = performance.now() - start; const tokens = results.reduce((s, r) => s + (r.metrics?.output_tokens || r.token_ids?.length || 0), 0); const ttfts = results.map(r => r.metrics?.ttft_ms).filter(Number.isFinite); setText("fanout-result", `${n} requests · ${tokens} tokens · ${fmt(tokens / (ms / 1000))} tok/s\nwall ${fmt(ms)} ms · server TTFT p50/p95 ${fmt(pctl(ttfts,.5))}/${fmt(pctl(ttfts,.95))} ms`); }
+  catch (e) { setText("fanout-result", `Failed: ${e.message}`); } finally { setBusy(button, false); ready(); }
+}
+async function prefix() {
+  const button = $("run-prefix"); setBusy(button, true, "Running…"); setText("prefix-result", "First long prompt then an exact repeat…");
+  try { const before = await ready(); const first = await generate(longPrefix, 20); const second = await generate(longPrefix, 20); const after = await ready(); const a = first.metrics?.ttft_ms, b = second.metrics?.ttft_ms; const hitDelta = (after?.prefix_cache_hits || 0) - (before?.prefix_cache_hits || 0); setText("prefix-result", `TTFT first/repeat ${fmt(a)}/${fmt(b)} ms · cache-hit delta ${hitDelta}\n${hitDelta > 0 ? "Exact prefix reused." : "No observed hit: enable prefix-cache blocks or inspect prompt policy."}`); }
+  catch (e) { setText("prefix-result", `Failed: ${e.message}`); } finally { setBusy(button, false); ready(); }
+}
+async function mixed() {
+  const button = $("run-mixed"); setBusy(button, true, "Running…"); setText("mixed-result", "Staggering short, medium, long prompts…");
+  try { const start = performance.now(); const jobs = samples.map((prompt, i) => new Promise(resolve => setTimeout(resolve, i * 80)).then(() => generate(prompt, 28))); const results = await Promise.all(jobs); const ms = performance.now() - start; const tokens = results.reduce((s,r) => s + (r.metrics?.output_tokens || 0), 0); const ttfts = results.map(r => r.metrics?.ttft_ms).filter(Number.isFinite); setText("mixed-result", `3 staggered requests · ${fmt(tokens/(ms/1000))} tok/s\nTTFT p50/p95 ${fmt(pctl(ttfts,.5))}/${fmt(pctl(ttfts,.95))} ms · wall ${fmt(ms)} ms`); }
+  catch (e) { setText("mixed-result", `Failed: ${e.message}`); } finally { setBusy(button, false); ready(); }
+}
+$("stream").onclick = streamRequest; $("cancel").onclick = () => streamAbort?.abort(); $("clear").onclick = () => { setText("output", ""); }; $("run-fanout").onclick = fanout; $("run-prefix").onclick = prefix; $("run-mixed").onclick = mixed;
+ready(); setInterval(ready, 900);
+</script>
+</body>
+</html>
