@@ -149,6 +149,46 @@ def _clamp_graph_buckets(settings: dict, max_active: int) -> dict:
     return settings
 
 
+def _stock_reference(loaded, prompts: list[str], max_new_tokens: int) -> list[list[int]]:
+    """Greedy continuations from unpatched Transformers: SDPA, DynamicCache, stock RoPE.
+
+    Must run before any engine is built on this model object, since the engine installs
+    Triton RMSNorm/SwiGLU on it in place; the RoPE install is process-global and is
+    undone here explicitly in case an engine already exists in this process.
+    """
+    import torch
+
+    from engine.kernels.rope import stock_rope
+
+    model, tokenizer = loaded.model, loaded.tokenizer
+    model.config._attn_implementation = "sdpa"
+    if hasattr(model.config, "_attn_implementation_internal"):
+        model.config._attn_implementation_internal = "sdpa"
+    outputs = []
+    with stock_rope(), torch.inference_mode():
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors="pt").input_ids.to(loaded.device)
+            generated = model.generate(
+                ids, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            outputs.append(generated[0, ids.shape[1]:].tolist())
+    return outputs
+
+
+def _first_divergence(arm: list[list[int]], reference: list[list[int]]) -> list[int | None]:
+    """Per prompt, the index of the first token that differs from the reference, or None."""
+    result = []
+    for produced, expected in zip(arm, reference):
+        index = next(
+            (i for i, (a, b) in enumerate(zip(produced, expected)) if a != b), None,
+        )
+        if index is None and len(produced) != len(expected):
+            index = min(len(produced), len(expected))
+        result.append(index)
+    return result
+
+
 def _verdict(baseline: dict, variant: dict) -> str:  # noqa: D401
     """Call a difference real only when it exceeds the noise in both arms."""
     if not baseline.get("n") or not variant.get("n"):
@@ -232,6 +272,10 @@ def main() -> int:
 
         makers[label] = make_engine
 
+    # Stock greedy reference, computed before any engine patches the shared model. It
+    # decides which arm is closer to the truth when the gate below finds a difference.
+    reference = _stock_reference(loaded, IDENTITY_PROMPTS, 48)
+
     # Token-identity gate before anything is timed. Each arm generates the same fixed
     # prompts greedily on a warmed engine; the outputs must match unless the setting is
     # one that legitimately changes numerics.
@@ -242,6 +286,9 @@ def main() -> int:
         identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
         del engine
     labels = list(makers)
+    divergence = {label: _first_divergence(identity[label], reference) for label in labels}
+    for label in labels:
+        print(f"vs stock reference, first divergent token per prompt: {label}={divergence[label]}")
     drift = [label for label in labels[1:] if identity[label] != identity[labels[0]]]
     if drift:
         message = f"greedy tokens differ across arms: {drift} vs {labels[0]}"
@@ -330,7 +377,8 @@ def main() -> int:
         "environment": environment_record(loaded.device),
         "git": git_record(),
         "clocks_before": clocks_before, "clocks_after": clocks_after,
-        "token_identity": {"identical": not drift, "drifted_arms": drift},
+        "token_identity": {"identical": not drift, "drifted_arms": drift,
+                           "first_divergence_vs_stock": divergence},
         "order": "interleaved",
         "arms": {label: arm.to_dict() for label, arm in arms.items()},
         "comparison": comparison,
