@@ -18,14 +18,21 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
+_MODEL = None
+
+
 def _load():
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, dtype=torch.float16, device_map="cuda", trust_remote_code=True,
-    )
-    model.eval()
-    return model, tok
+    """One checkpoint for every engine in this module; loading per test is 1.2 GB each."""
+    global _MODEL
+    if _MODEL is None:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME, dtype=torch.float16, device_map="cuda", trust_remote_code=True,
+        )
+        model.eval()
+        _MODEL = (model, tok)
+    return _MODEL
 
 
 def _engine(**overrides):

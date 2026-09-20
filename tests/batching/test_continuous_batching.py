@@ -27,7 +27,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
-def _load():
+def _load_fresh():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -35,6 +35,22 @@ def _load():
     )
     model.eval()
     return model, tok
+
+
+_ENGINE_MODEL = None
+
+
+def _load():
+    """One checkpoint shared by every engine in this module, as the A/B harness does.
+
+    The engine's kernel installers are idempotent and nothing here mutates the model
+    irreversibly, so a fresh 1.2 GB load per test bought nothing but time and, with the
+    caching allocator holding earlier blocks, an OOM by the twentieth test on a T4.
+    """
+    global _ENGINE_MODEL
+    if _ENGINE_MODEL is None:
+        _ENGINE_MODEL = _load_fresh()
+    return _ENGINE_MODEL
 
 
 _STOCK_MODEL = None
@@ -48,7 +64,7 @@ def _stock_model():
     """
     global _STOCK_MODEL
     if _STOCK_MODEL is None:
-        _STOCK_MODEL, _ = _load()
+        _STOCK_MODEL, _ = _load_fresh()
     return _STOCK_MODEL
 
 
