@@ -32,6 +32,12 @@ Choose **Runtime → Change runtime type → GPU**, then run:
 `requirements-colab.txt` intentionally does not reinstall PyTorch. Colab's supplied
 build is CUDA matched; replacing it can create a CUDA/PyTorch incompatibility.
 
+## Run on Kaggle's T4, from VS Code
+
+See [`docs/kaggle-setup.md`](docs/kaggle-setup.md) for wiring VS Code's
+Remote-SSH extension into a Kaggle GPU notebook via an SSH-over-ngrok tunnel,
+so you can edit and run this repo on a real T4 without leaving your editor.
+
 ## Architecture
 
 ```text
