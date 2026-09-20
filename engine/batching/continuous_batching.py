@@ -222,7 +222,10 @@ class ContinuousBatchingEngine:
                  kv_cache_dtype: str = "fp16",
                  cuda_graph_batch_size: int | None = None,
                  cuda_graph_batch_sizes: tuple[int, ...] | None = None,
-                 fuse_mlp_gate_up: bool = False):
+                 fuse_mlp_gate_up: bool = False,
+                 triton_rmsnorm: bool = True,
+                 triton_rope: bool = True,
+                 triton_swiglu: bool = True):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
@@ -253,6 +256,9 @@ class ContinuousBatchingEngine:
         self.kv_cache_dtype = kv_cache_dtype
         self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or ()
         self.fuse_mlp_gate_up = fuse_mlp_gate_up
+        self.triton_rmsnorm = triton_rmsnorm
+        self.triton_rope = triton_rope
+        self.triton_swiglu = triton_swiglu
         self._decode_graphs = {}
 
         cfg = model.config
@@ -289,14 +295,32 @@ class ContinuousBatchingEngine:
 
         # Qwen uses RMSNorm for hidden states and for per-head Q/K normalization.
         # Install one FP32-accumulating Triton kernel for both shapes before warmup.
-        from engine.kernels.rmsnorm import install_triton_rmsnorm
-        from engine.kernels.rope import install_triton_qwen_rope
-        from engine.kernels.swiglu import install_triton_qwen_swiglu
-        self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
-        install_triton_qwen_rope()
-        self.triton_swiglu_modules = install_triton_qwen_swiglu(
-            model, fuse_gate_up=fuse_mlp_gate_up,
-        )
+        # Each fusion is a toggle so an A/B can attribute it: a `False` flag actively
+        # restores the stock implementation, because benchmarks build several engines
+        # on one shared model object and a previous engine may have patched it.
+        from engine.kernels.rmsnorm import install_triton_rmsnorm, uninstall_triton_rmsnorm
+        from engine.kernels.rope import install_triton_qwen_rope, uninstall_triton_qwen_rope
+        from engine.kernels.swiglu import install_triton_qwen_swiglu, uninstall_triton_qwen_swiglu
+        if triton_rmsnorm:
+            self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
+        else:
+            uninstall_triton_rmsnorm(model)
+            self.triton_rmsnorm_modules = 0
+        if triton_rope:
+            install_triton_qwen_rope()
+        else:
+            uninstall_triton_qwen_rope()
+        if fuse_mlp_gate_up and not triton_swiglu:
+            raise ValueError("fuse_mlp_gate_up requires triton_swiglu=True")
+        # Re-install when the fusion mode changes: the installer is a no-op on an
+        # already patched module, so a prior engine's choice would otherwise persist.
+        uninstall_triton_qwen_swiglu(model)
+        if triton_swiglu:
+            self.triton_swiglu_modules = install_triton_qwen_swiglu(
+                model, fuse_gate_up=fuse_mlp_gate_up,
+            )
+        else:
+            self.triton_swiglu_modules = 0
 
         self.eos_ids = set()
         ce = model.generation_config.eos_token_id

@@ -22,7 +22,15 @@ from pathlib import Path
 from benchmarks.common import device_clock_record, environment_record, git_record
 from benchmarks.reliability.soak import SoakConfig, run_interleaved
 
-# Each arm is (label, engine keyword overrides). Everything not listed is shared.
+def _padded_buckets(max_active: int) -> tuple[int, ...]:
+    return tuple(size for size in (1, 2, 4, 8, 16, 32, 64) if size <= max_active) or (1,)
+
+
+# Each arm is (label, engine keyword overrides). Everything not listed is shared. An
+# override may also be a callable of `max_active`, for settings whose value only makes
+# sense relative to the engine's width (graph buckets are rejected above `max_active`).
+# Two keys are consumed by this harness rather than the engine: `warmup` (False skips
+# the pre-timing warmup so first-use capture/JIT lands inside the measured window).
 SETTINGS: dict[str, list[tuple[str, dict]]] = {
     # Graph buckets are clamped to max_active at build time, so this list is an upper
     # bound rather than a fixed configuration.
@@ -66,7 +74,75 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("chunk_16", {"prefill_chunk_size": 16,
                       "max_prefill_tokens_per_iteration": 16}),
     ],
+    # Elementwise fusions, one at a time. Run each twice, with and without
+    # --cuda-graphs: they mostly removed launch cost, which graphs remove as well, so
+    # their marginal value depends on whether graphs are present.
+    "triton_rmsnorm": [
+        ("stock_rmsnorm", {"triton_rmsnorm": False}),
+        ("triton_rmsnorm", {"triton_rmsnorm": True}),
+    ],
+    "triton_rope": [
+        ("stock_rope", {"triton_rope": False}),
+        ("triton_rope", {"triton_rope": True}),
+    ],
+    "triton_swiglu": [
+        ("stock_swiglu", {"triton_swiglu": False}),
+        ("triton_swiglu", {"triton_swiglu": True}),
+    ],
+    # Phase 9 re-run: the original "neutral" result paid two .contiguous() copies per
+    # layer that the strided SwiGLU kernel no longer needs.
+    "mlp_gate_up": [
+        ("separate_gate_up", {"fuse_mlp_gate_up": False}),
+        ("fused_gate_up", {"fuse_mlp_gate_up": True}),
+    ],
+    # Phase 7 vs Phase 8: one exact-width bucket against padded power-of-two buckets.
+    "graph_buckets_padded": [
+        ("exact_bucket", lambda max_active: {"cuda_graph_batch_sizes": (max_active,)}),
+        ("padded_buckets", lambda max_active: {"cuda_graph_batch_sizes": _padded_buckets(max_active)}),
+    ],
+    # Serving warmup: does paying capture/JIT before the window move the tail?
+    "warmup": [
+        ("cold_start", {"warmup": False}),
+        ("warmed", {"warmup": True}),
+    ],
 }
+
+
+# Leave-one-out: everything on, then each optimization removed alone. `full` is the
+# recommended serving configuration; contribution is metric(full) - metric(minus_x).
+# Persistent metadata, batched KV writes and the like have no toggle and are measured
+# by the commit ladder instead (docs/t4-reevaluation-plan.md, session B).
+FULL: dict = {
+    "cuda_graph_batch_sizes": _padded_buckets,
+    "prefix_cache_blocks": 64,
+    "tiled_prefill": True,
+    "triton_rmsnorm": True, "triton_rope": True, "triton_swiglu": True,
+}
+LEAVE_ONE_OUT: dict[str, dict] = {
+    "graphs": {"cuda_graph_batch_sizes": None},
+    "prefix_cache": {"prefix_cache_blocks": 0},
+    "tiled_prefill": {"tiled_prefill": False},
+    "rmsnorm": {"triton_rmsnorm": False},
+    "rope": {"triton_rope": False},
+    "swiglu": {"triton_swiglu": False},
+}
+for _name, _off in LEAVE_ONE_OUT.items():
+    SETTINGS[f"loo_{_name}"] = [("full", FULL), (f"minus_{_name}", {**FULL, **_off})]
+# All leave-one-out arms interleaved in one run, sharing one `full` baseline.
+SETTINGS["loo_all"] = [("full", FULL)] + [
+    (f"minus_{name}", {**FULL, **off}) for name, off in LEAVE_ONE_OUT.items()
+]
+
+
+def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[str, dict]]:
+    """Evaluate callable overrides against the engine width."""
+    resolved = []
+    for label, overrides in arms:
+        if callable(overrides):
+            overrides = overrides(max_active)
+        overrides = {k: (v(max_active) if callable(v) else v) for k, v in overrides.items()}
+        resolved.append((label, overrides))
+    return resolved
 
 
 # Settings whose arms are allowed to produce different greedy tokens. Everything else
@@ -245,7 +321,8 @@ def main() -> int:
         shared["cuda_graph_batch_sizes"] = graph_buckets(args.max_active)
     profile = PROMPT_PROFILES[args.prompt_profile]
     mean_prompt = mean_prompt_tokens(profile)
-    problem = binding_check(SETTINGS[args.setting], mean_prompt)
+    arms_spec = resolve_arms(SETTINGS[args.setting], args.max_active)
+    problem = binding_check(arms_spec, mean_prompt)
     if problem and not args.allow_non_binding:
         print(f"refusing to run: {problem}")
         return 2
@@ -261,14 +338,21 @@ def main() -> int:
 
     makers = {}
     arm_settings = {}
-    for label, overrides in SETTINGS[args.setting]:
+    for label, overrides in arms_spec:
         settings = _clamp_graph_buckets({**shared, **overrides}, args.max_active)
+        if settings.get("cuda_graph_batch_sizes") is None:
+            settings.pop("cuda_graph_batch_sizes", None)
         arm_settings[label] = settings
+        harness_keys = {"warmup"}
+        engine_kwargs = {k: v for k, v in settings.items() if k not in harness_keys}
+        skip_warmup = settings.get("warmup", True) is False
 
-        def make_engine(settings=settings):
-            return ContinuousBatchingEngine(
-                loaded.model, loaded.tokenizer, loaded.device, **settings
+        def make_engine(engine_kwargs=engine_kwargs, skip_warmup=skip_warmup):
+            engine = ContinuousBatchingEngine(
+                loaded.model, loaded.tokenizer, loaded.device, **engine_kwargs
             )
+            engine.skip_benchmark_warmup = skip_warmup
+            return engine
 
         makers[label] = make_engine
 
@@ -282,7 +366,7 @@ def main() -> int:
     identity = {}
     for label, make_engine in makers.items():
         engine = make_engine()
-        engine.warmup()
+        engine.warmup()  # the gate checks tokens, not first-use cost; always warm here
         identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
         del engine
     labels = list(makers)
@@ -349,24 +433,31 @@ def main() -> int:
               f"{arm.summary('latency.itl_p50').get('median', 0):.2f} "
               f"--itl-batch {max(1, round(batch))} --itl-context {max(1, round(context))}")
 
-    baseline, variant = arms[labels[0]], arms[labels[1]]
-    print(f"\n=== {labels[1]} vs {labels[0]} ===")
-    comparison = {}
+    # Every arm after the first is compared against the first. With two arms this is
+    # the usual A/B; `loo_all` compares each leave-one-out arm against the shared `full`.
     # expected_gap_ms leads because it is the only latency metric sensitive to a change
     # in the *mix* of step kinds. A median over token gaps is not: when prefill rose from
     # 22.7% to 46.9% of steps, itl_p50 stayed inside noise because the median gap was
     # still a decode step, while the average gap worsened 49%.
-    for metric in ("step_timing.expected_gap_ms", "step_timing.prefill_share_of_gap",
-                   "latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
-                   "latency.ttft_p50", "step_timing.decode_step_p50_ms",
-                   "step_timing.prefill_step_p50_ms",
-                   "step_timing.prefill_step_fraction",
-                   "step_timing.prefill_penalty_p50_ms", "waste_ratio",
-                   "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
-                   "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50"):
-        verdict = _verdict(baseline.summary(metric), variant.summary(metric))
-        comparison[metric] = verdict
-        print(f"  {metric:24s} {verdict}")
+    COMPARED = ("step_timing.expected_gap_ms", "step_timing.prefill_share_of_gap",
+                "latency.itl_p50", "latency.itl_p99", "latency.itl_p999",
+                "latency.ttft_p50", "step_timing.decode_step_p50_ms",
+                "step_timing.prefill_step_p50_ms",
+                "step_timing.prefill_step_fraction",
+                "step_timing.prefill_penalty_p50_ms", "waste_ratio",
+                "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
+                "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50")
+    baseline = arms[labels[0]]
+    comparisons = {}
+    for label in labels[1:]:
+        variant = arms[label]
+        print(f"\n=== {label} vs {labels[0]} ===")
+        comparisons[label] = {}
+        for metric in COMPARED:
+            verdict = _verdict(baseline.summary(metric), variant.summary(metric))
+            comparisons[label][metric] = verdict
+            print(f"  {metric:24s} {verdict}")
+    comparison = comparisons[labels[1]]  # two-arm shape, kept for existing readers
 
     payload = {
         "setting": args.setting, "repeats": args.repeats,
@@ -382,6 +473,7 @@ def main() -> int:
         "order": "interleaved",
         "arms": {label: arm.to_dict() for label, arm in arms.items()},
         "comparison": comparison,
+        "comparisons": comparisons,
     }
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

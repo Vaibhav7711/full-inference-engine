@@ -260,6 +260,41 @@ def test_d3_full_generation_matches_ref():
 
 @cuda
 @requires_cuda
+@pytest.mark.parametrize("disabled", ["triton_rmsnorm", "triton_rope", "triton_swiglu"])
+def test_d3_each_fusion_toggle_off_matches_ref(disabled):
+    """A fusion switched off must fall back to stock kernels, token-identically, and the
+    switch must take effect on a model object a previous engine already patched: the A/B
+    harness builds every arm on one shared checkpoint."""
+    import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
+
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    # A fully patched engine first, so the toggled engine has to undo its work.
+    ContinuousBatchingEngine(model, tok, "cuda", num_blocks=256, block_size=16, max_active=4)
+    eng = ContinuousBatchingEngine(model, tok, "cuda", num_blocks=2048, block_size=16,
+                                   max_active=8, **{disabled: False})
+
+    norms = [m for m in model.modules() if m.__class__.__name__.lower().endswith("rmsnorm")]
+    mlps = [m for m in model.modules() if m.__class__.__name__.lower() == "qwen3mlp"]
+    rmsnorm_on = any(hasattr(m, "_pre_triton_rmsnorm_forward") for m in norms)
+    swiglu_on = any(hasattr(m, "_pre_triton_swiglu_forward") for m in mlps)
+    rope_on = hasattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb")
+    assert rmsnorm_on == (disabled != "triton_rmsnorm")
+    assert swiglu_on == (disabled != "triton_swiglu")
+    assert rope_on == (disabled != "triton_rope")
+
+    prompts = ["The capital of France is", "The transformer architecture works by"]
+    refs = [_reference_greedy(tok, p, max_new_tokens=24) for p in prompts]
+    outs = eng.generate(prompts, max_new_tokens=24)
+    assert outs == refs, f"{disabled}=False diverged from stock reference: {outs} vs {refs}"
+
+    # Leave the shared model fully patched for the tests that follow.
+    ContinuousBatchingEngine(model, tok, "cuda", num_blocks=256, block_size=16, max_active=4)
+
+
+@cuda
+@requires_cuda
 def test_d3_mixed_lengths_and_staggered():
     """Sequences of very different prompt lengths + generation lengths batched together."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from benchmarks.reliability.ab import SETTINGS, _clamp_graph_buckets, graph_buckets
+from benchmarks.reliability.ab import (
+    FULL, LEAVE_ONE_OUT, SETTINGS, _clamp_graph_buckets, graph_buckets, resolve_arms,
+)
 
 
 def test_graph_buckets_never_exceed_max_active() -> None:
@@ -36,12 +38,32 @@ def test_clamp_passes_through_an_explicit_none() -> None:
 def test_every_declared_setting_survives_clamping_at_common_concurrencies() -> None:
     for name, arms in SETTINGS.items():
         for max_active in (1, 4, 8, 16):
-            for label, overrides in arms:
+            for label, overrides in resolve_arms(arms, max_active):
+                assert not any(callable(v) for v in overrides.values()), (name, label)
                 settings = _clamp_graph_buckets(dict(overrides), max_active)
                 buckets = settings.get("cuda_graph_batch_sizes")
                 assert buckets is None or all(s <= max_active for s in buckets), (
                     name, label, max_active, buckets
                 )
+
+
+def test_leave_one_out_arms_differ_from_full_in_exactly_the_named_setting() -> None:
+    """Attribution is only valid when one thing moves; a `minus_x` arm that also drifts
+    another key would measure two changes and credit one."""
+    full = dict(resolve_arms([("full", FULL)], 8)[0][1])
+    for name, off in LEAVE_ONE_OUT.items():
+        arms = dict(resolve_arms(SETTINGS[f"loo_{name}"], 8))
+        assert arms["full"] == full
+        diff = {k for k in full if full[k] != arms[f"minus_{name}"].get(k)}
+        assert diff == set(off), (name, diff)
+    assert [label for label, _ in SETTINGS["loo_all"]][0] == "full"
+    assert len(SETTINGS["loo_all"]) == 1 + len(LEAVE_ONE_OUT)
+
+
+def test_padded_bucket_setting_is_exact_width_versus_powers_of_two() -> None:
+    arms = dict(resolve_arms(SETTINGS["graph_buckets_padded"], 8))
+    assert arms["exact_bucket"]["cuda_graph_batch_sizes"] == (8,)
+    assert arms["padded_buckets"]["cuda_graph_batch_sizes"] == (1, 2, 4, 8)
 
 
 # ------------------------------------------------ pre-flight: can the treatment take effect?

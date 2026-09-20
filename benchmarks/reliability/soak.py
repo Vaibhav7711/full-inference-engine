@@ -526,8 +526,12 @@ def run_repeated(make_engine, config: SoakConfig, repeats: int = 5,
 
 
 def _warmed(engine):
-    """Pay graph capture and kernel JIT before the timed window, never inside it."""
-    if hasattr(engine, "warmup"):
+    """Pay graph capture and kernel JIT before the timed window, never inside it.
+
+    `skip_benchmark_warmup` is set by an A/B arm that wants to measure exactly that
+    first-use cost landing on live requests; everything else warms.
+    """
+    if hasattr(engine, "warmup") and not getattr(engine, "skip_benchmark_warmup", False):
         engine.warmup()
     return engine
 
