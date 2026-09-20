@@ -46,14 +46,49 @@ def kernel_diagnostics(kernel_fn) -> dict:
         if not compiled:
             return {}
         latest = compiled[-1]
-        return {
+        report = {
             "n_regs": getattr(latest, "n_regs", None),
             "n_spills": getattr(latest, "n_spills", None),
             "shared_bytes": getattr(latest, "metadata", None)
             and getattr(latest.metadata, "shared", None),
         }
+        report.update(ptx_report(getattr(latest, "asm", {}).get("ptx", "")))
+        return report
     except Exception:
         return {}
+
+
+def ptx_report(ptx: str) -> dict:
+    """What the compiler actually emitted, counted from the PTX.
+
+    Three questions a timing cannot answer, each visible as an instruction count:
+
+    - `mma_sync`: did `tl.dot` reach the tensor cores? Triton supports sm_80+ officially;
+      on Turing a dot can lower to `fma.rn.f32` loops instead, and a "tensor-core" kernel
+      that is really an FMA loop through MMA-shaped layout shuffles is slower than the
+      naive multiply-reduce it was meant to replace. Zero here is the whole story.
+    - `local_ld/st`: register spills. Anything in the hundreds means every loop iteration
+      round-trips local memory.
+    - `global_ld_vec / global_ld_scalar`: whether the gathered K/V tiles load 16 bytes at a
+      time (`ld.global.v4`) or one element at a time (`ld.global.b16`), i.e. whether the
+      compiler could prove the page rows contiguous along head_dim.
+    """
+    if not ptx:
+        return {}
+    import re
+
+    def count(pattern: str) -> int:
+        return len(re.findall(pattern, ptx))
+
+    return {
+        "mma_sync": count(r"\bmma\.sync"),
+        "fma_f32": count(r"\bfma\.rn\.f32"),
+        "local_ld": count(r"\bld\.local"),
+        "local_st": count(r"\bst\.local"),
+        "global_ld_vec": count(r"\bld\.global[.\w]*\.v[24]\."),
+        "global_ld_scalar": count(r"\bld\.global[.\w]*\.(?:b16|u16|f16|b32|u32)\s"),
+        "bar_sync": count(r"\bbar\.sync"),
+    }
 
 
 def _time_ms(fn, warmup: int = 3, iters: int = 10) -> float:
@@ -118,6 +153,43 @@ def ideal_kv_bytes(batch, q_heads, start, chunk, block_m):
     return entries * batch * q_heads * 2 * HEAD_DIM * BYTES
 
 
+def _ptx_only(args) -> int:
+    """Compile each kernel on one representative shape and report the instruction mix.
+
+    A kernel that is 100x off its hardware's peak is not mistuned, it is not doing what
+    its source says. This answers that before any timing: tensor cores or FMA, spills or
+    not, vector or scalar loads - for the tiled kernel and, as a control, the per-token
+    kernel it was meant to replace.
+    """
+    from engine.kernels.paged_prefill import _paged_prefill_kernel
+    from engine.kernels.tiled_paged_prefill import _tiled_paged_prefill_kernel
+
+    tensors = _build(args.batch, args.q_heads, args.kv_heads, args.prefix, args.chunks[0])
+    paged_prefill(*tensors)
+    torch.cuda.synchronize()
+    old = kernel_diagnostics(_paged_prefill_kernel)
+    tiled_paged_prefill(*tensors, block_m=args.block_m, block_n=args.block_n,
+                        num_warps=args.num_warps)
+    torch.cuda.synchronize()
+    new = kernel_diagnostics(_tiled_paged_prefill_kernel)
+    keys = ["n_regs", "n_spills", "shared_bytes", "mma_sync", "fma_f32", "local_ld",
+            "local_st", "global_ld_vec", "global_ld_scalar", "bar_sync"]
+    print(f"{'':18s}{'per_token':>12s}{'tiled':>12s}")
+    for key in keys:
+        print(f"{key:18s}{str(old.get(key, '?')):>12s}{str(new.get(key, '?')):>12s}")
+    verdicts = []
+    if new.get("mma_sync") == 0:
+        verdicts.append("tl.dot did NOT reach the tensor cores: no mma.sync in the tiled PTX. "
+                        "The kernel is an FMA loop through MMA-shaped layout shuffles.")
+    if (new.get("local_ld") or 0) > 0:
+        verdicts.append(f"tiled kernel spills: {new['local_ld']} local loads in the PTX.")
+    if (new.get("global_ld_scalar") or 0) > (new.get("global_ld_vec") or 0):
+        verdicts.append("tiled K/V gathers are scalar loads; contiguity along head_dim was not proven.")
+    print("\n" + ("\n".join(verdicts) if verdicts else "no structural defect visible in the PTX; "
+                                                   "the loss is in scheduling/occupancy, sweep tiles"))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=4)
@@ -128,6 +200,8 @@ def main() -> int:
     parser.add_argument("--block-m", type=int, default=32)
     parser.add_argument("--block-n", type=int, default=64)
     parser.add_argument("--sweep-tiles", action="store_true")
+    parser.add_argument("--ptx-only", action="store_true",
+                        help="compile both kernels once and print what the compiler emitted; no timing")
     parser.add_argument("--num-warps", type=int, default=8)
     parser.add_argument("--bandwidth-gbps", type=float, default=258.8,
                         help="measured achieved bandwidth, from roofline.py")
@@ -140,6 +214,9 @@ def main() -> int:
     print(f"device: {torch.cuda.get_device_name(0)}")
     print(f"batch={args.batch} q_heads={args.q_heads} kv_heads={args.kv_heads} "
           f"prefix={args.prefix}\n")
+
+    if args.ptx_only:
+        return _ptx_only(args)
 
     payload: dict = {"config": vars(args), "points": [], "fits": {}}
     print("A dense SDPA reference is included as an upper bound: same maths on gathered\n"
@@ -168,6 +245,10 @@ def main() -> int:
             note = f"  SPILLS {spills} bytes/thread"
         elif diag.get("n_regs"):
             note = f"  {diag['n_regs']} regs, {diag.get('shared_bytes', 0)} smem"
+        if "mma_sync" in diag:
+            note += (f", mma={diag['mma_sync']} fma={diag['fma_f32']} "
+                     f"spill_ld={diag['local_ld']} vec_ld={diag['global_ld_vec']} "
+                     f"scalar_ld={diag['global_ld_scalar']} bar={diag['bar_sync']}")
         import torch as _t
         sms = _t.cuda.get_device_properties(0).multi_processor_count
         blocks = args.batch * args.q_heads * -(-chunk // args.block_m)
@@ -228,7 +309,9 @@ def main() -> int:
             spill = diag.get("n_spills") or 0
             print(f"  M={block_m:3d} N={block_n:3d} w={warps} s={stages} "
                   f"kT={'y' if transposed else 'n'} -> {ms:8.3f} ms  "
-                  f"regs={str(diag.get('n_regs', '?')):>4} spills={spill:>5}{marker}")
+                  f"regs={str(diag.get('n_regs', '?')):>4} spills={spill:>5} "
+                  f"mma={diag.get('mma_sync', '?')} spill_ld={diag.get('local_ld', '?')} "
+                  f"vec_ld={diag.get('global_ld_vec', '?')} scalar_ld={diag.get('global_ld_scalar', '?')}{marker}")
         payload["sweep"] = sweep
         if best:
             print(f"\n  best: BLOCK_M={best[1]} BLOCK_N={best[2]} num_warps={best[3]} "
