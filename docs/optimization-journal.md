@@ -2399,3 +2399,58 @@ Left as found, pending measurement or a design decision: `tiled_prefill=True` de
 (D2 measured 0.3x before the tile defaults were corrected), SDPA fast path being
 all-or-nothing across a plan batch, budget remainders planned as sub-chunk slivers, SSE
 handlers polling every 5 ms per stream on the event loop.
+
+## The tiled prefill kernel never used the tensor cores
+
+Status: `DIAGNOSED — default flipped to the per-token kernel`. Kaggle T4, Triton compiled
+kernels read directly (`benchmarks/kernels/prefill_attention_ab.py --ptx-only`, batch 4,
+16/8 heads, prefix 896, chunk 64):
+
+| | per_token | tiled |
+|---|---|---|
+| `mma.sync` in PTX | 0 | **0** |
+| `fma.rn.f32` in PTX | 65 | **2052** |
+| registers / spill bytes | 72 / 0 | **255 / 128** |
+| shared memory | 2 KB | **49 KB** (T4: 64 KB per SM → one block per SM) |
+| K/V global loads | mostly 16-byte vector | scalar |
+
+`tl.dot` did not lower to an MMA instruction on this Triton/sm_75 combination. Both dots
+are FMA loops, but they still run through the shared-memory layout conversions that exist
+to feed tensor cores - that is the 49 KB - so the kernel pays for tensor-core plumbing and
+gets CUDA-core arithmetic, at one block per SM, spilling. This is why a kernel moving 60x
+fewer bytes than the naive one ran 3x slower (D2), and why tuning its tile shape could
+not help: the instruction the design is built on is absent on the device.
+
+Two earlier readings are corrected by this:
+
+- D2's "0.2% of tensor-core peak" was measured against a peak the kernel could not reach.
+  Against the CUDA-core peak it is ~1.4%, with occupancy and spills accounting for the rest.
+- The per-token kernel's "4.3% of peak" is a lean kernel (72 registers, no spills, many
+  blocks per SM) that is bandwidth-bound on redundant reads. That is the right shape to
+  fix, not the wrong design.
+
+Also found on the same pass: the engine A/B token-identity gate refused `tiled` versus
+`per_token` - the two produce different greedy tokens on ~50-token continuations of
+long prompts, though both pass the short-prompt reference tests. fp16 P·V accumulation
+against fp32 is the likely cause.
+
+Decision: `tiled_prefill` defaults to `False`. The engine had run the tiled kernel on every
+chunked prefill since the D2 commit; the first Kaggle pass measured that path at 0.77
+ms/token on chat prompts (98 ms per 128-token step) against the 0.405 ms/token fitted for
+the per-token kernel in Phase B. The `prefill_chunk` and `kv_dtype` A/Bs from that pass are
+confounded by it (their prefill "wins" are the slow kernel doing less work per step, and
+the INT8 arm running a per-token-structured kernel) and are to be re-run.
+
+Next for prefill, in order:
+
+1. **Gather + SDPA for chunked prefill.** The benchmark's "upper bound" is a valid
+   implementation: gather the prefix pages into a dense tensor, call
+   `F.scaled_dot_product_attention`. PyTorch's mem-efficient kernel does use the T4's
+   tensor cores. Gather cost at a 896 prefix is ~3.7 MB per row per layer, ~1.6 ms per
+   28-layer chunk step at the measured 258 GB/s, against 37 ms per layer for the tiled
+   kernel. It is also the same kernel the fresh-prompt path uses, so it should match that
+   path's tokens rather than drift.
+2. If a Triton kernel is still wanted: a register-tiled CUDA-core kernel - one K/V tile
+   loaded per program, an unrolled loop over BLOCK_M query rows using the per-token
+   kernel's `tl.sum(q * k)` body. The byte saving without `tl.dot` and without the
+   shared-memory shuffles. Only worth building if (1) leaves something on the table.

@@ -77,10 +77,12 @@ class _PrefillContext:
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
     # Which fp16 prefill attention kernel to run. The tiled kernel loads each KV tile once
-    # per tile of queries; the original loads the whole prefix once per query token. Kept
-    # switchable so the two can be A/B'd in-engine and the old path stays available until
-    # the new one has a token-identity gate behind it.
-    tiled_prefill: bool = True
+    # per tile of queries; the original loads the whole prefix once per query token. Off by
+    # default: on the T4 its `tl.dot` compiles to FMA (no mma.sync in the PTX), it spills
+    # at 255 registers, and 49 KB of shared memory limits it to one block per SM - measured
+    # 3x slower than the per-token kernel and not greedy-token-identical to it. See the
+    # journal entry "The tiled prefill kernel never used the tensor cores".
+    tiled_prefill: bool = False
     prefill_block_m: int | None = None
     prefill_block_n: int | None = None
 
@@ -213,7 +215,7 @@ class ContinuousBatchingEngine:
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
-                 tiled_prefill: bool = True,
+                 tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
                  prefill_block_n: int | None = None,
                  max_prefill_tokens_per_iteration: int = 128,
