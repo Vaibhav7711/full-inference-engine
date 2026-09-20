@@ -53,6 +53,10 @@ class SoakConfig:
     seed: int = 0
     max_steps: int = 500_000
     sample_every_steps: int = 25
+    # Ask the engine for its per-phase step split (host staging, decode/prefill GPU time,
+    # sampling sync). Costs one extra event sync on prefill steps that complete no
+    # request; both arms of an A/B pay it equally.
+    instrument: bool = False
 
 
 @dataclass
@@ -82,6 +86,8 @@ class SoakResult:
     step_timing: dict[str, float] = field(default_factory=dict)
     _decode_step_ms: list[float] = field(default_factory=list, repr=False)
     _prefill_step_ms: list[float] = field(default_factory=list, repr=False)
+    # Per-phase samples from the engine's instrumentation, keyed by phase name.
+    _phase_ms: dict[str, list[float]] = field(default_factory=dict, repr=False)
     _batch_samples: list[float] = field(default_factory=list, repr=False)
     _context_samples: list[float] = field(default_factory=list, repr=False)
     prefix_cache: dict[str, float] = field(default_factory=dict)
@@ -253,6 +259,8 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
     rng = random.Random(config.seed)
     workload = _Workload(config, rng, forbidden=set(engine.eos_ids))
     result = SoakResult(config=config)
+    if hasattr(engine, "instrument"):
+        engine.instrument = config.instrument
 
     submitted: list[GenerationRequest] = []
     in_flight: dict[str, GenerationRequest] = {}
@@ -314,6 +322,8 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
                 result._prefill_step_ms.append(elapsed_ms)
             elif getattr(engine, "last_step_decode_rows", 0):
                 result._decode_step_ms.append(elapsed_ms)
+            for phase, value in getattr(engine, "last_step_timing", {}).items():
+                result._phase_ms.setdefault(phase, []).append(value)
             result.steps += 1
         elif not accepting:
             break
@@ -400,6 +410,9 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
             if decode_ms and prefill_ms else 0.0
         ),
     }
+    for phase, samples in sorted(result._phase_ms.items()):
+        result.step_timing[f"{phase}_p50"] = _percentile(samples, 0.50)
+        result.step_timing[f"{phase}_p99"] = _percentile(samples, 0.99)
     if decode_ms and prefill_ms:
         # Frequency-weighted decomposition of the average gap a caller experiences. The
         # penalty matters in proportion to how often a step carries prefill, so neither
@@ -486,6 +499,8 @@ class RepeatedResult:
             "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
             "step_timing.prefill_step_fraction", "step_timing.prefill_penalty_p50_ms",
             "step_timing.expected_gap_ms", "step_timing.prefill_share_of_gap",
+            "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
+            "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50",
         ]
         return {
             "label": self.label, "runs": len(self.runs), "ok": self.ok,
@@ -506,8 +521,35 @@ def run_repeated(make_engine, config: SoakConfig, repeats: int = 5,
     result = RepeatedResult(label=label or f"soak-{config.seed}")
     for offset in range(repeats):
         seeded = replace(config, seed=config.seed + offset)
-        result.runs.append(run_soak(make_engine(), seeded))
+        result.runs.append(run_soak(_warmed(make_engine()), seeded))
     return result
+
+
+def _warmed(engine):
+    """Pay graph capture and kernel JIT before the timed window, never inside it."""
+    if hasattr(engine, "warmup"):
+        engine.warmup()
+    return engine
+
+
+def run_interleaved(makers: dict[str, object], config: SoakConfig, repeats: int = 5,
+                    on_run=None) -> dict[str, RepeatedResult]:
+    """Run several configurations A B A B ... rather than A A A B B B.
+
+    On a shared, thermally limited GPU the run-to-run drift is monotone in time - clocks
+    fall as the card heats. Blocking the arms puts all of that drift on one side of the
+    comparison; interleaving them spreads it across both. Each configuration still sees
+    the same seed sequence.
+    """
+    results = {label: RepeatedResult(label=label) for label in makers}
+    for offset in range(repeats):
+        seeded = replace(config, seed=config.seed + offset)
+        for label, make_engine in makers.items():
+            run = run_soak(_warmed(make_engine()), seeded)
+            results[label].runs.append(run)
+            if on_run is not None:
+                on_run(label, offset, run)
+    return results
 
 
 def _build_engine(args) -> object:
@@ -515,12 +557,12 @@ def _build_engine(args) -> object:
     from engine.model import load_model
 
     loaded = load_model(args.model)
-    return ContinuousBatchingEngine(
+    return _warmed(ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, loaded.device,
         num_blocks=args.num_blocks, block_size=16, max_active=args.max_active,
         prefix_cache_blocks=args.prefix_cache_blocks,
         cuda_graph_batch_sizes=(2, 4, 8, 16) if args.cuda_graphs else None,
-    )
+    ))
 
 
 def main() -> int:

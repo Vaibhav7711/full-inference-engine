@@ -12,14 +12,32 @@ from torch.nn import functional as F
 
 
 @triton.jit
-def _swiglu_kernel(gate_ptr, up_ptr, out_ptr, elements, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < elements
+def _swiglu_kernel(
+    gate_ptr, up_ptr, out_ptr, columns,
+    stride_gate, stride_up, stride_out,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < columns
     # Triton 3.6's sigmoid accepts FP32/FP64. Promotion also mirrors the stable
     # internal evaluation used by PyTorch SiLU before the result is stored as FP16.
-    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + offsets, gate * tl.sigmoid(gate) * up, mask=mask)
+    gate = tl.load(gate_ptr + row * stride_gate + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr + row * stride_up + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + row * stride_out + offsets, gate * tl.sigmoid(gate) * up, mask=mask)
+
+
+def _as_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """View `[..., columns]` as `[rows, columns]` without copying when the layout allows.
+
+    The fused gate/up projection hands over the two halves of one `[..., 2*columns]`
+    output as strided views. Reading them in place through a row stride is what makes
+    that fusion save a launch instead of paying two full activation copies to make the
+    halves contiguous first.
+    """
+    if tensor.stride(-1) != 1:
+        tensor = tensor.contiguous()
+    return tensor.reshape(-1, tensor.shape[-1])
 
 
 def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -28,12 +46,18 @@ def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         raise ValueError("gate and up tensors must have matching shape, dtype, and device")
     if gate.device.type != "cuda":
         raise ValueError("fused SwiGLU requires CUDA tensors")
-    gate = gate.contiguous()
-    up = up.contiguous()
-    output = torch.empty_like(gate)
-    elements = gate.numel()
-    _swiglu_kernel[(triton.cdiv(elements, 256),)](
-        gate, up, output, elements, BLOCK=256, num_warps=4
+    if gate.ndim == 0 or gate.numel() == 0:
+        return torch.nn.functional.silu(gate) * up
+    gate_rows = _as_rows(gate)
+    up_rows = _as_rows(up)
+    rows, columns = gate_rows.shape
+    output = torch.empty(gate.shape, dtype=gate.dtype, device=gate.device)
+    output_rows = output.view(rows, columns)
+    block = 512
+    _swiglu_kernel[(rows, triton.cdiv(columns, block))](
+        gate_rows, up_rows, output_rows, columns,
+        gate_rows.stride(0), up_rows.stride(0), output_rows.stride(0),
+        BLOCK=block, num_warps=4,
     )
     return output
 

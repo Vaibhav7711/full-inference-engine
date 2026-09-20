@@ -57,6 +57,11 @@ class PrefixCache:
         self._nodes: dict[int, _PrefixNode] = {}
         self._edges: dict[tuple[int | None, tuple[int, ...]], int] = {}
         self._exact: dict[tuple[int, ...], _ExactEntry] = {}
+        # How many cache owners (radix nodes and exact entries) reference each physical
+        # block. Kept incrementally: eviction runs on the worker thread inside a step,
+        # and rebuilding this from every node per victim made a full cache cost O(N) per
+        # evicted block on each publish.
+        self._references: dict[int, int] = {}
         self._next_node_id = 0
         self._next_entry_id = 0
         self._clock = 0
@@ -130,6 +135,7 @@ class PrefixCache:
             self._next_node_id += 1
             owner = _CacheOwner(node_id)
             self.block_manager.allocator.attach(owner, [physical_block])
+            self._reference((physical_block,))
             node = _PrefixNode(
                 node_id, parent_id, token_block, physical_block, owner
             )
@@ -156,6 +162,7 @@ class PrefixCache:
             self._next_entry_id += 1
             owner = _ExactOwner(entry_id)
             self.block_manager.allocator.attach(owner, block_ids)
+            self._reference(block_ids)
             entry = _ExactEntry(
                 entry_id, exact_key, block_ids, int(next_token_id), owner
             )
@@ -203,14 +210,23 @@ class PrefixCache:
         node.last_access = self._clock
 
     def _evict_to_limit(self) -> None:
-        while len(self._cached_physical_blocks()) > self.max_blocks and self._evict_one():
+        while len(self._references) > self.max_blocks and self._evict_one():
             pass
 
     def _cached_physical_blocks(self) -> set[int]:
-        blocks = {node.physical_block_id for node in self._nodes.values()}
-        for entry in self._exact.values():
-            blocks.update(entry.physical_block_ids)
-        return blocks
+        return set(self._references)
+
+    def _reference(self, blocks: tuple[int, ...]) -> None:
+        for block in blocks:
+            self._references[block] = self._references.get(block, 0) + 1
+
+    def _unreference(self, blocks: tuple[int, ...]) -> None:
+        for block in blocks:
+            remaining = self._references[block] - 1
+            if remaining:
+                self._references[block] = remaining
+            else:
+                del self._references[block]
 
     def _entry_blocks(self, item: _PrefixNode | _ExactEntry) -> tuple[int, ...]:
         if isinstance(item, _ExactEntry):
@@ -219,13 +235,7 @@ class PrefixCache:
 
     def _cache_references(self) -> dict[int, int]:
         """How many cache owners (radix nodes and exact entries) reference each block."""
-        references: dict[int, int] = {}
-        for node in self._nodes.values():
-            references[node.physical_block_id] = references.get(node.physical_block_id, 0) + 1
-        for entry in self._exact.values():
-            for block in entry.physical_block_ids:
-                references[block] = references.get(block, 0) + 1
-        return references
+        return self._references
 
     def _is_freeable(self, item: _PrefixNode | _ExactEntry, references: dict[int, int]) -> bool:
         """True when some block of this entry has no owner outside the cache.
@@ -256,6 +266,7 @@ class PrefixCache:
             ),
         )
         self.block_manager.allocator.release(victim.owner)
+        self._unreference(self._entry_blocks(victim))
         if isinstance(victim, _ExactEntry):
             self._exact.pop(victim.token_ids)
         else:

@@ -45,3 +45,56 @@ def assert_repeatable_tokens(token_runs: list[list[int]]) -> None:
     """Reject a deterministic benchmark if repeated runs emit different tokens."""
     if token_runs and any(tokens != token_runs[0] for tokens in token_runs[1:]):
         raise RuntimeError("greedy output changed between measured benchmark runs")
+
+
+def git_record(root: str | None = None) -> dict[str, object]:
+    """Which code produced a measurement: commit, branch, and whether the tree was dirty.
+
+    A result JSON without this cannot be tied back to the kernel or scheduler it measured,
+    which is how three stale files ended up being the only committed evidence.
+    """
+    import subprocess
+
+    def run(*args: str) -> str | None:
+        try:
+            return subprocess.check_output(
+                ["git", *args], cwd=root, text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    status = run("status", "--porcelain")
+    return {
+        "commit": run("rev-parse", "HEAD"),
+        "short": run("rev-parse", "--short", "HEAD"),
+        "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(status) if status is not None else None,
+    }
+
+
+def device_clock_record(index: int = 0) -> dict[str, object]:
+    """Current SM/memory clocks, power and temperature from nvidia-smi, or {} off-GPU.
+
+    Recorded before and after each run: a T4 throttles at its 70 W cap, so the same
+    configuration measured cold and hot is two different experiments.
+    """
+    import subprocess
+
+    fields = ["clocks.sm", "clocks.mem", "clocks.max.sm", "power.draw", "power.limit",
+              "temperature.gpu", "clocks_throttle_reasons.active"]
+    try:
+        raw = subprocess.check_output(
+            ["nvidia-smi", f"--id={index}", f"--query-gpu={','.join(fields)}",
+             "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {}
+    values = [item.strip() for item in raw.split(",")]
+    record: dict[str, object] = {}
+    for name, value in zip(fields, values):
+        try:
+            record[name] = float(value)
+        except ValueError:
+            record[name] = value
+    return record

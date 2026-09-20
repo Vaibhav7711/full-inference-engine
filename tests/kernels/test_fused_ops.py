@@ -49,6 +49,22 @@ def test_fused_swiglu_matches_reference(shape) -> None:
 
 @cuda
 @requires_cuda
+@pytest.mark.parametrize("shape", [(16, 3072), (2, 11, 3072)])
+def test_fused_swiglu_reads_split_projection_halves_in_place(shape) -> None:
+    """The fused gate/up projection yields strided halves; no copy may be needed."""
+    from engine.kernels.swiglu import _as_rows, triton_swiglu
+
+    torch.manual_seed(41)
+    fused = torch.randn(*shape[:-1], 2 * shape[-1], device="cuda", dtype=torch.float16)
+    gate, up = fused.split(shape[-1], dim=-1)
+    assert not gate.is_contiguous()
+    assert _as_rows(gate).data_ptr() == gate.data_ptr(), "the strided half was copied"
+    reference = torch.nn.functional.silu(gate) * up
+    torch.testing.assert_close(triton_swiglu(gate, up), reference, rtol=2e-3, atol=2e-3)
+
+
+@cuda
+@requires_cuda
 def test_qwen_swiglu_installer_covers_every_layer() -> None:
     from transformers import AutoModelForCausalLM
     from engine.kernels.swiglu import install_triton_qwen_swiglu, uninstall_triton_qwen_swiglu

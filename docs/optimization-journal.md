@@ -2360,3 +2360,42 @@ is losing to its own implementation rather than to the problem. The sweep report
 `n_regs`, `n_spills` and shared bytes per variant, covers `num_stages` and the K layout,
 prints the grid size and blocks per SM, and states plainly when no configuration beats the
 kernel it replaces - in which case the honest outcome is to delete it rather than tune it.
+
+## Structural overhead removed ahead of the T4 re-measurement
+
+Status: `APPLIED — UNMEASURED`. Earlier results are being re-run on Kaggle T4 (multiple
+runs each) because some were malformed. Only changes that are faster by construction -
+same bytes, same results, fewer launches or less host work - were made; anything that
+needs a measurement to justify (the tiled prefill default, the prefill budget, SDPA
+grouping) is left for the re-run to decide.
+
+- **Decode metadata staging** (`_prepare_decode_metadata`): block tables, token ids,
+  positions and lengths were written into the pinned host buffers one tensor
+  `__setitem__` at a time. Timed off-GPU: **3.4 ms per step** at batch 16 x 64 blocks per
+  row, vs 0.18 ms staging each row with one slice copy. That cost was serialised ahead of
+  every graph replay and grew with context length. Now one slice copy per buffer/row.
+- **Copy-on-write tail**: 2 x num_layers separate `copy_` launches (56 for Qwen3-0.6B) on
+  a request's first decode step, since the exact-hit entry shares its partial tail block.
+  Now one `torch._foreach_copy_`. The exact-entry design itself is unchanged.
+- **Fused SwiGLU on strided halves**: `triton_swiglu` called `.contiguous()` on both
+  inputs, so the gate/up projection fusion (Phase 9) paid two full activation copies per
+  layer for the one GEMM launch it saved. The kernel now takes a row stride and reads the
+  `split()` views in place. Phase 9's "neutral" result measured those copies, not the
+  fusion; it should be re-run.
+- **Prefix-cache eviction bookkeeping**: the block-reference map and cached-block set
+  were rebuilt from every node and exact entry per evicted block. With a full cache each
+  publish evicted several blocks at O(N) each, on the worker thread inside a step. The map
+  is now maintained incrementally; a churn test checks it against a rebuild.
+- **Warm-up before serving** (`ContinuousBatchingEngine.warmup`, called by the server's
+  engine factory): synthetic requests through the ordinary step loop capture every graph
+  bucket in both decode regimes and compile both prefill paths, then reset engine state.
+  Previously each capture (two eager forwards plus a device sync) and Triton JIT landed on
+  the first live requests to reach that bucket - the likeliest source of the unexplained
+  p999. Benchmarks that construct the engine directly should call `warmup()` before
+  timing, or keep their own warm rounds.
+- `reset()` now passes `reserved_blocks` to the rebuilt scheduler, as `__init__` does.
+
+Left as found, pending measurement or a design decision: `tiled_prefill=True` default
+(D2 measured 0.3x before the tile defaults were corrected), SDPA fast path being
+all-or-nothing across a plan batch, budget remainders planned as sub-chunk slivers, SSE
+handlers polling every 5 ms per stream on the event loop.

@@ -76,11 +76,15 @@ def default_engine_factory(
 
     loaded = load_model(model_name)
     buckets = tuple(size for size in graph_buckets if size <= max_active)
-    return ContinuousBatchingEngine(
+    engine = ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, loaded.device, max_active=max_active,
         num_blocks=num_blocks, cuda_graph_batch_sizes=buckets or None,
         max_waiting_requests=max_pending_requests,
     )
+    # Graph capture and Triton JIT happen at startup, not on the first live requests
+    # that reach each bucket. Readiness is reported only after this returns.
+    engine.warmup()
+    return engine
 
 
 def create_app(

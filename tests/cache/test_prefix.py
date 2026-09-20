@@ -86,3 +86,38 @@ def test_pressure_eviction_skips_entries_pinned_by_active_requests() -> None:
     freed = cache.evict_until_free(4)
     assert freed == 2 and manager.allocator.free_block_count == 4
     assert cache.snapshot()["cached_blocks"] == 0
+
+
+def test_reference_map_matches_a_rebuild_through_publish_and_evict_churn() -> None:
+    """Eviction reads an incrementally maintained block-reference map; it must never
+    drift from what a from-scratch scan of every node and exact entry would produce."""
+    import random
+
+    def rebuilt(cache: PrefixCache) -> dict[int, int]:
+        references: dict[int, int] = {}
+        for node in cache._nodes.values():
+            references[node.physical_block_id] = references.get(node.physical_block_id, 0) + 1
+        for entry in cache._exact.values():
+            for block in entry.physical_block_ids:
+                references[block] = references.get(block, 0) + 1
+        return references
+
+    rng = random.Random(7)
+    manager = KVBlockManager(num_blocks=64, block_size_tokens=4)
+    cache = PrefixCache(manager, max_blocks=12)
+    for step in range(60):
+        length = rng.randint(1, 20)
+        # Shared vocabulary so prompts share prefixes and radix nodes get reused.
+        tokens = [rng.randint(0, 2) for _ in range(length)]
+        allocation = manager.reserve(f"r{step}", length, sequence_length=length)
+        if allocation is None:
+            cache.evict_until_free(8)
+            assert cache._cache_references() == rebuilt(cache)
+            continue
+        cache.publish(tokens, allocation, next_token_id=rng.randint(0, 2))
+        manager.release(f"r{step}")
+        assert cache._cache_references() == rebuilt(cache)
+        assert cache._cached_physical_blocks() == set(rebuilt(cache))
+        assert len(cache._cached_physical_blocks()) <= cache.max_blocks
+    cache.clear()
+    assert cache._cache_references() == {} == rebuilt(cache)

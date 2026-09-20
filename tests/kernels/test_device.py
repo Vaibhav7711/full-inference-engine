@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from engine.kernels.device import DeviceProfile, fits_in_memory, prefill_tile_defaults
+import engine.kernels.device as device
+from engine.kernels.device import DeviceProfile, prefill_tile_defaults
 
 T4 = DeviceProfile("Tesla T4", (7, 5), 15.8, 40, 4.0)
 ADA_4060 = DeviceProfile("NVIDIA GeForce RTX 4060", (8, 9), 8.6, 24, 24.0)
@@ -35,6 +36,7 @@ def test_profile_renders_the_facts_that_change_conclusions() -> None:
         assert fragment in rendered, rendered
 
 
-def test_memory_check_is_skipped_without_a_device() -> None:
-    fits, reason = fits_in_memory(8_000_000_000)
+def test_memory_check_is_skipped_without_a_device(monkeypatch) -> None:
+    monkeypatch.setattr(device, "current_device", lambda: None)
+    fits, reason = device.fits_in_memory(8_000_000_000)
     assert fits and "no CUDA device" in reason

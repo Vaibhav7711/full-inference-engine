@@ -19,7 +19,8 @@ import argparse
 import json
 from pathlib import Path
 
-from benchmarks.reliability.soak import SoakConfig, run_repeated
+from benchmarks.common import device_clock_record, environment_record, git_record
+from benchmarks.reliability.soak import SoakConfig, run_interleaved
 
 # Each arm is (label, engine keyword overrides). Everything not listed is shared.
 SETTINGS: dict[str, list[tuple[str, dict]]] = {
@@ -66,6 +67,20 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
                       "max_prefill_tokens_per_iteration": 16}),
     ],
 }
+
+
+# Settings whose arms are allowed to produce different greedy tokens. Everything else
+# must be token-identical across arms: a speedup that changes output is a bug.
+TOKEN_DRIFT_EXPECTED = {"kv_dtype"}
+
+# Fixed prompts for the cross-arm token-identity gate. Long enough to cross a prefill
+# chunk and the 128-token decode regime boundary once generation is included.
+IDENTITY_PROMPTS = [
+    "Explain how a paged KV cache differs from a contiguous one, in detail. " * 6,
+    "List ten facts about the number seven.",
+    "Write a short story about a lighthouse keeper who " + "kept a very long diary, " * 12,
+    "Why?",
+]
 
 
 # Prompt-length profiles. The default soak workload is far shorter than real chat
@@ -170,6 +185,10 @@ def main() -> int:
                         help="enable graphs in both arms; required to study prefill, "
                              "since an ungraphed decode path swamps the effect")
     parser.add_argument("--out", default="results/soak_ab.json")
+    parser.add_argument("--no-instrument", action="store_true",
+                        help="skip the engine's per-phase step split (host/GPU/sync)")
+    parser.add_argument("--allow-token-drift", action="store_true",
+                        help="continue even if arms produce different greedy tokens")
     args = parser.parse_args()
 
     from engine.batching.continuous_batching import ContinuousBatchingEngine
@@ -195,27 +214,73 @@ def main() -> int:
     config = SoakConfig(
         duration_s=args.duration, concurrency=args.concurrency, seed=args.seed,
         cancel_probability=0.02,  # low: this measures generation, not cancellation
+        instrument=not args.no_instrument,
         **profile,
     )
     print(f"workload: {args.prompt_profile} profile, mean prompt ~{mean_prompt:.0f} tokens")
 
-    arms = {}
+    makers = {}
+    arm_settings = {}
     for label, overrides in SETTINGS[args.setting]:
         settings = _clamp_graph_buckets({**shared, **overrides}, args.max_active)
+        arm_settings[label] = settings
 
         def make_engine(settings=settings):
             return ContinuousBatchingEngine(
                 loaded.model, loaded.tokenizer, loaded.device, **settings
             )
 
-        print(f"\n=== {label} ({args.repeats} runs) ===")
-        repeated = run_repeated(make_engine, config, repeats=args.repeats, label=label)
-        arms[label] = repeated
+        makers[label] = make_engine
+
+    # Token-identity gate before anything is timed. Each arm generates the same fixed
+    # prompts greedily on a warmed engine; the outputs must match unless the setting is
+    # one that legitimately changes numerics.
+    identity = {}
+    for label, make_engine in makers.items():
+        engine = make_engine()
+        engine.warmup()
+        identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
+        del engine
+    labels = list(makers)
+    drift = [label for label in labels[1:] if identity[label] != identity[labels[0]]]
+    if drift:
+        message = f"greedy tokens differ across arms: {drift} vs {labels[0]}"
+        if args.setting in TOKEN_DRIFT_EXPECTED:
+            print(f"NOTE {message} (expected for {args.setting})")
+        elif args.allow_token_drift:
+            print(f"WARNING {message}")
+        else:
+            print(f"refusing to run: {message}. Fix the kernel or pass --allow-token-drift.")
+            return 3
+    else:
+        print("token identity: all arms produce identical greedy output")
+
+    clocks_before = device_clock_record()
+    if clocks_before:
+        print(f"clocks before: {clocks_before}")
+
+    def report(label, offset, run):
+        timing = run.step_timing
+        print(f"  [{label} run {offset + 1}/{args.repeats}] "
+              f"gap={timing.get('expected_gap_ms', 0):.2f}ms "
+              f"decode={timing.get('decode_step_p50_ms', 0):.2f}ms "
+              f"host={timing.get('host_stage_ms_p50', 0):.2f}ms "
+              f"gpu={timing.get('decode_gpu_ms_p50', 0):.2f}ms "
+              f"ttft={run.latency.get('ttft_p50', 0):.1f}ms")
+
+    print(f"\n=== interleaved: {' / '.join(labels)} x {args.repeats} ===")
+    arms = run_interleaved(makers, config, repeats=args.repeats, on_run=report)
+    clocks_after = device_clock_record()
+
+    for label, repeated in arms.items():
+        print(f"\n=== {label} ===")
         for metric in ("step_timing.expected_gap_ms", "latency.itl_p50",
                        "latency.ttft_p50", "waste_ratio",
                        "mean_decode_batch", "mean_context_tokens",
                        "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
-                       "step_timing.prefill_step_fraction"):
+                       "step_timing.prefill_step_fraction",
+                       "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
+                       "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50"):
             stats = repeated.summary(metric)
             if stats.get("n"):
                 print(f"  {metric:24s} median={stats['median']:.3f}  "
@@ -237,7 +302,6 @@ def main() -> int:
               f"{arm.summary('latency.itl_p50').get('median', 0):.2f} "
               f"--itl-batch {max(1, round(batch))} --itl-context {max(1, round(context))}")
 
-    labels = [label for label, _ in SETTINGS[args.setting]]
     baseline, variant = arms[labels[0]], arms[labels[1]]
     print(f"\n=== {labels[1]} vs {labels[0]} ===")
     comparison = {}
@@ -250,7 +314,9 @@ def main() -> int:
                    "latency.ttft_p50", "step_timing.decode_step_p50_ms",
                    "step_timing.prefill_step_p50_ms",
                    "step_timing.prefill_step_fraction",
-                   "step_timing.prefill_penalty_p50_ms", "waste_ratio"):
+                   "step_timing.prefill_penalty_p50_ms", "waste_ratio",
+                   "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
+                   "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50"):
         verdict = _verdict(baseline.summary(metric), variant.summary(metric))
         comparison[metric] = verdict
         print(f"  {metric:24s} {verdict}")
@@ -258,8 +324,14 @@ def main() -> int:
     payload = {
         "setting": args.setting, "repeats": args.repeats,
         "config": {**config.__dict__, **shared},
+        "arm_settings": arm_settings,
         "prompt_profile": args.prompt_profile,
         "mean_prompt_tokens": mean_prompt,
+        "environment": environment_record(loaded.device),
+        "git": git_record(),
+        "clocks_before": clocks_before, "clocks_after": clocks_after,
+        "token_identity": {"identical": not drift, "drifted_arms": drift},
+        "order": "interleaved",
         "arms": {label: arm.to_dict() for label, arm in arms.items()},
         "comparison": comparison,
     }

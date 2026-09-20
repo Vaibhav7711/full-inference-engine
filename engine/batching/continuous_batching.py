@@ -30,6 +30,7 @@ Staged tests (run in order): test_d1 (prefill), test_d2 (one decode step), test_
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Optional
 
 import torch
@@ -271,6 +272,17 @@ class ContinuousBatchingEngine:
         self.prefill_sdpa_tokens = 0
         self.prefill_chunked_tokens = 0
         self.last_step_prefill_path = ""
+        # Opt-in step decomposition. A wall-clock timer around `step()` blends Python
+        # staging, the H2D copies, the forward and the sampling sync, so it cannot say
+        # which of them a change moved. With `instrument` on, `last_step_timing` holds
+        # per-phase milliseconds for the step just run: `host_stage_ms` (metadata staging
+        # before the copies), `decode_gpu_ms` / `prefill_gpu_ms` (CUDA events around each
+        # forward), `sync_ms` (the sampling device-to-host wait). GPU phases need an event
+        # sync, which decode already pays at sampling; a prefill step that completes no
+        # request gains one sync it would not otherwise have, so leave this off for
+        # production serving and on for benchmarks that want the split.
+        self.instrument = False
+        self.last_step_timing: dict[str, float] = {}
         self.num_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
         self.num_q_heads = cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
@@ -365,7 +377,13 @@ class ContinuousBatchingEngine:
             raise ValueError("active batch exceeds max_active")
         if row_count < count or row_count > self.max_active:
             raise ValueError("invalid graph bucket size")
-        for row, request in enumerate(active):
+        # Gather the batch as Python lists first and stage each buffer with one slice
+        # copy. A tensor `__setitem__` per element costs a few microseconds of dispatch,
+        # and the block-table loop alone ran to several milliseconds per step at batch 16
+        # with 1k-token contexts - all of it serialized ahead of the graph replay.
+        token_ids: list[int] = []
+        lengths: list[int] = []
+        for request in active:
             allocation = request.allocation
             if allocation is None or request.next_token_id is None:
                 raise RuntimeError("decode request is missing token or KV allocation")
@@ -374,11 +392,8 @@ class ContinuousBatchingEngine:
                 raise RuntimeError(
                     f"request {request.request_id!r} has no KV slot for its next token"
                 )
-            self._host_input_ids[row, 0] = request.next_token_id
-            self._host_position_ids[row, 0] = allocation.sequence_length
-            self._host_seq_lens[row] = allocation.sequence_length
-            for column, physical_block in enumerate(request.block_table):
-                self._host_block_tables[row, column] = physical_block
+            token_ids.append(request.next_token_id)
+            lengths.append(allocation.sequence_length)
 
         if row_count > count:
             if len(self._graph_dummy_blocks) < row_count - count:
@@ -386,11 +401,17 @@ class ContinuousBatchingEngine:
             pad_token = self.tokenizer.pad_token_id
             if pad_token is None:
                 pad_token = next(iter(self.eos_ids), 0)
-            for row in range(count, row_count):
-                self._host_input_ids[row, 0] = pad_token
-                self._host_position_ids[row, 0] = 0
-                self._host_seq_lens[row] = 0
-                self._host_block_tables[row, 0] = self._graph_dummy_blocks[row - count]
+            token_ids.extend([pad_token] * (row_count - count))
+            lengths.extend([0] * (row_count - count))
+
+        self._host_input_ids[:row_count, 0] = torch.tensor(token_ids, dtype=torch.long)
+        self._host_position_ids[:row_count, 0] = torch.tensor(lengths, dtype=torch.long)
+        self._host_seq_lens[:row_count] = torch.tensor(lengths, dtype=torch.int32)
+        for row, request in enumerate(active):
+            table = request.block_table
+            self._host_block_tables[row, :len(table)] = torch.tensor(table, dtype=torch.int32)
+        for row in range(count, row_count):
+            self._host_block_tables[row, 0] = self._graph_dummy_blocks[row - count]
 
         input_ids = self._device_input_ids[:row_count]
         position_ids = self._device_position_ids[:row_count]
@@ -419,6 +440,7 @@ class ContinuousBatchingEngine:
         self.scheduler = FCFSScheduler(
             self.block_manager, max_waiting_requests=self.max_waiting_requests,
             prefix_cache=self.prefix_cache,
+            reserved_blocks=len(self._graph_dummy_blocks),
         )
 
     def _ensure_writable_tail(self, request: GenerationRequest) -> bool:
@@ -437,13 +459,15 @@ class ContinuousBatchingEngine:
         if copied is None:
             return False
         old_block, new_block = copied
-        for key_pool, value_pool in zip(self.key_pool, self.value_pool):
-            key_pool[new_block].copy_(key_pool[old_block])
-            value_pool[new_block].copy_(value_pool[old_block])
+        # One block per layer for K and V (plus scales for INT8). Issued as a single
+        # foreach copy rather than 2*num_layers separate launches: the bytes are the same,
+        # the launch overhead is not, and this runs on a request's first decode step.
+        pools = self.key_pool + self.value_pool
         if self.key_scale_pool is not None:
-            for key_scale, value_scale in zip(self.key_scale_pool, self.value_scale_pool):
-                key_scale[new_block].copy_(key_scale[old_block])
-                value_scale[new_block].copy_(value_scale[old_block])
+            pools = pools + self.key_scale_pool + self.value_scale_pool
+        torch._foreach_copy_(
+            [pool[new_block] for pool in pools], [pool[old_block] for pool in pools],
+        )
         return True
 
     def _ensure_kv_capacity(self, request: GenerationRequest, target_length: int) -> bool:
@@ -492,6 +516,28 @@ class ContinuousBatchingEngine:
         if request.state is not RequestState.WAITING:
             self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
         return False
+
+    def _gpu_timer(self):
+        if not self.instrument or torch.device(self.device).type != "cuda":
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start
+
+    def _gpu_elapsed(self, start, key: str) -> None:
+        if start is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        end.synchronize()
+        self.last_step_timing[key] = self.last_step_timing.get(key, 0.0) + start.elapsed_time(end)
+
+    def _host_elapsed(self, started: float | None, key: str) -> None:
+        if started is None:
+            return
+        self.last_step_timing[key] = (
+            self.last_step_timing.get(key, 0.0) + (perf_counter() - started) * 1000
+        )
 
     def stats_snapshot(self) -> dict[str, object]:
         """Cheap, GPU-free view of engine state for the metrics endpoint.
@@ -664,6 +710,7 @@ class ContinuousBatchingEngine:
             self.key_pool, self.value_pool, block_tables, seq_lens, padded_length,
             self.key_scale_pool, self.value_scale_pool,
         )
+        timer = self._gpu_timer()
         out = self.model(
             input_ids=ids, attention_mask=attention_mask,
             past_key_values=cache, use_cache=True, return_dict=True,
@@ -671,6 +718,7 @@ class ContinuousBatchingEngine:
         rows = torch.arange(len(requests), device=self.device)
         last_positions = seq_lens.to(dtype=torch.long) - 1
         next_tokens = out.logits[rows, last_positions].argmax(dim=-1).tolist()
+        self._gpu_elapsed(timer, "prefill_gpu_ms")
 
         for request, token in zip(requests, next_tokens):
             if not self.block_manager.append_tokens(
@@ -763,6 +811,7 @@ class ContinuousBatchingEngine:
             prefill_block_m=self.prefill_block_m,
             prefill_block_n=self.prefill_block_n,
         ))
+        timer = self._gpu_timer()
         try:
             out = self.model(
                 input_ids=ids, position_ids=position_ids,
@@ -789,6 +838,7 @@ class ContinuousBatchingEngine:
             tokens = out.logits[rows, positions].argmax(dim=-1).tolist()
             for (_, request), token in zip(completed_rows, tokens):
                 self._complete_prefill(request, int(token))
+        self._gpu_elapsed(timer, "prefill_gpu_ms")
 
     def _plan_prefill_chunks(self) -> list[tuple[GenerationRequest, int]]:
         return self.scheduler.plan_prefill(
@@ -817,6 +867,7 @@ class ContinuousBatchingEngine:
         `last_step_prefill_tokens` let a benchmark separate those gaps from pure decode
         gaps instead of inferring the split from a skewed distribution.
         """
+        self.last_step_timing = {}
         decoding = [
             request for request in self.scheduler.active.values()
             if request.state is RequestState.DECODING
@@ -846,6 +897,7 @@ class ContinuousBatchingEngine:
         N = len(active)
         if N == 0:
             return
+        host_started = perf_counter() if self.instrument else None
 
         # Switch to the batched K4 attention fn
         self.model.config._attn_implementation = self.ATTN_NAME
@@ -882,6 +934,8 @@ class ContinuousBatchingEngine:
         input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(
             active, graph_bucket_size=graph_bucket_size,
         )
+        self._host_elapsed(host_started, "host_stage_ms")
+        timer = self._gpu_timer()
 
         # Stash context for the attention fn
         context = _BatchContext(
@@ -915,7 +969,10 @@ class ContinuousBatchingEngine:
         # Sample next token per sequence, advance state
         # One device-to-host synchronization for the complete batch. Calling `.item()`
         # per row serializes N scalar copies and N Python-visible CUDA waits.
+        sync_started = perf_counter() if self.instrument else None
         next_tokens = logits[:len(active), -1, :].argmax(dim=-1).tolist()
+        self._host_elapsed(sync_started, "sync_ms")
+        self._gpu_elapsed(timer, "decode_gpu_ms")
         for s, token in zip(active, next_tokens):
             self.block_manager.append_tokens(s.request_id)
             tok = int(token)
@@ -947,6 +1004,64 @@ class ContinuousBatchingEngine:
             self.step()
 
         return [request.output_token_ids for request in requests]
+
+    @torch.inference_mode()
+    def warmup(self) -> dict[str, int]:
+        """Pay every first-use cost before serving: Triton JIT and CUDA-Graph capture.
+
+        Runs synthetic requests through the ordinary step loop so that every graph
+        bucket is captured in both decode kernel regimes (context below and above the
+        128-token boundary in `select_paged_decode_config`), and both prefill paths -
+        SDPA for a fresh whole prompt, chunked for a prompt longer than one chunk - have
+        compiled. Without this, each of those costs lands on the first live requests
+        that need it: a capture is two eager forwards plus a device sync, and a bucket is
+        first reached at exactly the load level that fills it.
+
+        Allocator, prefix cache, scheduler and step counters are reset afterwards, so
+        warmup leaves nothing behind except captured graphs and kernel caches.
+        """
+        if torch.device(self.device).type != "cuda":
+            return {"rounds": 0, "graphs": len(self._decode_graphs)}
+        vocab_size = int(getattr(self.model.config, "vocab_size", 0)) or 1000
+        generator = torch.Generator().manual_seed(0)
+        # Below the regime boundary even after decoding, and within one prefill chunk.
+        short_prompt = max(1, min(64, self.prefill_chunk_size, self.max_prefill_tokens_per_iteration))
+        # Past the boundary once prefilled, and longer than one chunk or one budget,
+        # whichever is smaller, so the resumable chunk path is the one that runs.
+        long_prompt = max(130, min(self.prefill_chunk_size, self.max_prefill_tokens_per_iteration) + 2)
+        widths = list(self.cuda_graph_batch_sizes) or [1]
+        # Random token ids can decode to EOS; ignore it so every round reaches decode.
+        eos_ids, self.eos_ids = self.eos_ids, set()
+        rounds = 0
+        try:
+            for width in widths:
+                for length in (short_prompt, long_prompt):
+                    for index in range(width):
+                        ids = torch.randint(1, vocab_size, (length,), generator=generator).tolist()
+                        self.submit(GenerationRequest(
+                            request_id=f"__warmup_{rounds}_{index}",
+                            prompt_token_count=length, max_new_tokens=3, prompt_token_ids=ids,
+                        ))
+                    steps = 0
+                    while self.has_unfinished_requests and steps < 10_000:
+                        self.step()
+                        steps += 1
+                    rounds += 1
+        finally:
+            self.eos_ids = eos_ids
+        summary = {
+            "rounds": rounds,
+            "graphs": len(self._decode_graphs),
+            "prefill_sdpa_calls": self.prefill_sdpa_calls,
+            "prefill_chunked_calls": self.prefill_chunked_calls,
+        }
+        self.reset()
+        self.prefill_steps = self.decode_only_steps = 0
+        self.last_step_prefill_tokens = self.last_step_decode_rows = 0
+        self.prefill_sdpa_calls = self.prefill_chunked_calls = 0
+        self.prefill_sdpa_tokens = self.prefill_chunked_tokens = 0
+        self.last_step_prefill_path = ""
+        return summary
 
     def attn_call_count(self) -> int:
         return _ATTN_CALLS
