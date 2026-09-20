@@ -32,3 +32,36 @@ def test_auto_uses_bfloat16_when_supported(monkeypatch: pytest.MonkeyPatch) -> N
 def test_unknown_dtype_is_rejected() -> None:
     with pytest.raises(ValueError, match="unsupported dtype"):
         resolve_dtype("float8", torch.device("cpu"))
+
+
+def test_tie_output_embeddings_shares_storage_only_when_identical() -> None:
+    import torch
+    from torch import nn
+
+    from engine.model.loader import tie_output_embeddings
+
+    class Tiny(nn.Module):
+        def __init__(self, tie: bool, same_values: bool):
+            super().__init__()
+            self.config = type("Config", (), {"tie_word_embeddings": tie})()
+            self.embed = nn.Embedding(8, 4)
+            self.head = nn.Linear(4, 8, bias=False)
+            with torch.no_grad():
+                self.head.weight.copy_(self.embed.weight if same_values else self.embed.weight + 1)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_output_embeddings(self):
+            return self.head
+
+    model = Tiny(tie=True, same_values=True)
+    assert tie_output_embeddings(model)
+    assert model.head.weight.data_ptr() == model.embed.weight.data_ptr()
+
+    model = Tiny(tie=True, same_values=False)
+    assert not tie_output_embeddings(model)
+    assert model.head.weight.data_ptr() != model.embed.weight.data_ptr()
+
+    model = Tiny(tie=False, same_values=True)
+    assert not tie_output_embeddings(model)

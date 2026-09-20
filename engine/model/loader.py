@@ -47,6 +47,28 @@ def resolve_dtype(dtype: str | torch.dtype, device: torch.device) -> torch.dtype
     return torch.float16
 
 
+def tie_output_embeddings(model) -> bool:
+    """Share `lm_head` with the input embedding when the config asks for it.
+
+    Newer transformers builds refuse to tie when a checkpoint ships both tensors (Qwen3
+    does), leaving two copies of a 311 MB matrix on the GPU. Tying is only safe when the
+    two are identical, so that is checked rather than assumed. Returns True when the
+    output projection shares storage with the embedding table afterwards.
+    """
+    if not getattr(model.config, "tie_word_embeddings", False):
+        return False
+    output = model.get_output_embeddings()
+    inputs = model.get_input_embeddings()
+    if output is None or inputs is None:
+        return False
+    if output.weight.data_ptr() == inputs.weight.data_ptr():
+        return True
+    if output.weight.shape != inputs.weight.shape or not torch.equal(output.weight, inputs.weight):
+        return False
+    output.weight = inputs.weight
+    return True
+
+
 def load_model(
     model_name: str = "Qwen/Qwen3-0.6B",
     *,
@@ -69,6 +91,7 @@ def load_model(
         model_name, revision=revision, dtype=resolved_dtype
     ).to(device)
     model.eval()
+    tie_output_embeddings(model)
     resolved_revision = getattr(model.config, "_commit_hash", None)
     return LoadedModel(
         model_name=model_name,
