@@ -36,6 +36,19 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 
+def query_length_from(cache_position) -> int:
+    """Number of new tokens in this forward pass, from either cache-interface generation.
+
+    transformers >= 4.53 hands `get_mask_sizes` the `cache_position` tensor; older builds
+    passed the query length as an int. The mask builder then evaluates
+    `kv_length + kv_offset - width > 0`, which raises on a multi-element tensor, so the
+    result must be a plain int either way.
+    """
+    if hasattr(cache_position, "shape"):
+        return int(cache_position.shape[-1])
+    return int(cache_position)
+
+
 class PagedLayer:
     """Block-structured KV storage for one transformer layer, batch=1.
 
@@ -198,8 +211,11 @@ class PagedCache(DynamicCache):
 
     # -- mask/length methods the model's masking machinery calls --
 
-    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position, layer_idx: int = 0) -> tuple[int, int]:
         """Return (kv_length, kv_offset) for causal-mask construction.
+
+        `cache_position` is the position tensor on transformers >= 4.53 and the query
+        length as an int on older builds; both must yield plain ints here.
 
         The parent DynamicCache inspects layer types (CacheLayerMixin) which our
         PagedLayer is not, so its implementation raises. We answer directly from our
@@ -213,7 +229,7 @@ class PagedCache(DynamicCache):
             kv_offset = past_seen already attended before this pass (0 at prefill)
         """
         past_seen = self._paged_layers[layer_idx].seq_len
-        kv_length = past_seen + query_length
+        kv_length = past_seen + query_length_from(cache_position)
         kv_offset = 0
         return kv_length, kv_offset
 

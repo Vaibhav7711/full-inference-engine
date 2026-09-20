@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from transformers.cache_utils import DynamicCache
 
-from engine.kernels.kv_write import write_prefill_kv_batched
+from engine.cache.paged_cache import query_length_from
 
 
 class BatchedPoolBackedPrefillCache(DynamicCache):
@@ -41,6 +41,8 @@ class BatchedPoolBackedPrefillCache(DynamicCache):
         if self._layer_lengths[layer_idx] != 0:
             raise RuntimeError("batched prefill cache supports exactly one write per layer")
         if self.key_scale_pool is None:
+            from engine.kernels.kv_write import write_prefill_kv_batched
+
             write_prefill_kv_batched(
                 key_states, value_states, self.key_pool[layer_idx], self.value_pool[layer_idx],
                 self.block_tables, self.seq_lens,
@@ -58,8 +60,11 @@ class BatchedPoolBackedPrefillCache(DynamicCache):
     def get_seq_length(self, layer_idx: int = 0, *args, **kwargs) -> int:
         return self._layer_lengths[layer_idx]
 
-    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
-        return self._layer_lengths[layer_idx] + query_length, 0
+    def get_mask_sizes(self, cache_position, layer_idx: int = 0) -> tuple[int, int]:
+        # transformers >= 4.53 passes the `cache_position` tensor here; older builds
+        # passed the query length as an int. Returning anything but plain ints breaks the
+        # mask builder, which compares `kv_length + kv_offset - mask_width > 0`.
+        return self._layer_lengths[layer_idx] + query_length_from(cache_position), 0
 
     def get_max_cache_shape(self, *args, **kwargs):
         return None

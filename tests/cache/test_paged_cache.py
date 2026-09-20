@@ -193,3 +193,28 @@ def test_paged_cache_is_authoritative_store():
     assert snap["seq_len"] == prompt_len + 20
     assert snap["blocks_per_layer"] >= 2, "cache should have grown beyond initial block"
     assert snap["total_growths"] > 0, "cache should have grown at least once"
+
+
+def test_mask_sizes_are_plain_ints_for_both_cache_interfaces() -> None:
+    """transformers >= 4.53 passes a cache_position tensor; older builds pass an int.
+
+    Either way the result must be Python ints: the mask builder evaluates
+    `kv_length + kv_offset - width > 0`, which raises on a tensor with several values.
+    """
+    import torch
+
+    from engine.cache.paged_cache import PagedCache
+    from engine.cache.pool_cache import BatchedPoolBackedPrefillCache
+
+    pool = [torch.zeros(2, 4, 1, 2)]
+    batched = BatchedPoolBackedPrefillCache(pool, pool, torch.zeros(1, 2, dtype=torch.int32),
+                                            torch.tensor([3], dtype=torch.int32), padded_length=3)
+    for query in (torch.arange(3), 3):
+        kv_length, kv_offset = batched.get_mask_sizes(query, 0)
+        assert (kv_length, kv_offset) == (3, 0) and type(kv_length) is int
+
+    paged = PagedCache(num_layers=1, block_size_tokens=4)
+    paged.layers[0].seq_len = 5
+    for query in (torch.arange(2), 2):
+        kv_length, kv_offset = paged.get_mask_sizes(query, 0)
+        assert (kv_length, kv_offset) == (7, 0) and type(kv_length) is int
