@@ -18,8 +18,14 @@ if [ ! -x "$INSTALL_DIR/code" ]; then
   rm "$INSTALL_DIR/vscode_cli.tar.gz"
 fi
 
-echo "Starting VS Code tunnel. Open the printed https://github.com/login/device"
-echo "URL and enter the code to authenticate, then keep this cell running."
+echo "Logging in with GitHub. Open the printed https://github.com/login/device"
+echo "URL and enter the code to authenticate."
+echo
+
+"$INSTALL_DIR/code" tunnel user login --provider github
+
+echo
+echo "Starting VS Code tunnel. Keep this cell running."
 echo
 
 exec "$INSTALL_DIR/code" tunnel --accept-server-license-terms --name kaggle-fol
