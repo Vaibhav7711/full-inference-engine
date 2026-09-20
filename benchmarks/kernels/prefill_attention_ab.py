@@ -32,30 +32,55 @@ LAYERS = 28          # Qwen3-0.6B: a step runs the attention kernel once per lay
 BYTES = 2
 
 
+def _compiled_kernels(kernel_fn) -> list:
+    """Every compiled variant of a JIT function, across the Triton cache layouts.
+
+    Triton <= 3.2 keeps `JITFunction.cache[device][key]`; 3.3+ keeps
+    `device_caches[device] = (kernel_cache, target, backend, binder)`.
+    """
+    found = []
+    cache = getattr(kernel_fn, "cache", None)
+    if isinstance(cache, dict):
+        for per_device in cache.values():
+            if isinstance(per_device, dict):
+                found.extend(per_device.values())
+    device_caches = getattr(kernel_fn, "device_caches", None)
+    if isinstance(device_caches, dict):
+        for entry in device_caches.values():
+            store = entry[0] if isinstance(entry, tuple) else entry
+            if isinstance(store, dict):
+                found.extend(store.values())
+    return found
+
+
 def kernel_diagnostics(kernel_fn) -> dict:
-    """Registers, spills and shared memory of the most recently compiled variant.
+    """Registers, spills, shared memory and instruction mix of the latest compiled variant.
 
     Triton records these per compiled kernel and they are the only way to tell an
     occupancy problem from a spilling one from a memory one. Reading them is the
     difference between diagnosing and guessing: a kernel moving 60x less data while
     running 3.5x slower is not memory-bound, and n_spills says so directly.
     """
-    try:
-        cache = getattr(kernel_fn, "cache", {})
-        compiled = [k for device in cache.values() for k in device.values()]
-        if not compiled:
-            return {}
-        latest = compiled[-1]
-        report = {
-            "n_regs": getattr(latest, "n_regs", None),
-            "n_spills": getattr(latest, "n_spills", None),
-            "shared_bytes": getattr(latest, "metadata", None)
-            and getattr(latest.metadata, "shared", None),
-        }
-        report.update(ptx_report(getattr(latest, "asm", {}).get("ptx", "")))
-        return report
-    except Exception:
-        return {}
+    compiled = _compiled_kernels(kernel_fn)
+    if not compiled:
+        return {"error": f"no compiled kernels found on {getattr(kernel_fn, '__name__', kernel_fn)}"}
+    latest = compiled[-1]
+    report: dict = {}
+    for name in ("n_regs", "n_spills"):
+        report[name] = getattr(latest, name, None)
+    metadata = getattr(latest, "metadata", None)
+    report["shared_bytes"] = getattr(metadata, "shared", None) if metadata is not None else None
+    ptx = ""
+    asm = getattr(latest, "asm", None)
+    if asm is not None:
+        try:
+            ptx = asm["ptx"]
+        except Exception as error:  # LazyDict / dict differences across versions
+            report["error"] = f"could not read PTX: {error!r}"
+    if isinstance(ptx, bytes):
+        ptx = ptx.decode("utf-8", "replace")
+    report.update(ptx_report(ptx))
+    return report
 
 
 def ptx_report(ptx: str) -> dict:
@@ -178,6 +203,9 @@ def _ptx_only(args) -> int:
     for key in keys:
         print(f"{key:18s}{str(old.get(key, '?')):>12s}{str(new.get(key, '?')):>12s}")
     verdicts = []
+    if "mma_sync" not in new or "mma_sync" not in old:
+        print(f"\nDIAGNOSTICS UNAVAILABLE: per_token={old.get('error')} tiled={new.get('error')}")
+        return 1
     if new.get("mma_sync") == 0:
         verdicts.append("tl.dot did NOT reach the tensor cores: no mma.sync in the tiled PTX. "
                         "The kernel is an FMA loop through MMA-shaped layout shuffles.")
