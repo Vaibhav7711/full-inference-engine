@@ -74,8 +74,9 @@ def run_rung(tree: Path, out: Path, widths: str, args, graph: bool, log: Path) -
     started = time.time()
     with log.open("a") as fh:
         proc = subprocess.run(cmd, cwd=tree, env=env, stdout=fh, stderr=subprocess.STDOUT)
-    if proc.returncode != 0:
-        return {"error": f"exit {proc.returncode}, see {log}", "elapsed_s": time.time() - started}
+    if proc.returncode != 0 or not out.exists():
+        return {"error": f"exit {proc.returncode}, no output at {out}; see {log}",
+                "elapsed_s": round(time.time() - started, 1)}
     data = json.loads(out.read_text())
     tps = {1: data["sequential"]["throughput_tok_s"]}
     for row in data["sweep"]:
@@ -122,7 +123,9 @@ def main() -> int:
         keep = set(args.only.split(","))
         rungs = [r for r in rungs if r[0] in keep or r[1] in keep]
     root = (repo / args.worktrees).resolve()
-    out = Path(args.out)
+    # Absolute: each rung's benchmark runs with cwd inside its own worktree, and a
+    # relative --output would land there instead of in the run directory.
+    out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     logs = out.parent / "ladder_logs"
     logs.mkdir(exist_ok=True)
