@@ -1030,17 +1030,25 @@ class ContinuousBatchingEngine:
         # whichever is smaller, so the resumable chunk path is the one that runs.
         long_prompt = max(130, min(self.prefill_chunk_size, self.max_prefill_tokens_per_iteration) + 2)
         widths = list(self.cuda_graph_batch_sizes) or [1]
+        budget = self.max_prefill_tokens_per_iteration
         # Random token ids can decode to EOS; ignore it so every round reaches decode.
         eos_ids, self.eos_ids = self.eos_ids, set()
         rounds = 0
         try:
             for width in widths:
                 for length in (short_prompt, long_prompt):
+                    # Prompts are admitted a budget's worth per step, so the earliest
+                    # request must keep decoding until the last one has joined the batch,
+                    # or the round never reaches `width` rows and that bucket is never
+                    # captured in this regime.
+                    steps_to_admit_all = -(-(width * length) // budget) + width
+                    max_new_tokens = 3 + steps_to_admit_all
                     for index in range(width):
                         ids = torch.randint(1, vocab_size, (length,), generator=generator).tolist()
                         self.submit(GenerationRequest(
                             request_id=f"__warmup_{rounds}_{index}",
-                            prompt_token_count=length, max_new_tokens=3, prompt_token_ids=ids,
+                            prompt_token_count=length, max_new_tokens=max_new_tokens,
+                            prompt_token_ids=ids,
                         ))
                     steps = 0
                     while self.has_unfinished_requests and steps < 10_000:
