@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from benchmarks.reliability.ab import (
-    FULL, LEAVE_ONE_OUT, SETTINGS, _clamp_graph_buckets, graph_buckets, resolve_arms,
+    FULL, LEAVE_ONE_OUT, SETTINGS, _clamp_graph_buckets, drift_expected, graph_buckets,
+    resolve_arms,
 )
 
 
@@ -106,3 +107,14 @@ def test_prompt_profiles_are_ordered_and_plausible() -> None:
     assert means == sorted(means)
     # Real chat traffic carries a system prompt plus history; the default profile does not.
     assert means[0] < 200 and means[1] > 500 and means[2] > 1500
+
+
+def test_drift_is_expected_exactly_where_arms_swap_kernels() -> None:
+    """Arms that run different fp16 kernels may flip a late near-tie; arms that only change
+    scheduling or memory policy must stay token-identical, or the speedup is a bug."""
+    for setting in ("kv_dtype", "prefill_kernel", "triton_rmsnorm", "triton_rope",
+                    "triton_swiglu", "mlp_gate_up", "loo_all", "loo_rope"):
+        assert drift_expected(setting), setting
+    for setting in ("cuda_graphs", "prefix_cache", "prefill_chunk", "graph_buckets_padded",
+                    "warmup"):
+        assert not drift_expected(setting), setting

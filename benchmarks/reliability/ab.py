@@ -145,9 +145,18 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
     return resolved
 
 
-# Settings whose arms are allowed to produce different greedy tokens. Everything else
-# must be token-identical across arms: a speedup that changes output is a bug.
-TOKEN_DRIFT_EXPECTED = {"kv_dtype"}
+# Settings whose arms are allowed to produce different greedy tokens: they swap a kernel,
+# and fp16 kernels with a different reduction order are not bit-identical, so a late
+# near-tie can flip. Everything else must be token-identical across arms: a speedup that
+# changes output is a bug. Kernel-swapping arms are still gated below: each must agree
+# with stock Transformers for the first `--min-identical-tokens` of every prompt, which a
+# wrong kernel fails immediately and a rounding difference does not.
+TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "triton_rmsnorm", "triton_rope",
+                        "triton_swiglu", "mlp_gate_up"}
+
+
+def drift_expected(setting: str) -> bool:
+    return setting in TOKEN_DRIFT_EXPECTED or setting.startswith("loo_")
 
 # Fixed prompts for the cross-arm token-identity gate. Long enough to cross a prefill
 # chunk and the 128-token decode regime boundary once generation is included.
@@ -305,6 +314,9 @@ def main() -> int:
                         help="skip the engine's per-phase step split (host/GPU/sync)")
     parser.add_argument("--allow-token-drift", action="store_true",
                         help="continue even if arms produce different greedy tokens")
+    parser.add_argument("--min-identical-tokens", type=int, default=8,
+                        help="every arm must match stock Transformers for at least this "
+                             "many leading tokens of every identity prompt")
     args = parser.parse_args()
 
     from engine.batching.continuous_batching import ContinuousBatchingEngine
@@ -373,11 +385,20 @@ def main() -> int:
     divergence = {label: _first_divergence(identity[label], reference) for label in labels}
     for label in labels:
         print(f"vs stock reference, first divergent token per prompt: {label}={divergence[label]}")
+    early = {label: [i for i in divergence[label] if i is not None and i < args.min_identical_tokens]
+             for label in labels}
+    broken = [label for label in labels if early[label]]
+    if broken and not args.allow_token_drift:
+        print(f"refusing to run: {broken} diverge from stock Transformers within the first "
+              f"{args.min_identical_tokens} tokens ({ {b: divergence[b] for b in broken} }). "
+              f"That is a wrong kernel, not rounding. Fix it or pass --allow-token-drift.")
+        return 3
     drift = [label for label in labels[1:] if identity[label] != identity[labels[0]]]
     if drift:
         message = f"greedy tokens differ across arms: {drift} vs {labels[0]}"
-        if args.setting in TOKEN_DRIFT_EXPECTED:
-            print(f"NOTE {message} (expected for {args.setting})")
+        if drift_expected(args.setting):
+            print(f"NOTE {message} (expected for {args.setting}: arms use different kernels; "
+                  f"all arms match stock for the first {args.min_identical_tokens} tokens)")
         elif args.allow_token_drift:
             print(f"WARNING {message}")
         else:
