@@ -2454,3 +2454,34 @@ Next for prefill, in order:
    loaded per program, an unrolled loop over BLOCK_M query rows using the per-token
    kernel's `tl.sum(q * k)` body. The byte saving without `tl.dot` and without the
    shared-memory shuffles. Only worth building if (1) leaves something on the table.
+
+### SDPA over gathered pages as a chunked-prefill implementation; the tiled kernel on later GPUs
+
+`engine/kernels/sdpa_prefill.py` adds the third chunked-prefill attention path, selected by
+`ContinuousBatchingEngine(prefill_attention="per_token" | "sdpa" | "tiled")` (the old
+`tiled_prefill` boolean still works). Per layer it gathers each row's prefix pages into a
+dense `[B, H, T, D]` tensor (`index_select` on the pool, no Python loop), builds one boolean
+causal mask for the padded chunk batch, and calls `torch.nn.functional.scaled_dot_product_attention`
+with `enable_gqa`. The longest `start + chunk` is passed from the planner so no layer reads
+it back from the device. Unit-tested on CPU against a dense reference and on CUDA against
+the per-token kernel; `test_d4` now runs the engine's chunked path with both kernels
+against stock Transformers. `ab.py --setting prefill_kernel` is a three-arm run.
+
+**The tiled kernel is kept, for the GPUs this engine will also serve on.** The T4 result is a
+property of Triton on sm_75, not of the kernel's design: on Ada (RTX 40, sm_89) and
+Blackwell (RTX 50, sm_120) `tl.dot` lowers to `mma.sync`, `cp.async` makes `num_stages > 2`
+real, and the register and shared-memory budgets are larger. The same
+FlashAttention-over-pages structure that loses 3x here is expected to win there. The
+device profile in `engine/kernels/device.py` already distinguishes these cases
+(`supports_async_copy`, per-device tile defaults). Rule for enabling it on a new device,
+in order:
+
+1. `benchmarks/kernels/prefill_attention_ab.py --ptx-only` must show `mma_sync > 0`,
+   no spills, and vector K/V loads for the tiled kernel. Without that, do not run timings.
+2. `--sweep-tiles` on that device picks the tile shape; the SDPA column is the bound to beat.
+3. `ab.py --setting prefill_kernel --prompt-profile chat` in the engine, with the
+   first-divergence-from-stock line recorded for each arm. A kernel that diverges earlier
+   than `sdpa` does not become the default on speed alone.
+
+Until then the default stays `per_token`, with `sdpa` the candidate to replace it on the T4
+pending the Phase 1b measurement.

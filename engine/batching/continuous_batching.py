@@ -42,7 +42,19 @@ from engine.kernels.paged_decode_batched import (
 )
 from engine.kernels.paged_decode_config import select_paged_decode_config
 from engine.kernels.paged_prefill import paged_prefill
+from engine.kernels.sdpa_prefill import sdpa_paged_prefill
 from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
+
+# Chunked-prefill attention implementations, by name:
+#   per_token  Triton, one program per (row, head, query token); lean, bandwidth-bound on
+#              redundant prefix reads. The measured baseline.
+#   sdpa       gather the prefix pages into a dense tensor and call torch SDPA - the same
+#              kernel the fresh-prompt fast path uses; reaches the tensor cores on sm_75.
+#   tiled      Triton FlashAttention structure over paged KV with `tl.dot`. Only a
+#              candidate on devices where `tl.dot` lowers to mma (sm_80+); on the T4 it
+#              compiles to FMA, spills, and runs one block per SM. Check with
+#              `benchmarks/kernels/prefill_attention_ab.py --ptx-only` before enabling.
+PREFILL_ATTENTION_KINDS = ("per_token", "sdpa", "tiled")
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
 
@@ -76,15 +88,18 @@ class _PrefillContext:
     chunk_lens: torch.Tensor
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
-    # Which fp16 prefill attention kernel to run. The tiled kernel loads each KV tile once
-    # per tile of queries; the original loads the whole prefix once per query token. Off by
-    # default: on the T4 its `tl.dot` compiles to FMA (no mma.sync in the PTX), it spills
-    # at 255 registers, and 49 KB of shared memory limits it to one block per SM - measured
-    # 3x slower than the per-token kernel and not greedy-token-identical to it. See the
-    # journal entry "The tiled prefill kernel never used the tensor cores".
-    tiled_prefill: bool = False
+    # One of PREFILL_ATTENTION_KINDS. See the note at the top of the module.
+    attention: str = "per_token"
+    # Longest start + chunk in this batch, known host-side at planning time. The SDPA
+    # path gathers this many logical tokens per row; reading it from the device tensors
+    # would be a synchronization per layer.
+    total_len: int = 0
     prefill_block_m: int | None = None
     prefill_block_n: int | None = None
+
+    @property
+    def tiled_prefill(self) -> bool:
+        return self.attention == "tiled"
 
 
 _PREFILL_CTX: Optional[_PrefillContext] = None
@@ -172,7 +187,13 @@ def chunked_prefill_attention_forward(
             key, value, key_pool, value_pool, ctx.block_tables,
             ctx.chunk_lens, ctx.start_positions,
         )
-        if ctx.tiled_prefill:
+        if ctx.attention == "sdpa":
+            out = sdpa_paged_prefill(
+                query, key_pool, value_pool, ctx.block_tables,
+                ctx.start_positions, ctx.chunk_lens, scale=scaling,
+                total_len=ctx.total_len,
+            )
+        elif ctx.attention == "tiled":
             out = tiled_paged_prefill(
                 query, key_pool, value_pool, ctx.block_tables,
                 ctx.start_positions, ctx.chunk_lens, scale=scaling,
@@ -215,6 +236,7 @@ class ContinuousBatchingEngine:
     def __init__(self, model, tokenizer, device, *,
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
+                 prefill_attention: str | None = None,
                  tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
                  prefill_block_n: int | None = None,
@@ -249,7 +271,13 @@ class ContinuousBatchingEngine:
         self.block_size = block_size
         self.max_active = max_active
         self.prefill_chunk_size = prefill_chunk_size
-        self.tiled_prefill = tiled_prefill
+        # `tiled_prefill` is the older boolean form of the same choice.
+        if prefill_attention is None:
+            prefill_attention = "tiled" if tiled_prefill else "per_token"
+        if prefill_attention not in PREFILL_ATTENTION_KINDS:
+            raise ValueError(f"prefill_attention must be one of {PREFILL_ATTENTION_KINDS}")
+        self.prefill_attention = prefill_attention
+        self.tiled_prefill = prefill_attention == "tiled"
         self.prefill_block_m = prefill_block_m
         self.prefill_block_n = prefill_block_n
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
@@ -833,7 +861,8 @@ class ContinuousBatchingEngine:
         _set_prefill_ctx(_PrefillContext(
             self.key_pool, self.value_pool, block_tables, starts, chunk_lens,
             self.key_scale_pool, self.value_scale_pool,
-            tiled_prefill=self.tiled_prefill,
+            attention=self.prefill_attention,
+            total_len=max(start + count for start, count in zip(starts_list, counts_list)),
             prefill_block_m=self.prefill_block_m,
             prefill_block_n=self.prefill_block_n,
         ))

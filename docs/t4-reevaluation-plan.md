@@ -88,7 +88,7 @@ Isolation tiers:
 | P2 | Chunked paged prefill + decode-first scheduling | `24e7621` | worst decoder ITL 308 → 97 ms (−69%); long TTFT 361 → 1230 ms; short-prompt tp unchanged | T | `chunked_prefill_latency.py --chunk-size`; `ab.py --setting prefill_chunk` |
 | P3 | Prefill budget 128 tok/iteration | `b8811e9` | 64/128/256: 295/430/424 tok/s; long TTFT 898/531/544 ms | T | `mixed_arrival_prefill_budget_ab.py --budgets 64,128,256` |
 | P4 | Batching chunks across requests in one step | Phase B | 4 chunks in one step 55.4 ms vs 4 steps 186.3 ms (3.4x/unit work) | T | `sweep.py --only B3` |
-| P5 | Tiled causal prefill kernel (D2) | `tiled_paged_prefill.py` | **0.3x** (slower) before tile-default fixes; now default `tiled_prefill=True`, unmeasured | T | `ab.py --setting prefill_kernel --prompt-profile chat`; `prefill_attention_ab.py --sweep-tiles` |
+| P5 | Chunked-prefill attention: per_token / sdpa / tiled | `sdpa_prefill.py`, `tiled_paged_prefill.py` | tiled **0.3x** and diagnosed: no `mma.sync` on sm_75, spills, 1 block/SM (journal "never used the tensor cores"); default now `per_token`; `sdpa` (gathered pages + torch SDPA) is the candidate | T | `ab.py --setting prefill_kernel --prompt-profile chat` (three arms); `prefill_attention_ab.py --ptx-only` on any new GPU before enabling `tiled` |
 | P6 | Prefix-cache eviction bookkeeping incremental | `5a9514c` | O(N) per evicted block → O(1); unmeasured | L | ladder `55ebb7a` → `5a9514c` (with D16) |
 | P7 | `warmup()` before serving | `5a9514c` | removes first-request capture/JIT from p999; unmeasured | T | soak with/without `warmup()`; compare p999 and first-request TTFT |
 
@@ -183,7 +183,7 @@ Decision rule per item, fixed in advance:
    `tests/batching/test_continuous_batching.py::test_d3_each_fusion_toggle_off_matches_ref`.
 2. **`ab.py` settings**: `triton_rmsnorm`, `triton_rope`, `triton_swiglu`, `mlp_gate_up`,
    `graph_buckets_padded` (exact width vs powers of two), `warmup` (cold vs warmed), and the
-   leave-one-out family `loo_graphs`, `loo_prefix_cache`, `loo_tiled_prefill`, `loo_rmsnorm`,
+   leave-one-out family `loo_graphs`, `loo_prefix_cache`, `loo_rmsnorm`,
    `loo_rope`, `loo_swiglu`, plus `loo_all` (all seven arms interleaved against one `full`).
    The harness now compares every arm against the first and writes `comparisons[label]`.
 3. **Ladder runner**: `scripts/commit_ladder.py` — one worktree per rung, every rung every

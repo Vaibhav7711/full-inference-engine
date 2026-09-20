@@ -55,10 +55,14 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("chunk_32", {"prefill_chunk_size": 32,
                       "max_prefill_tokens_per_iteration": 32}),
     ],
-    # The Phase D2 change: tiled attention versus the per-query-token kernel.
+    # Chunked-prefill attention implementations, baseline first. `sdpa` gathers the
+    # prefix pages and calls torch SDPA (tensor cores on sm_75); `tiled` is the Triton
+    # FlashAttention structure, which on the T4 compiles to FMA and spills - kept as an
+    # arm so the same run measures it on any GPU where tl.dot does reach the MMA units.
     "prefill_kernel": [
-        ("per_token", {"tiled_prefill": False}),
-        ("tiled", {"tiled_prefill": True}),
+        ("per_token", {"prefill_attention": "per_token"}),
+        ("sdpa", {"prefill_attention": "sdpa"}),
+        ("tiled", {"prefill_attention": "tiled"}),
     ],
     # If a prefill step costs the same at 128 and 512 tokens, its cost is per-invocation
     # overhead rather than work, and no scheduling change can reduce it.
@@ -115,13 +119,12 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
 FULL: dict = {
     "cuda_graph_batch_sizes": _padded_buckets,
     "prefix_cache_blocks": 64,
-    "tiled_prefill": True,
+    "prefill_attention": "per_token",
     "triton_rmsnorm": True, "triton_rope": True, "triton_swiglu": True,
 }
 LEAVE_ONE_OUT: dict[str, dict] = {
     "graphs": {"cuda_graph_batch_sizes": None},
     "prefix_cache": {"prefix_cache_blocks": 0},
-    "tiled_prefill": {"tiled_prefill": False},
     "rmsnorm": {"triton_rmsnorm": False},
     "rope": {"triton_rope": False},
     "swiglu": {"triton_swiglu": False},

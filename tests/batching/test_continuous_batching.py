@@ -393,7 +393,8 @@ def test_padded_cuda_graph_bucket_matches_reference():
 
 @cuda
 @requires_cuda
-def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
+@pytest.mark.parametrize("prefill_attention", ["per_token", "sdpa"])
+def test_d4_chunked_prefill_matches_reference_and_releases_blocks(prefill_attention):
     """A prompt spanning several resumable chunks remains token-identical."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
 
@@ -407,6 +408,7 @@ def test_d4_chunked_prefill_matches_reference_and_releases_blocks():
     eng = ContinuousBatchingEngine(
         model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
         prefill_chunk_size=8, max_prefill_tokens_per_iteration=8,
+        prefill_attention=prefill_attention,
     )
     actual = eng.generate([prompt], max_new_tokens=max_new)[0]
     assert actual == reference
