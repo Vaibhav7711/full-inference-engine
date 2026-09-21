@@ -52,6 +52,28 @@ step cost -2.4%, inside noise, while doubling prefill frequency: average gap +49
 identical, so prefill is entirely ungraphed. **No scheduling change can reduce it**; the
 prefill path itself is the target.
 
+### Kaggle T4 re-baseline (2026-09-21, branch `t4-phase0`)
+
+Warmed engines, interleaved arms, 5 x 30 s closed-loop runs at concurrency 8, provenance
+and clocks in every JSON (`results/t4/20260921_*/`). Supersedes the Colab numbers above
+where they disagree; the Colab decode-graph result is reproduced.
+
+| quantity | chat profile (~656-token prompts) | long profile (~1.8k) |
+|---|---|---|
+| decode-only step p50 (graphs on) | 10.3 ms | 10.4 ms |
+| host staging per step | 0.26 ms | 0.27 ms |
+| prefill step p50, `sdpa` graphed (default) | **27.0 ms** | **30.3 ms** |
+| prefill step p50, `per_token` graphed | 45.3 ms | 87.9 ms |
+| prefill step p50, `tiled` (previous default, Sep 20) | 98 ms | — |
+| TTFT p50, `sdpa` | 414 ms | 3.7 s |
+| ITL p99, `sdpa` | 41 ms | 76 ms |
+| CUDA graphs, decode step | 34.2 → 9.7 ms (−72%) | |
+
+Decisions taken on these: `prefill_attention="sdpa"` default; `tiled` kept for sm_80+
+only (no `mma.sync` on the T4, see journal); prefill chunk 128 (cost fixed per
+invocation on the real kernel); prefix cache and INT8 KV off by default (unresolved or
+negative on these workloads).
+
 ### Preemption (Gate 1B)
 
 Rebuild 37.53 ms, independent of token count (32 and 22 tokens both 37.53 ms). Queue wait
@@ -117,7 +139,8 @@ A/B comparison list for that reason.
 | Prefill chunk A/B (128 vs 512) | **void**: non-binding, both arms fit a ~122-token prompt in one chunk |
 | Prefill investigation (Phase B sweep) | **accepted**: `step_ms = 21.13 + 0.405*chunk`, R²=0.998 |
 | Phase D1 — decouple prefill budget from chunk size | **next**, scheduling only |
-| Phase D2 — tiled causal prefill kernel | **failed**: 0.3x, 0.2% of tensor-core peak. Grid collapses to 64 blocks on 40 SMs at chunk 64 — tiling the query dimension trades away the parallelism it was meant to buy. Diagnosing with spills, occupancy and an SDPA upper bound. |
+| Phase D2 — tiled causal prefill kernel | **diagnosed, retired on T4**: `tl.dot` emits no `mma.sync` on sm_75 (FMA loops through MMA-shaped shared-memory shuffles, 255 regs, 1 block/SM). Kept as the candidate for sm_80+ devices behind a PTX gate. |
+| Prefill path — SDPA over gathered pages, graphed | **accepted**: −40% chat / −66% long prefill step vs per-token kernel, token-identical to stock on the identity prompts. Default. |
 
 ---
 

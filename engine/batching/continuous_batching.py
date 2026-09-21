@@ -46,10 +46,12 @@ from engine.kernels.sdpa_prefill import sdpa_paged_prefill
 from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
 
 # Chunked-prefill attention implementations, by name:
+#   sdpa       (default) gather the prefix pages into a dense tensor and call torch SDPA -
+#              the same kernel the fresh-prompt fast path uses; reaches the tensor cores
+#              on sm_75. Measured -40%/-66% prefill step vs per_token on the T4 and
+#              token-identical to stock Transformers on the identity prompts.
 #   per_token  Triton, one program per (row, head, query token); lean, bandwidth-bound on
-#              redundant prefix reads. The measured baseline.
-#   sdpa       gather the prefix pages into a dense tensor and call torch SDPA - the same
-#              kernel the fresh-prompt fast path uses; reaches the tensor cores on sm_75.
+#              redundant prefix reads. The previous default and the measured baseline.
 #   tiled      Triton FlashAttention structure over paged KV with `tl.dot`. Only a
 #              candidate on devices where `tl.dot` lowers to mma (sm_80+); on the T4 it
 #              compiles to FMA, spills, and runs one block per SM. Check with
@@ -97,7 +99,7 @@ class _PrefillContext:
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
     # One of PREFILL_ATTENTION_KINDS. See the note at the top of the module.
-    attention: str = "per_token"
+    attention: str = "sdpa"
     # Longest start + chunk in this batch, known host-side at planning time. The SDPA
     # path gathers this many logical tokens per row; reading it from the device tensors
     # would be a synchronization per layer.
@@ -289,9 +291,12 @@ class ContinuousBatchingEngine:
         self.block_size = block_size
         self.max_active = max_active
         self.prefill_chunk_size = prefill_chunk_size
-        # `tiled_prefill` is the older boolean form of the same choice.
+        # `tiled_prefill` is the older boolean form of the same choice. Default: SDPA over
+        # gathered pages - measured on the T4 (journal, "SDPA under graphs") at -40% chat
+        # and -66% long prefill step against the per-token kernel, and the only chunked
+        # path that matches stock Transformers token-for-token on the identity prompts.
         if prefill_attention is None:
-            prefill_attention = "tiled" if tiled_prefill else "per_token"
+            prefill_attention = "tiled" if tiled_prefill else "sdpa"
         if prefill_attention not in PREFILL_ATTENTION_KINDS:
             raise ValueError(f"prefill_attention must be one of {PREFILL_ATTENTION_KINDS}")
         self.prefill_attention = prefill_attention

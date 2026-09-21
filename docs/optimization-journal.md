@@ -2583,3 +2583,44 @@ slower respectively. Two causes, one per kernel, both in the engine rather than 
 
 INT8 KV on the long profile with drift allowed: every metric unresolved (decode -9% inside
 23% spread). No speed win at 1.8k context on this model; stays off.
+
+## SDPA under graphs: chunked prefill 2-3x faster and token-identical to stock — default flipped
+
+Kaggle T4, commit `9f1f828` (SDPA on the memory-efficient backend, prefill graphs on, before
+the per-step mask cache), `ab.py --setting prefill_sdpa`, 5 interleaved 30 s runs per arm,
+decode graphs on in both arms. `results/t4/20260921_e709d4e/ab_prefill_sdpa_graphed_*.json`.
+
+| | per_token | sdpa | change (spread) |
+|---|---|---|---|
+| chat: prefill step p50 | 45.3 ms | **27.0 ms** | −40.6% (9.9%) |
+| chat: prefill GPU p50 | 35.7 ms | **16.5 ms** | −53.8% (20.4%) |
+| chat: TTFT p50 / ITL p99 | 701 ms / 82.5 ms | **414 ms / 41.2 ms** | ITL p99 −50.0% (20.1%); TTFT unresolved |
+| long: prefill step p50 | 87.9 ms | **30.3 ms** | −65.6% (31.6%) |
+| long: prefill GPU p50 | 80.8 ms | **20.5 ms** | −74.6% (32.2%) |
+| long: TTFT p50 / ITL p99 | 9.8 s / 211 ms | **3.7 s / 76 ms** | unresolved (spreads ~100%) |
+| decode step | 10.3 ms | 10.4 ms | +1.1%, unresolved — as it must be |
+| first divergence from stock, 4 prompts | 4, 18, none, 13 | **none, none, none, none** | |
+
+The long profile gains more because attention's share of the step grows with prefix
+length, which is the signature of a kernel win rather than noise. `sdpa` is also the first
+chunked path to reproduce stock Transformers token-for-token on every identity prompt: it
+is torch's own kernel, the same one the fresh-prompt path runs.
+
+**Decision:** `prefill_attention` defaults to `"sdpa"` in the engine, the server factory and
+the A/B `full` configuration. `per_token` stays as the measured baseline; `tiled` stays for
+sm_80+ devices under the rule recorded above.
+
+Open observation, not chased: `per_token`'s divergence from stock moved from
+`[none, none, none, 13]` at `e709d4e` to `[4, 18, none, 13]` at `9f1f828`. The changes in
+between (graphed, full-width chunk batches; vocabulary projection on last tokens only) are
+shared with `sdpa`, which matches stock exactly, so the shared machinery is not the cause.
+It is no longer the default, so this is recorded rather than investigated.
+
+What is now established for the prefill path, in order of arrival: the tiled kernel never
+reached the tensor cores (PTX); the per-token kernel was 10x off SDPA in isolation
+(kernel table); the engine A/Bs contradicted the kernel table because the forward is
+launch-bound and the SDPA path added launches (per-layer mask rebuild) - fixed by the
+per-step cache and made irrelevant by graphing the forward; and with both in place SDPA
+wins by 2-3x on the step. The remaining prefill cost is the un-attention part of the forward
+plus the decode it carries, i.e. the same fixed-cost regime decode was in before graphs.
+Phase 2a's `prefill_graphs` A/B measures that piece on its own.

@@ -130,7 +130,7 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
 FULL: dict = {
     "cuda_graph_batch_sizes": _padded_buckets,
     "prefix_cache_blocks": 64,
-    "prefill_attention": "per_token",
+    "prefill_attention": "sdpa",
     "prefill_cuda_graphs": True,
     "triton_rmsnorm": True, "triton_rope": True, "triton_swiglu": True,
 }
