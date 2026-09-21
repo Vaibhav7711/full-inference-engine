@@ -2820,3 +2820,49 @@ the engine A/B's `decode_step_p50_ms`. If the kernel wins in isolation but the s
 not move, the decode step is not attention-bound at this operating point and the next
 lever is elsewhere (per-layer launch count inside the graph, or the lm_head GEMM). If
 neither moves, the L2 already absorbed the double read and the item is closed.
+
+## Phase 2c result: the rank-3 GQA kernel loses 1.5-2.8x; warmup closes p99 by 71%; the identity gate has a hole
+
+Kaggle T4, commit `c7afabb`, `results/t4/20260921_c7afabb/`.
+
+**Decode kernel, K/V tile shared across the group - first version, negative.** Sweep
+(`paged_decode_regime_sweep.py --kernel both`, CUDA events, best config per kernel):
+
+| context | batch | per_head best | gqa best | gqa / per_head |
+|---|---|---|---|---|
+| 128 | 8 | 0.109 ms (128x4) | 0.165 ms (32x8) | 1.52 |
+| 512 | 8 | 0.136 ms | 0.211 ms | 1.56 |
+| 1024 | 8 | 0.208 ms | 0.368 ms | 1.77 |
+| 2048 | 16 | 0.659 ms | 1.376 ms | 2.09 |
+| 2048 | 1 | 0.165 ms | 0.464 ms | 2.82 |
+
+Engine A/B (`decode_kernel`, chat / long): decode step +76.5% / +129.8%, ITL p50 +35% /
++64%. Unambiguous. The ratio does not close at batch 16 x 2048, where the halved grid
+(128 programs on 40 SMs) has parallelism to spare, so the grid is not the cost; the
+`[REP, BLOCK_N, D]` rank-3 products are. That is the same lesson the static check
+`test_no_rank_three_broadcast_intermediate` encodes, this time at a size (64 KB per
+program) where the bytes argument does not apply: Triton's 3-D layouts are what cost.
+The kernel is rewritten as an explicit two-head unroll over rank-2 tiles - one K load and
+one V load per iteration feeding two heads, every product `[BLOCK_N, D]` - which is the
+formulation that actually tests the shared read. To be swept once; if it does not beat
+per-head in isolation the item is closed and the double read is judged absorbed by L2.
+
+What the sweep gave regardless: per-head decode attention is 0.14-0.21 ms per layer at
+(batch 4-8, 512-1024 tokens), i.e. 4-6 ms of the 10 ms decode step across 28 layers.
+Attention is about half the decode step at the chat operating point; the other half is
+the weight read plus per-layer overhead. That is the decode budget from here on.
+
+**`warmup` (P7): closed.** Cold start vs warmed, chat, 5 x 15 s: ITL p99 −71.4% (spread
+7.5%), p999 −63.1% (6.0%), `lazy_graph_captures` −100%; p50, step costs and gap all
+unresolved at <1%. Warmup moves nothing but the tail, and moves all of it.
+
+**`prefill_graphs`: refused by the identity gate**, and the refusal is informative.
+`prefill_eager` diverges from stock at token 4 (prompt 0) and 13 (prompt 3);
+`prefill_graphed` at 18 (prompt 1). Phase 1b's `per_token` arm diverged at 4, 18 and 13 -
+the same positions, from a different kernel. Three implementations flipping at the same
+three positions is the signature of near-ties in the logits there, not of a wrong kernel,
+and the gate's "early divergence = wrong kernel" rule cannot tell the two apart.
+`scripts/token_margins.py` prints the stock top-2 logit margin at each generated
+position; if the margins at 4/13/18 are below fp16 resolution the gate is re-specified
+to skip tied positions, and `prefill_graphs` reruns with drift allowed. Not decided
+until measured.

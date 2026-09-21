@@ -16,16 +16,13 @@ def select_paged_decode_config(
     Mixed-length batches select from their longest active sequence so every program
     uses one valid compile-time configuration without a device-side synchronization.
 
-    The GQA-shared kernel holds `n_rep` heads of state and broadcasts its products over
-    `[REP, BLOCK_N, D]`, so its tile is halved to keep the same register footprint as the
-    per-head regime it replaces. Re-derive from `paged_decode_regime_sweep.py --kernel gqa`
-    on a new device.
+    The GQA-shared kernel holds two heads of state over the same rank-2 tiles, so it
+    takes the per-head regime as its starting point. Re-derive from
+    `paged_decode_regime_sweep.py --kernel both` on a new device.
     """
     if max_sequence_length <= 0 or batch_size <= 0:
         raise ValueError("max_sequence_length and batch_size must be positive")
     if kernel not in DECODE_ATTENTION_KINDS:
         raise ValueError(f"kernel must be one of {DECODE_ATTENTION_KINDS}")
     block_n = 128 if max_sequence_length >= 128 else 64
-    if kernel == "gqa":
-        block_n //= 2
     return block_n, 4

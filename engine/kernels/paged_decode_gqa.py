@@ -6,12 +6,13 @@ tile is streamed from the pool `n_rep` times per layer - twice for Qwen3-0.6B. D
 the memory-bound half of serving and, at batch 8-16 with ~700-token contexts, KV traffic
 is of the same order as the weight read the step is floored by.
 
-This variant runs one program per (sequence, KV head) and carries the online-softmax
-state of all `n_rep` query heads: `[REP]` running max and sum, `[REP, D]` accumulator.
-Each K/V tile is loaded once and used for every head in the group. The score and PV
-products broadcast to `[REP, BLOCK_N, D]` in registers, so a tile of BLOCK_N here costs
-what a tile of REP * BLOCK_N costs in the per-head kernel; the regime table halves
-BLOCK_N accordingly.
+This variant runs one program per (sequence, KV head) with the group's two query heads
+unrolled: two sets of online-softmax state, one K tile and one V tile per iteration
+feeding both. All products are rank-2, as in the per-head kernel. (A first version
+carried the group as a tensor axis and broadcast to `[REP, BLOCK_N, D]`; it lost 1.5-2.8x
+to the per-head kernel at every point of the T4 sweep, so the layout, not the shared
+read, was what got measured. Journal, Phase 2c.) Written for `n_rep == 2`, Qwen3-0.6B's
+geometry; other group sizes use the per-head kernel.
 
 What it does not fix: the grid shrinks by `n_rep` (S * kv_heads programs), so at small
 batches fewer SMs are busy. Whether the halved traffic beats the lost parallelism on a
@@ -36,34 +37,40 @@ def _paged_decode_gqa_kernel(
     stride_bts, stride_btb,
     stride_sl,
     scale,
-    REP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LENGTH_OFFSET: tl.constexpr,
 ):
-    pid_s = tl.program_id(0)    # sequence
-    pid_kv = tl.program_id(1)   # KV head; query heads kv*REP .. kv*REP+REP-1
+    """One program per (sequence, KV head), the group's two query heads unrolled.
 
-    offs_r = tl.arange(0, REP)
+    Every product is rank-2 (`[BLOCK_N, D]`), exactly as in the per-head kernel; the
+    only difference is that one K tile and one V tile feed two heads. The first version
+    of this kernel carried the group as a leading tensor axis and broadcast to
+    `[REP, BLOCK_N, D]`; that ran 1.5-2.8x slower than the per-head kernel on the T4 at
+    every operating point, including ones with ample parallelism, so the rank-3 layout
+    and not the halved grid was the cost. This form isolates the shared read.
+    """
+    pid_s = tl.program_id(0)
+    pid_kv = tl.program_id(1)
+
     offs_d = tl.arange(0, HEAD_DIM)
     offs_n = tl.arange(0, BLOCK_N)
-
     seq_len = tl.load(sl_ptr + pid_s * stride_sl) + LENGTH_OFFSET
 
-    # The group's query vectors: [REP, HEAD_DIM]
-    q_heads = pid_kv * REP + offs_r
-    q_ptrs = q_ptr + pid_s * stride_qs + q_heads[:, None] * stride_qh + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs)
+    h0 = pid_kv * 2
+    q_base = q_ptr + pid_s * stride_qs + offs_d * stride_qd
+    q0 = tl.load(q_base + h0 * stride_qh)
+    q1 = tl.load(q_base + (h0 + 1) * stride_qh)
 
-    m_i = tl.full([REP], float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros([REP], dtype=tl.float32)
-    acc = tl.zeros([REP, HEAD_DIM], dtype=tl.float32)
+    m0 = float("-inf")
+    l0 = 0.0
+    acc0 = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    m1 = float("-inf")
+    l1 = 0.0
+    acc1 = tl.zeros([HEAD_DIM], dtype=tl.float32)
 
     bt_base = bt_ptr + pid_s * stride_bts
-    kv_off = pid_kv * stride_kh
-    v_kv_off = pid_kv * stride_vh
-
     for start_n in range(0, seq_len, BLOCK_N):
         cur_n = start_n + offs_n
         n_mask = cur_n < seq_len
@@ -71,31 +78,33 @@ def _paged_decode_gqa_kernel(
         offset = cur_n % BLOCK_SIZE
         phys_block = tl.load(bt_base + logical_block * stride_btb, mask=n_mask, other=0)
 
-        k_row = phys_block[:, None] * stride_kb + offset[:, None] * stride_ks + kv_off
+        k_row = phys_block[:, None] * stride_kb + offset[:, None] * stride_ks + pid_kv * stride_kh
         k = tl.load(kp_ptr + k_row + offs_d[None, :] * stride_kd,
-                    mask=n_mask[:, None], other=0.0)                       # [BLOCK_N, D]
+                    mask=n_mask[:, None], other=0.0)                       # [BLOCK_N, D], once
 
-        # scores[r, n] = q[r] . k[n]  -> [REP, BLOCK_N], one tile read for all REP heads
-        scores = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
-        scores = tl.where(n_mask[None, :], scores, float("-inf"))
+        s0 = tl.where(n_mask, tl.sum(q0[None, :] * k, axis=1) * scale, float("-inf"))
+        s1 = tl.where(n_mask, tl.sum(q1[None, :] * k, axis=1) * scale, float("-inf"))
+        mn0 = tl.maximum(m0, tl.max(s0, axis=0))
+        mn1 = tl.maximum(m1, tl.max(s1, axis=0))
+        a0 = tl.exp(m0 - mn0)
+        a1 = tl.exp(m1 - mn1)
+        p0 = tl.exp(s0 - mn0)
+        p1 = tl.exp(s1 - mn1)
 
-        m_ij = tl.max(scores, axis=1)                                     # [REP]
-        m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new[:, None])                               # [REP, BLOCK_N]
-
-        v_row = phys_block[:, None] * stride_vb + offset[:, None] * stride_vs + v_kv_off
+        v_row = phys_block[:, None] * stride_vb + offset[:, None] * stride_vs + pid_kv * stride_vh
         v = tl.load(vp_ptr + v_row + offs_d[None, :] * stride_vd,
-                    mask=n_mask[:, None], other=0.0)                       # [BLOCK_N, D]
+                    mask=n_mask[:, None], other=0.0)                       # [BLOCK_N, D], once
 
-        acc = acc * alpha[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        m_i = m_new
+        acc0 = acc0 * a0 + tl.sum(p0[:, None] * v, axis=0)
+        acc1 = acc1 * a1 + tl.sum(p1[:, None] * v, axis=0)
+        l0 = l0 * a0 + tl.sum(p0, axis=0)
+        l1 = l1 * a1 + tl.sum(p1, axis=0)
+        m0 = mn0
+        m1 = mn1
 
-    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-    acc = acc / l_safe[:, None]
-    o_ptrs = out_ptr + pid_s * stride_os + q_heads[:, None] * stride_oh + offs_d[None, :] * stride_od
-    tl.store(o_ptrs, acc.to(out_ptr.dtype.element_ty))
+    o_base = out_ptr + pid_s * stride_os + offs_d * stride_od
+    tl.store(o_base + h0 * stride_oh, (acc0 / tl.where(l0 > 0.0, l0, 1.0)).to(out_ptr.dtype.element_ty))
+    tl.store(o_base + (h0 + 1) * stride_oh, (acc1 / tl.where(l1 > 0.0, l1, 1.0)).to(out_ptr.dtype.element_ty))
 
 
 def paged_decode_gqa(
@@ -118,9 +127,8 @@ def paged_decode_gqa(
         raise ValueError("head_dim mismatch or above 128")
     if H % kv_heads:
         raise ValueError("num_q_heads must be a multiple of kv_heads")
-    rep = H // kv_heads
-    if rep & (rep - 1):
-        raise ValueError("GQA group size must be a power of two for the shared kernel")
+    if H // kv_heads != 2:
+        raise ValueError("the shared kernel is written for a GQA group of exactly 2 query heads")
     if block_n not in {16, 32, 64, 128}:
         raise ValueError("block_n must be one of 16, 32, 64, or 128")
     if num_warps not in {2, 4, 8}:
@@ -146,7 +154,7 @@ def paged_decode_gqa(
         block_tables.stride(0), block_tables.stride(1),
         seq_lens.stride(0),
         scale,
-        REP=rep, BLOCK_SIZE=block_size, HEAD_DIM=D, BLOCK_N=block_n,
+        BLOCK_SIZE=block_size, HEAD_DIM=D, BLOCK_N=block_n,
         LENGTH_OFFSET=length_offset, num_warps=num_warps,
     )
     return out

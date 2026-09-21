@@ -182,8 +182,8 @@ def test_t4_regime_selector_boundaries() -> None:
     assert select_paged_decode_config(127, 16) == (64, 4)
     assert select_paged_decode_config(128, 1) == (128, 4)
     assert select_paged_decode_config(2048, 16) == (128, 4)
-    assert select_paged_decode_config(64, 8, "gqa") == (32, 4)
-    assert select_paged_decode_config(2048, 16, "gqa") == (64, 4)
+    assert select_paged_decode_config(64, 8, "gqa") == (64, 4)
+    assert select_paged_decode_config(2048, 16, "gqa") == (128, 4)
     with pytest.raises(ValueError):
         select_paged_decode_config(0, 1)
 
@@ -280,11 +280,10 @@ def test_batched_equals_separate_launches():
 
 @cuda
 @requires_cuda
-@pytest.mark.parametrize("block_n", [16, 32, 64])
+@pytest.mark.parametrize("block_n", [32, 64, 128])
 @pytest.mark.parametrize("num_q_heads,kv_heads,D", [
-    (8, 8, 128),    # REP 1
     (16, 8, 128),   # GQA 2:1 (Qwen3-0.6B)
-    (8, 2, 64),     # GQA 4:1
+    (4, 2, 64),     # GQA 2:1, smaller dim
 ])
 def test_gqa_shared_decode_matches_per_head_kernel(block_n, num_q_heads, kv_heads, D):
     """One program per KV head, all of its query heads: bit-close to the per-head kernel

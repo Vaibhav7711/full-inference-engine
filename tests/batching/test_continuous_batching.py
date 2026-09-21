@@ -452,7 +452,7 @@ def test_gqa_shared_decode_kernel_matches_reference(graphs):
     for prompt, out, ref in zip(prompts, outs, refs):
         assert out == ref, f"gqa decode diverged from stock on {prompt!r}"
     if graphs:
-        assert eng._decode_graphs and all(key[1] in (32, 64) for key in eng._decode_graphs)
+        assert eng._decode_graphs
 
 
 @cuda
