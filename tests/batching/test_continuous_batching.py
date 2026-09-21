@@ -435,7 +435,9 @@ def test_fused_step_runs_decode_and_prefill_in_one_forward(graphs):
     for prompt, out, ref, sep in zip(prompts, actual, refs, expected):
         assert out == sep, f"fused diverged from the two-forward engine on {prompt!r}"
         assert out == ref, f"fused diverged from stock on {prompt!r}"
-    assert fused.block_manager.snapshot()["used_blocks"] == fused.prefix_cache.snapshot()["cached_blocks"]
+    # Graph dummy pages are permanently reserved and count as used.
+    assert (fused.block_manager.snapshot()["used_blocks"]
+            == fused.prefix_cache.snapshot()["cached_blocks"] + len(fused._graph_dummy_blocks))
 
 
 @cuda
@@ -507,7 +509,8 @@ def test_d4_chunked_prefill_matches_reference_and_releases_blocks(prefill_attent
     if graphs:
         assert eng._prefill_graphs, "chunked prefill never replayed a graph"
         assert not eng._prefill_graph_unsupported
-    assert eng.block_manager.snapshot()["used_blocks"] == eng.prefix_cache.snapshot()["cached_blocks"]
+    assert (eng.block_manager.snapshot()["used_blocks"]
+            == eng.prefix_cache.snapshot()["cached_blocks"] + len(eng._graph_dummy_blocks))
 
 
 @cuda
