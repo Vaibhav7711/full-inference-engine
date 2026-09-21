@@ -93,14 +93,19 @@ def sdpa_paged_prefill(
     mask = chunk_causal_mask(start_positions, chunk_lens, query_len, total_len)
     if scale is None:
         scale = head_dim ** -0.5
-    try:
-        return F.scaled_dot_product_attention(
-            query, keys, values, attn_mask=mask, scale=scale, enable_gqa=q_heads != kv_heads,
-        )
-    except TypeError:
-        # torch < 2.5 has no enable_gqa; expand KV heads explicitly.
-        repeat = q_heads // kv_heads
-        return F.scaled_dot_product_attention(
-            query, keys.repeat_interleave(repeat, dim=1),
-            values.repeat_interleave(repeat, dim=1), attn_mask=mask, scale=scale,
-        )
+    repeat = q_heads // kv_heads
+    if repeat == 1:
+        return F.scaled_dot_product_attention(query, keys, values, attn_mask=mask, scale=scale)
+    # GQA without `enable_gqa`: that flag is honoured only by the math backend on this
+    # torch/GPU (no flash on sm_75, and the memory-efficient kernel rejects it), which
+    # materialises fp32 score matrices and cost +37% prefill GPU time on the T4. Instead
+    # fold the `repeat` query heads that share a KV head into the query-length axis, so
+    # the kernel sees [B, kv_heads, repeat*Q, D] against [B, kv_heads, T, D] and the
+    # memory-efficient path applies. Query head h = kv * repeat + r, matching the Triton
+    # kernels' `h // repeat` mapping.
+    grouped = query.reshape(batch, kv_heads, repeat * query_len, head_dim)
+    grouped_mask = mask.expand(batch, repeat, query_len, total_len).reshape(
+        batch, 1, repeat * query_len, total_len,
+    )
+    out = F.scaled_dot_product_attention(grouped, keys, values, attn_mask=grouped_mask, scale=scale)
+    return out.reshape(batch, q_heads, query_len, head_dim)

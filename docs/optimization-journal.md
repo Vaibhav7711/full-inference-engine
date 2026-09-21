@@ -2485,3 +2485,46 @@ in order:
 
 Until then the default stays `per_token`, with `sdpa` the candidate to replace it on the T4
 pending the Phase 1b measurement.
+
+## Phase 1b on Kaggle T4: the corrected default, measured
+
+Kaggle T4, commit `e709d4e`, `chat` profile (mean prompt 656 tokens), concurrency 8,
+5 interleaved runs of 30 s per arm, warmed engines, graphs on. `results/t4/20260921_e709d4e/`.
+
+**Flipping chunked prefill from `tiled` to `per_token`** (compared with the previous day's
+tiled-default pass on the same workload): prefill step 98 → 47.9 ms, expected gap 63 → 38 ms,
+TTFT p50 2.83 s → 0.89 s, ITL p99 295 → 82 ms. The `tiled` arm in the same run: prefill step
++110.6%, prefill GPU +134.2%, ITL p99 +275.0%, all far outside spread. Decode unchanged
+(+0.7%, unresolved), as it must be.
+
+**`prefill_chunk` on the real kernel**: chunk 32 vs 128 gives prefill step −13.5%, expected gap
+unresolved (+4.7% in 13.3% spread), TTFT +343.6%. This is the original "cost is fixed per
+invocation" finding, now on the right kernel; yesterday's −62% was the tiled kernel's
+marginal cost. Chunk 128 stays.
+
+**`prefix_cache`**: everything unresolved except prefill step +6.8% (spread 3.9%) with the
+cache on. On a workload with three shared prefixes the publish/copy-on-write cost is
+visible and the hit benefit is not. Not enabled by default until a workload with real
+sharing shows it paying.
+
+**`sdpa` arm**: +30.0% prefill step, +36.7% prefill GPU versus `per_token`, and it diverged
+from stock earlier (tokens 10 and 18 on two prompts, `per_token` never). Cause found in the
+implementation, not the idea: `enable_gqa=True` is honoured only by torch's math backend
+on this GPU (no flash kernel on sm_75; the memory-efficient kernel rejects the flag), so
+the arm ran fp32 materialised attention. Fixed by folding the query heads that share a KV
+head into the query axis (`[B, kv_heads, repeat*Q, D]`), which the memory-efficient kernel
+accepts; a CUDA test now forces that backend so a regression to math raises. Re-measured
+as Phase 1c.
+
+**`kv_dtype`**: the gate refused the INT8 arm for diverging from stock at token 0 on one
+prompt. The identity prompts are submitted together, so that prompt fell into a mixed plan
+and took the chunked path, where a prompt's own K/V are quantized before its attention
+runs; a near-tie flipping there is quantization, which the INT8 kernels' own reference
+tests bound. The 8-token rule is right for fp16 kernel swaps and wrong for a dtype change.
+Re-run with drift allowed and the divergence recorded. Note from the first pass that INT8
+did not move decode time at 1.8k-token contexts (±5%, unresolved), so at present it is an
+accuracy cost without a speed win on this model.
+
+Stock-divergence line, for the record: `per_token` matches stock on three of four identity
+prompts and diverges at token 13 on the fourth, as do every fp16 arm and the fresh-prompt
+path - that one is the engine's fp16 decode numerics, not any prefill kernel.

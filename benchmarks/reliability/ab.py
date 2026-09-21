@@ -64,6 +64,11 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("sdpa", {"prefill_attention": "sdpa"}),
         ("tiled", {"prefill_attention": "tiled"}),
     ],
+    # The two-arm form, once `tiled` has been measured on a device.
+    "prefill_sdpa": [
+        ("per_token", {"prefill_attention": "per_token"}),
+        ("sdpa", {"prefill_attention": "sdpa"}),
+    ],
     # If a prefill step costs the same at 128 and 512 tokens, its cost is per-invocation
     # overhead rather than work, and no scheduling change can reduce it.
     "prefill_chunk_large": [
@@ -154,8 +159,8 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
 # changes output is a bug. Kernel-swapping arms are still gated below: each must agree
 # with stock Transformers for the first `--min-identical-tokens` of every prompt, which a
 # wrong kernel fails immediately and a rounding difference does not.
-TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "triton_rmsnorm", "triton_rope",
-                        "triton_swiglu", "mlp_gate_up"}
+TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rmsnorm",
+                        "triton_rope", "triton_swiglu", "mlp_gate_up"}
 
 
 def drift_expected(setting: str) -> bool:
