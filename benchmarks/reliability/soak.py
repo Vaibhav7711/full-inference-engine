@@ -473,7 +473,9 @@ class RepeatedResult:
         values = []
         for run in self.runs:
             source = getattr(run, head)
-            value = source[tail] if tail else source
+            # A phase an arm never records (e.g. `fused_gpu_ms` on the two-forward
+            # engine) is an empty series, not an error: summary() reports n=0.
+            value = source.get(tail) if tail else source
             if value is not None:
                 values.append(float(value))
         return values
