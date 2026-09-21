@@ -10,9 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
+from pathlib import Path
 
 import torch
+
+# Run as a script, sys.path[0] is scripts/, not the repo; make the repo importable
+# regardless of the caller's working directory (the notebook runner's cwd has varied).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def main() -> int:
