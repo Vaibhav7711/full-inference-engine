@@ -52,15 +52,22 @@ def capture_fused_step_graph(
     engine._set_attention(engine.FUSED_ATTN_NAME)
     _, _, block_tables, seq_lens = engine._prepare_decode_metadata([], graph_bucket_size=decode_rows)
     engine._prepare_prefill_metadata([], prefill_rows)
-    engine._set_fused_contexts(
-        decode_rows=decode_rows, block_tables=block_tables, seq_lens=seq_lens,
-        block_n=block_n, num_warps=num_warps, prefill_rows=prefill_rows,
-        total_len=context_len if context_len else 1, width=width,
-    )
+
+    def set_contexts():
+        engine._set_fused_contexts(
+            decode_rows=decode_rows, block_tables=block_tables, seq_lens=seq_lens,
+            block_n=block_n, num_warps=num_warps, prefill_rows=prefill_rows,
+            total_len=context_len if context_len else 1, width=width,
+        )
+
+    set_contexts()
     try:
         with torch.inference_mode():
             engine._fused_forward(decode_rows, prefill_rows, width)   # compile and allocate
         torch.cuda.synchronize()
+        # Fresh contexts for the capture: the eager run filled the prefill context's
+        # per-step SDPA cache with tensors outside the graph (see paged_prefill_graph).
+        set_contexts()
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
             next_tokens = engine._fused_forward(decode_rows, prefill_rows, width)

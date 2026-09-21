@@ -462,9 +462,15 @@ def test_fused_step_survives_preemption():
 
 @cuda
 @requires_cuda
+@pytest.mark.parametrize("graphs", [None, (2, 4)], ids=["eager", "graphed"])
 @pytest.mark.parametrize("prefill_attention", ["per_token", "sdpa"])
-def test_d4_chunked_prefill_matches_reference_and_releases_blocks(prefill_attention):
-    """A prompt spanning several resumable chunks remains token-identical."""
+def test_d4_chunked_prefill_matches_reference_and_releases_blocks(prefill_attention, graphs):
+    """A prompt spanning several resumable chunks remains token-identical.
+
+    The graphed case replays a captured chunk forward whose SDPA mask and page indices
+    must be recorded inside the graph: a capture that reused the eager warm-up run's
+    cached tensors replayed reads of freed memory (device-side assert on the T4).
+    """
     from engine.batching.continuous_batching import ContinuousBatchingEngine
 
     model, tok = _load()
@@ -477,10 +483,13 @@ def test_d4_chunked_prefill_matches_reference_and_releases_blocks(prefill_attent
     eng = ContinuousBatchingEngine(
         model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
         prefill_chunk_size=8, max_prefill_tokens_per_iteration=8,
-        prefill_attention=prefill_attention,
+        prefill_attention=prefill_attention, cuda_graph_batch_sizes=graphs,
     )
     actual = eng.generate([prompt], max_new_tokens=max_new)[0]
     assert actual == reference
+    if graphs:
+        assert eng._prefill_graphs, "chunked prefill never replayed a graph"
+        assert not eng._prefill_graph_unsupported
     assert eng.block_manager.snapshot()["used_blocks"] == eng.prefix_cache.snapshot()["cached_blocks"]
 
 

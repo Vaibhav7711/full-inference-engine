@@ -61,6 +61,10 @@ def capture_paged_prefill_graph(
         with torch.inference_mode():
             engine._prefill_forward(rows, width)   # compile and allocate outside capture
         torch.cuda.synchronize()
+        # A fresh context for the capture: the eager run above filled the context's
+        # per-step SDPA cache with mask and page-index tensors that live outside the
+        # graph and are freed after it. Recording reads of them would replay garbage.
+        engine._set_prefill_context(rows, total_len)
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
             next_tokens = engine._prefill_forward(rows, width)

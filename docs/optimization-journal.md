@@ -2684,3 +2684,15 @@ vs `fused_forward`), chat and long profiles, 5 x 30 s interleaved; notebook Phas
 Decision metric: `prefill_step_p50_ms` and `expected_gap_ms`; `fused_gpu_ms_p50` is the
 fused forward on its own. `check_hooks` fails if `fused_graphs` is zero after warmup.
 Result to be recorded here when the run is pasted.
+
+**First Kaggle run of Phase 2b failed before measuring anything**, with a device-side
+assert on the very first chunked prefill step - and not in the fused path. The per-step
+SDPA cache from `ec173b9` (mask and page indices built once per step, reused across
+layers) was never run under graphs on a GPU: the graphed SDPA measurement was taken at
+`9f1f828`, one commit earlier. Graph capture runs the forward once eagerly (compile,
+allocate) and then again under capture, both on the same `_PrefillContext`; the capture
+therefore found the cache already filled and recorded reads of the *eager* run's mask and
+index tensors, which are freed after capture. Replay gathered pages through garbage
+indices. Fix: the capture gets a fresh context after the eager run, in both the prefill
+and the fused capture. `test_d4` now runs its graphed variant so this is caught by the
+CUDA suite rather than by the benchmark.
