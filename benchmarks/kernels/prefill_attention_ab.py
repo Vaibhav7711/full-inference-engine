@@ -24,6 +24,7 @@ import torch
 
 from benchmarks.reliability.sweep import fit_line
 from engine.kernels.paged_prefill import paged_prefill
+from engine.kernels.sdpa_prefill import sdpa_paged_prefill
 from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
 
 HEAD_DIM = 128
@@ -250,8 +251,8 @@ def main() -> int:
     print("A dense SDPA reference is included as an upper bound: same maths on gathered\n"
           "contiguous tensors, using whatever attention kernel torch picks. If the tiled\n"
           "kernel is far off *that*, the problem is the kernel rather than the workload.\n")
-    header = (f"{'chunk':>6} {'old ms':>9} {'new ms':>9} {'sdpa ms':>9} {'speedup':>8} "
-              f"{'grid':>7} {'blk/SM':>7}")
+    header = (f"{'chunk':>6} {'old ms':>9} {'new ms':>9} {'sdpa ms':>9} {'eng_sdpa':>9} "
+              f"{'speedup':>8} {'grid':>7} {'blk/SM':>7}")
     print(header)
     print("-" * len(header))
     old_ms, new_ms = [], []
@@ -259,6 +260,10 @@ def main() -> int:
         tensors = _build(args.batch, args.q_heads, args.kv_heads, args.prefix, chunk)
         old = _time_ms(lambda t=tensors: paged_prefill(*t))
         sdpa = _time_ms(lambda t=tensors: _dense_sdpa(*t))
+        # The engine's own SDPA path: gather inside the timed region, GQA folded into the
+        # query axis, one mask for the batch. This is what `prefill_attention="sdpa"` runs.
+        total = args.prefix + chunk
+        engine_sdpa = _time_ms(lambda t=tensors: sdpa_paged_prefill(*t, total_len=total))
         new = _time_ms(lambda t=tensors: tiled_paged_prefill(
             *t, block_m=args.block_m, block_n=args.block_n, num_warps=args.num_warps))
         ideal = ideal_kv_bytes(args.batch, args.q_heads, args.prefix, chunk, args.block_m)
@@ -280,10 +285,11 @@ def main() -> int:
         import torch as _t
         sms = _t.cuda.get_device_properties(0).multi_processor_count
         blocks = args.batch * args.q_heads * -(-chunk // args.block_m)
-        print(f"{chunk:>6} {old:>9.3f} {new:>9.3f} {sdpa:>9.3f} {old / new:>7.1f}x "
+        print(f"{chunk:>6} {old:>9.3f} {new:>9.3f} {sdpa:>9.3f} {engine_sdpa:>9.3f} {old / new:>7.1f}x "
               f"{blocks:>7} {blocks / sms:>7.1f}{note}")
         payload["points"].append({
             "chunk": chunk, "old_ms": old, "new_ms": new, "sdpa_ms": sdpa,
+            "engine_sdpa_ms": engine_sdpa,
             "blocks": blocks, "blocks_per_sm": blocks / sms, "speedup": old / new,
             "ideal_kv_bytes": ideal, "effective_gbps": gbps, "diagnostics": diag,
         })
