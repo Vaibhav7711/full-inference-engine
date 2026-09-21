@@ -1,0 +1,44 @@
+{
+  "note": "Medians transcribed from Kaggle stdout; raw JSON/logs not recovered from the session. See README.md.",
+  "gpu": "Tesla T4 (Kaggle, 2x)",
+  "model": "Qwen/Qwen3-0.6B fp16",
+  "fused_step": {
+    "ae1eb71": {
+      "chat": {"separate_forwards": {"expected_gap_ms": 21.32, "itl_p50": 24.10, "itl_p99": 38.48, "prefill_step_p50_ms": 24.88, "ttft_p50": 406},
+               "fused_forward":     {"expected_gap_ms": 18.06, "itl_p50": 19.88, "itl_p99": 33.13, "prefill_step_p50_ms": 20.65, "fused_gpu_ms_p50": 20.15, "ttft_p50": 318}},
+      "long": {"separate_forwards": {"expected_gap_ms": 25.23, "itl_p50": 27.28, "itl_p99": 64.70, "prefill_step_p50_ms": 26.29, "ttft_p50": 3080},
+               "fused_forward":     {"expected_gap_ms": 21.89, "itl_p50": 22.55, "itl_p99": 126.85, "prefill_step_p50_ms": 23.05, "fused_gpu_ms_p50": 27.14, "ttft_p50": 2901}},
+      "first_divergence_vs_stock": {"separate_forwards": [null, null, null, null], "fused_forward": [null, 18, null, null]}
+    },
+    "2dcecfd": {
+      "chat": {"separate_forwards": {"itl_p50": 24.16, "itl_p99": 38.4, "itl_p999": 56.0, "lazy_graph_captures": 0},
+               "fused_forward":     {"itl_p50": 19.83, "itl_p99": 33.0, "itl_p999": 51.4, "lazy_graph_captures": 0}},
+      "long": {"separate_forwards": {"itl_p50": 27.19, "itl_p99": 64.5, "itl_p999": 114.2, "lazy_graph_captures_median": 2},
+               "fused_forward":     {"itl_p50": 22.64, "itl_p99": 44.6, "itl_p999": 150.9, "lazy_graph_captures_median": 6}}
+    },
+    "f87416f": {
+      "long": {"separate_forwards": {"itl_p50": 27.28, "itl_p99": 49.5, "itl_p999": 68.5, "lazy_graph_captures": 0},
+               "fused_forward":     {"itl_p50": 22.38, "itl_p99": 43.9, "itl_p999": 60.2, "lazy_graph_captures": 0},
+               "verdicts": {"prefill_step_p50_ms": "-13.9% (5.4%)", "prefill_penalty_p50_ms": "-27.7% (16.0%)", "decode_step_p50_ms": "+0.6% unresolved"}}
+    }
+  },
+  "decode_kernel_c7afabb_rank3": {
+    "chat": {"expected_gap_ms": "+40.8%", "itl_p50": "+35.2%", "decode_step_p50_ms": "+76.5%"},
+    "long": {"expected_gap_ms": "+66.6%", "itl_p50": "+63.6%", "decode_step_p50_ms": "+129.8%"}
+  },
+  "decode_sweep_9a9f86d_rank2_ratio_gqa_over_per_head": {
+    "128": {"1": 1.06, "4": 0.97, "8": 0.96, "16": 0.95},
+    "512": {"1": 1.12, "4": 1.01, "8": 0.89, "16": 0.98},
+    "1024": {"1": 1.13, "4": 0.99, "8": 1.00, "16": 0.98},
+    "2048": {"1": 1.01, "4": 0.97, "8": 0.99, "16": 0.98}
+  },
+  "per_head_decode_kernel_ms_best": {
+    "128": {"1": 0.0800, "4": 0.0855, "8": 0.0999, "16": 0.1373},
+    "512": {"1": 0.1137, "4": 0.1498, "8": 0.2214, "16": 0.2638},
+    "1024": {"1": 0.1341, "4": 0.1429, "8": 0.2066, "16": 0.3622},
+    "2048": {"1": 0.2295, "4": 0.2952, "8": 0.4225, "16": 0.7208}
+  },
+  "warmup_c7afabb_chat": {"itl_p99": "-71.4% (7.5%)", "itl_p999": "-63.1% (6.0%)", "itl_p50": "-0.2% unresolved", "lazy_graph_captures": "-100%"},
+  "prefill_graphs_9a9f86d_chat": {"expected_gap_ms": "-51.3% (11.6%)", "itl_p50": "-57.4% (7.9%)", "itl_p99": "-36.4% (9.6%)", "prefill_step_p50_ms": "-56.7% (8.0%)", "prefill_gpu_ms_p50": "-60.5% (6.9%)", "decode_step_p50_ms": "+8.6% (5.8%) operating-point shift"},
+  "token_margins_9a9f86d": {"0:4": 0.0078, "0:10": 0.0, "1:18": 0.0156, "3:13": 0.0156, "2:min": 0.1406}
+}
