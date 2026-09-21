@@ -66,6 +66,8 @@ def main() -> int:
     missing = {"host_stage_ms", "decode_gpu_ms", "sync_ms"} - set(timing)
     if missing:
         problems.append(f"step split missing phases: {sorted(missing)}")
+    if engine.lazy_graph_captures:
+        problems.append(f"{engine.lazy_graph_captures} graph capture(s) happened after warmup")
 
     record = {
         "warmup_s": warmup_s, "warmup": summary, "captured_graphs": captured,

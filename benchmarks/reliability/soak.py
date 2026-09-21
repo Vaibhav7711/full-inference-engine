@@ -399,6 +399,9 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
         "decode_only_steps": len(decode_ms),
         "prefill_steps": len(prefill_ms),
         "fused_steps": int(getattr(engine, "fused_steps", 0)),
+        # Graph captures that happened inside the timed window: each is a ~100-200 ms
+        # step, so any non-zero value here is where a p99/p999 regression comes from.
+        "lazy_graph_captures": int(getattr(engine, "lazy_graph_captures", 0)),
         "prefill_step_fraction": len(prefill_ms) / total_steps if total_steps else 0.0,
         "decode_step_p50_ms": _percentile(decode_ms, 0.50),
         "decode_step_p99_ms": _percentile(decode_ms, 0.99),
@@ -504,7 +507,8 @@ class RepeatedResult:
             "step_timing.expected_gap_ms", "step_timing.prefill_share_of_gap",
             "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
             "step_timing.prefill_gpu_ms_p50", "step_timing.fused_gpu_ms_p50",
-            "step_timing.sync_ms_p50",
+            "step_timing.sync_ms_p50", "step_timing.lazy_graph_captures",
+            "latency.itl_p999",
         ]
         return {
             "label": self.label, "runs": len(self.runs), "ok": self.ok,

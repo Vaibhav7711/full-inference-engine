@@ -459,7 +459,7 @@ def main() -> int:
                        "step_timing.prefill_step_fraction",
                        "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
                        "step_timing.prefill_gpu_ms_p50", "step_timing.fused_gpu_ms_p50",
-                       "step_timing.sync_ms_p50"):
+                       "step_timing.sync_ms_p50", "step_timing.lazy_graph_captures"):
             stats = repeated.summary(metric)
             if stats.get("n"):
                 print(f"  {metric:24s} median={stats['median']:.3f}  "
@@ -495,7 +495,7 @@ def main() -> int:
                 "step_timing.prefill_penalty_p50_ms", "waste_ratio",
                 "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
                 "step_timing.prefill_gpu_ms_p50", "step_timing.fused_gpu_ms_p50",
-                "step_timing.sync_ms_p50")
+                "step_timing.sync_ms_p50", "step_timing.lazy_graph_captures")
     baseline = arms[labels[0]]
     comparisons = {}
     for label in labels[1:]:

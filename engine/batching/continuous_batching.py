@@ -531,6 +531,10 @@ class ContinuousBatchingEngine:
         self._prefill_graphs = {}
         self._fused_graphs = {}
         self._prefill_graph_pool = None
+        # Graph captures taken while serving, i.e. shapes warmup did not cover. Each one
+        # is two eager forwards plus device syncs inside a live step (~100-200 ms on the
+        # T4), so a non-zero count after warmup is a tail-latency finding, not a detail.
+        self.lazy_graph_captures = 0
         # Attention kinds whose forward could not be captured on this build; they run
         # eagerly with the same staged buffers. Recorded once, with the reason.
         self._prefill_graph_unsupported: dict[str, str] = {}
@@ -783,6 +787,7 @@ class ContinuousBatchingEngine:
             "prefill_steps": self.prefill_steps,
             "decode_only_steps": self.decode_only_steps,
             "fused_steps": self.fused_steps,
+            "lazy_graph_captures": self.lazy_graph_captures,
             "prefill_sdpa_calls": self.prefill_sdpa_calls,
             "prefill_chunked_calls": self.prefill_chunked_calls,
             "prefill_sdpa_tokens": self.prefill_sdpa_tokens,
@@ -991,6 +996,7 @@ class ContinuousBatchingEngine:
             graph = self._prefill_graphs.get(key)
             if graph is None:
                 # Capture stages inert rows of its own; the real batch is staged after.
+                self.lazy_graph_captures += 1
                 graph = self._capture_prefill_graph(row_count, context_len)
             if graph is None:  # capture failed for this kind: fall back to eager
                 use_graph = False
@@ -1373,6 +1379,7 @@ class ContinuousBatchingEngine:
             key = (decode_bucket, prefill_bucket, self.prefill_attention, context_len, block_n, num_warps)
             graph = self._fused_graphs.get(key)
             if graph is None:
+                self.lazy_graph_captures += 1
                 graph = self._capture_fused_graph(key)
             use_graph = graph is not None
         if use_graph:
@@ -1471,6 +1478,7 @@ class ContinuousBatchingEngine:
             graph = self._decode_graphs.get(graph_key)
             if graph is None:
                 from engine.graphs import capture_paged_decode_graph
+                self.lazy_graph_captures += 1
                 graph = capture_paged_decode_graph(
                     self, batch_size=graph_bucket_size, block_n=decode_block_n,
                     num_warps=decode_num_warps,
@@ -1584,18 +1592,21 @@ class ContinuousBatchingEngine:
                     if key not in self._prefill_graphs:
                         if self._capture_prefill_graph(rows, context_len) is None:
                             break
-            # Fused step graphs for the common shapes: every decode bucket carrying one or
-            # two chunk rows, at the contexts a chat prompt reaches, in both decode kernel
-            # regimes. Rarer shapes are captured on first use.
+            # Fused step graphs for every shape the fused path can replay: each decode
+            # bucket x each chunk-row bucket up to the limit x the same context buckets
+            # as the prefill graphs x both decode kernel regimes. The first Kaggle run
+            # covered only {1, 2} rows and contexts up to 1024, and the long profile
+            # (2048-token contexts) then captured a dozen graphs inside the timed window:
+            # ITL p99 doubled (64.7 -> 126.9 ms) while p50 fell 17%. A capture is two
+            # eager forwards plus syncs in a live step; it belongs in warmup or nowhere.
             if self.fused_step:
-                fused_contexts = [0]
-                if self.prefill_attention == "sdpa":
-                    fused_contexts = [_prefill_context_bucket(length) for length in (256, 512, 1024)]
+                fused_rows = [
+                    rows for rows in (1,) + self.cuda_graph_batch_sizes
+                    if self._prefill_row_bucket(rows, self.FUSED_PREFILL_ROW_LIMIT) == rows
+                ]
                 for decode_rows in self.cuda_graph_batch_sizes:
-                    for prefill_rows in (1, 2):
-                        if self._prefill_row_bucket(prefill_rows, self.FUSED_PREFILL_ROW_LIMIT) != prefill_rows:
-                            continue
-                        for context_len in fused_contexts:
+                    for prefill_rows in fused_rows:
+                        for context_len in contexts:
                             for block_n, num_warps in ((64, 4), (128, 4)):
                                 key = (decode_rows, prefill_rows, self.prefill_attention,
                                        context_len, block_n, num_warps)
@@ -1613,6 +1624,7 @@ class ContinuousBatchingEngine:
         }
         self.reset()
         self.prefill_steps = self.decode_only_steps = self.fused_steps = 0
+        self.lazy_graph_captures = 0   # captures during warmup are the point of warmup
         self.last_step_prefill_tokens = self.last_step_decode_rows = 0
         self.prefill_sdpa_calls = self.prefill_chunked_calls = 0
         self.prefill_sdpa_tokens = self.prefill_chunked_tokens = 0

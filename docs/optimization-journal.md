@@ -2696,3 +2696,54 @@ index tensors, which are freed after capture. Replay gathered pages through garb
 indices. Fix: the capture gets a fresh context after the eager run, in both the prefill
 and the fused capture. `test_d4` now runs its graphed variant so this is caught by the
 CUDA suite rather than by the benchmark.
+
+## Phase 2b result: fused step −17% ITL p50 on both profiles; tail regression traced to in-window capture
+
+Kaggle T4, commit `ae1eb71`, `ab.py --setting fused_step --cuda-graphs`, 5 interleaved
+30 s runs per arm. `results/t4/20260921_ae1eb71/ab_fused_step_{chat,long}_30s.json`.
+
+| | separate_forwards | fused_forward | change (spread) |
+|---|---|---|---|
+| chat: expected gap | 21.3 ms | **18.1 ms** | −15% |
+| chat: ITL p50 / p99 | 24.1 / 38.5 ms | **19.9 / 33.1 ms** | −17.5% / −14% |
+| chat: prefill-carrying step p50 | 24.9 ms | **20.7 ms** | −17.0% (6.8%) |
+| chat: prefill penalty on decoders | | | −30.1% (9.9%) |
+| chat: decode-only step p50 | 10.2 ms | 10.3 ms | +1.2%, unresolved — as it must be |
+| chat: ITL p999 | | | **+149%** (spread 64%) |
+| long: expected gap | 25.2 ms | **21.9 ms** | −13% |
+| long: ITL p50 / p99 | 27.3 / 64.7 ms | **22.6 / 126.9 ms** | −17% / **+96%** |
+| long: prefill-carrying step p50 | 26.3 ms | **23.1 ms** | −12.3% (6.3%) |
+| long: prefill penalty on decoders | | | −27.3% (13.7%) |
+| TTFT p50, both profiles | 406 / 3080 ms | 318 / 2901 ms | unresolved (spreads ~100%) |
+| first divergence from stock, 4 prompts | none ×4 | none, 18, none, none | |
+
+Fused wins every one of the ten interleaved pairs on the gap. The shape is what the
+arithmetic said: prefill-carrying steps cheaper, decode-only steps untouched. Two
+comparisons in the printed table look bad and are accounting: `host_stage_ms` +66-92%
+because one phase now stages both buffers, and `sync_ms` +104-117% because the fused
+step's single sync waits for the whole forward whereas the separate arm's `sync_ms` only
+ever timed the decode wait (the prefill path recorded none). Both sit inside the step
+time that fell.
+
+**The tail regression is real and diagnosed.** Warmup pre-captured fused graphs for
+{1, 2} chunk rows at contexts up to 1024. Long-profile prompts (~1.8k tokens) live in the
+2048 bucket, so every (decode bucket x chunk rows x regime) key at 2048 was captured on
+first use, inside the timed window, on every fresh engine: two eager forwards over a
+2048-token gather plus syncs, ~150 ms each, about a dozen per run. At decode batch ~2
+that is ~25 affected token gaps in a run of ~2,700, which is exactly the p99 sample. Chat
+hits the same thing with rarer keys (3-4 chunk rows, the 64-wide kernel regime), so it
+shows only at p999. Fix: warmup captures every shape the fused path can replay (all
+decode buckets x chunk-row buckets up to the limit x the four context buckets x both
+regimes; 72 graphs at three buckets, ~10 s), and the engine counts
+`lazy_graph_captures` after warmup; soak/A/B report it and `check_hooks` fails on any.
+The p99/p999 columns are to be re-measured with that in place; p50 and the step costs
+do not depend on it.
+
+**Token identity.** The fused arm diverges from stock on one prompt at token 18 (the
+separate arm on none). That is the GEMM-shape drift predicted when this was built: the
+same kernels see `N + 128` rows instead of `N` and `128`, cuBLAS picks a different
+tiling, and an fp16 near-tie 18 tokens in flips. It passes the 8-token gate and is of
+the same class as `per_token`'s drift. Recorded, not chased.
+
+**Decision:** `fused_step=True` stays the default. Prefill-carrying steps are now 20.7 ms
+on chat against 98 ms at the start of the T4 work (tiled, eager, two forwards).

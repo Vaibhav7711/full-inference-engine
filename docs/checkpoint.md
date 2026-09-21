@@ -62,11 +62,14 @@ where they disagree; the Colab decode-graph result is reproduced.
 |---|---|---|
 | decode-only step p50 (graphs on) | 10.3 ms | 10.4 ms |
 | host staging per step | 0.26 ms | 0.27 ms |
-| prefill step p50, `sdpa` graphed (default) | **27.0 ms** | **30.3 ms** |
+| prefill step p50, `sdpa` graphed + fused with decode (default) | **20.7 ms** | **23.1 ms** |
+| prefill step p50, `sdpa` graphed, separate forwards | 24.9-27.0 ms | 26.3-30.3 ms |
 | prefill step p50, `per_token` graphed | 45.3 ms | 87.9 ms |
 | prefill step p50, `tiled` (previous default, Sep 20) | 98 ms | — |
-| TTFT p50, `sdpa` | 414 ms | 3.7 s |
-| ITL p99, `sdpa` | 41 ms | 76 ms |
+| ITL p50, fused vs separate | 19.9 vs 24.1 ms (−17.5%) | 22.6 vs 27.3 ms (−17%) |
+| TTFT p50, `sdpa` | 318-414 ms | 2.9-3.7 s |
+| ITL p99, `sdpa`, separate forwards | 38-41 ms | 65-76 ms |
+| ITL p99, fused (before warmup covered 2048 contexts) | 33 ms | 127 ms — in-window capture, see journal |
 | CUDA graphs, decode step | 34.2 → 9.7 ms (−72%) | |
 
 Decisions taken on these: `prefill_attention="sdpa"` default; `tiled` kept for sm_80+
@@ -74,10 +77,10 @@ only (no `mma.sync` on the T4, see journal); prefill chunk 128 (cost fixed per
 invocation on the real kernel); prefix cache and INT8 KV off by default (unresolved or
 negative on these workloads).
 
-Built after this table, not yet measured: `fused_step` (Phase 2b) runs a prefill-carrying
-step's decode rows and chunk rows as one packed forward; on by default, `fused_step=False`
-is the A/B arm. Expected to move the prefill step p50 from 27 ms toward the 17-20 ms
-region; the number goes here when the Kaggle run is in.
+`fused_step` (Phase 2b) is on by default: one packed forward for a step's decode rows and
+chunk rows. Measured −15%/−13% expected gap and −17% ITL p50 on chat/long; the p99/p999
+regression in that run was graph capture inside the timed window (warmup now covers all
+fused shapes; `lazy_graph_captures` must read 0) and is to be re-measured.
 
 ### Preemption (Gate 1B)
 

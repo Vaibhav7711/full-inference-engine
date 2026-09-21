@@ -91,7 +91,7 @@ Isolation tiers:
 | P5 | Chunked-prefill attention: per_token / sdpa / tiled | `sdpa_prefill.py`, `tiled_paged_prefill.py` | tiled **0.3x** and diagnosed: no `mma.sync` on sm_75, spills, 1 block/SM (journal "never used the tensor cores"); default now `per_token`; `sdpa` (gathered pages + torch SDPA) is the candidate | T | `ab.py --setting prefill_kernel --prompt-profile chat` (three arms); `prefill_attention_ab.py --ptx-only` on any new GPU before enabling `tiled` |
 | P6 | Prefix-cache eviction bookkeeping incremental | `5a9514c` | O(N) per evicted block → O(1); unmeasured | L | ladder `55ebb7a` → `5a9514c` (with D16) |
 | P7 | `warmup()` before serving | `5a9514c` | removes first-request capture/JIT from p999; unmeasured | T | soak with/without `warmup()`; compare p999 and first-request TTFT |
-| P8 | Fused decode + prefill forward per step (`fused_step`) | Phase 2b | one forward, one sync per prefill-carrying step; chunk-row graph buckets start at 1; unmeasured (expected prefill step 27 → ~17-20 ms) | T | `ab.py --setting fused_step --cuda-graphs` chat + long; `check_hooks` (`fused_graphs` > 0) |
+| P8 | Fused decode + prefill forward per step (`fused_step`) | Phase 2b | prefill step 24.9 → 20.7 ms chat (−17%), 26.3 → 23.1 long; ITL p50 −17% both; gap −15%/−13%; p99 pending re-measure after warmup coverage fix | T | `ab.py --setting fused_step --cuda-graphs` chat + long; `check_hooks` (`fused_graphs` > 0) |
 
 ### 3.3 Memory / capacity
 
