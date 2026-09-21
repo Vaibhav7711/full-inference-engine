@@ -2772,3 +2772,23 @@ fused captures, roughly 20 s more warmup, paid once.
 
 The result stands as measured for everything but long-profile p999, which is expected
 to follow p99 once the counter reads zero there.
+
+**Long profile, third run, warmup contexts sized to capacity** (`f87416f`; zero
+in-window captures in both arms, five runs each):
+
+| long | separate_forwards | fused_forward | change |
+|---|---|---|---|
+| ITL p50 / p99 / p999 | 27.3 / 49.5 / 68.5 ms | **22.4 / 43.9 / 60.2 ms** | −18% / −11% / −12% |
+| prefill-carrying step p50 | | | −13.9% (spread 5.4%) |
+| prefill penalty on decoders | | | −27.7% |
+| decode-only step | | | +0.6%, unresolved |
+
+The baseline's own p99 fell from 64.5 to 49.5 ms once its 4096-context captures left the
+window, so the −31% p99 in the previous run overstated the fused gain; −11% is the
+number. Every percentile moves the same way in both profiles and the counter reads zero,
+so Phase 2b is closed: **fused step, default on**. Prefill-carrying step p50 on chat:
+98 ms (Sep 20, tiled, eager, two forwards) → 27.0 (SDPA, graphed) → 20.5 ms (fused).
+
+Lesson recorded for the method: a tail percentile compared across arms is only a
+result when both arms report zero graph captures inside the window. `lazy_graph_captures`
+is now in every soak/A/B JSON and `check_hooks` fails on a non-zero count.
