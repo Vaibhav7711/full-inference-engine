@@ -2866,3 +2866,56 @@ and the gate's "early divergence = wrong kernel" rule cannot tell the two apart.
 position; if the margins at 4/13/18 are below fp16 resolution the gate is re-specified
 to skip tied positions, and `prefill_graphs` reruns with drift allowed. Not decided
 until measured.
+
+## Phase 2c closed: ties, not kernels; the shared-KV read is already served by L2; graphs on prefill −57%
+
+Kaggle T4, commit `9a9f86d`, `results/t4/20260921_9a9f86d/`.
+
+**The identity gate was refusing on coin flips.** `scripts/token_margins.py`, stock
+kernels, top-2 logit margin at the positions where three different chunked-prefill
+implementations had all diverged:
+
+| prompt | position | margin | fp16 ulp at that magnitude |
+|---|---|---|---|
+| 0 | 4 | 0.0078 | 0.0078 |
+| 1 | 18 | 0.0156 | 0.0156 |
+| 3 | 13 | 0.0156 | 0.0156 |
+
+One ulp each. The next-smallest margins on those prompts are 4-6x larger, and prompt 2,
+on which nothing ever diverged, has no margin below 0.14. So "diverges from stock within
+8 tokens" was, here, "reproduces a one-ulp tie" - which no implementation that is not
+bit-identical to stock's fp16 accumulation order can be asked to do. The gate now takes
+the stock margin at every position (`TIE_MARGIN = 0.02`) and does not count a first
+difference on a tied position as a divergence; ties are reported and saved separately
+(`ties_vs_stock`). The "early divergence = wrong kernel" rule stands for real margins.
+In hindsight the Phase 1b note that `per_token`'s divergence "moved from [none, none,
+none, 13] to [4, 18, none, 13]" was this: the positions are properties of the prompts.
+
+**GQA-shared decode kernel, rank-2 rewrite: 0.95-1.06x, noise.** Best-config ratio
+gqa/per_head across 16 operating points sits between 0.89 and 1.13 with no trend in
+batch or context. The kernel does half the K/V loads and runs in the same time, so the
+second read was already coming from L2 (4 MB on the T4; a layer's KV for the batch at
+the chat operating point is ~25 MB, but the two programs of a group run adjacently and
+the tile is reused within microseconds). Closed; `decode_attention` stays `"per_head"`
+and the variant is kept as the negative result it is.
+
+What the two sweeps establish about decode attention instead: at (batch 8, 1024) the
+per-head kernel moves 33 MB of unique KV per layer in 0.21 ms, ~160 GB/s - half of what
+this GPU delivers to a well-shaped kernel. It is not traffic-bound; it is
+parallelism-bound: 128 programs on 40 SMs, each walking its tiles serially, and at batch
+1 only 16 programs. The lever that fits that diagnosis is split-K - several programs per
+(row, head), each over a slice of the context, merged by a small second pass - not
+fewer reads. Candidate D19, not built.
+
+**`prefill_graphs` (Phase 2a, chat, drift allowed): graphed −56.7% prefill step (spread
+8%), −60.5% prefill GPU, −57.4% ITL p50, −51.3% expected gap, −36.4% ITL p99.** With
+`fused_step` on, the eager arm runs every prefill-carrying forward eagerly, so this is
+the whole launch-bound cost of the chunk forward, captured. The graphed arm's decode-only
+step is +8.6%: it completes more requests per second, so its decode batches are larger -
+an operating-point shift, visible in `mean_decode_batch`, not a cost of the graphs. Its
+`sync_ms` +1368% is accounting: the eager arm's wait is hidden inside its own launch
+loop. Phase 2a closed.
+
+**Gate failures in the CUDA suite** (`test_d4[*-graphed]`, `test_fused_step[graphed]`):
+one wrong assertion of mine - graph dummy pages are permanently reserved and count as
+used blocks - after every token assertion had passed. Fixed in `59dc024`.

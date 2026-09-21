@@ -267,8 +267,19 @@ def _clamp_graph_buckets(settings: dict, max_active: int) -> dict:
     return settings
 
 
-def _stock_reference(loaded, prompts: list[str], max_new_tokens: int) -> list[list[int]]:
-    """Greedy continuations from unpatched Transformers: SDPA, DynamicCache, stock RoPE.
+# A greedy step whose top two logits are within this margin is a tie at fp16 resolution
+# (one ulp at logit magnitude 16-32 is 0.0156). No implementation that is not bit-identical
+# to stock can be expected to reproduce it, so a divergence there says nothing about the
+# kernel. Measured on the T4: the three positions where three different prefill paths all
+# diverged had margins of 0.0078, 0.0156 and 0.0156 (scripts/token_margins.py).
+TIE_MARGIN = 0.02
+
+
+def _stock_reference(
+    loaded, prompts: list[str], max_new_tokens: int,
+) -> tuple[list[list[int]], list[list[float]]]:
+    """Greedy continuations from unpatched Transformers: SDPA, DynamicCache, stock RoPE,
+    with the top-2 logit margin at every generated position.
 
     Must run before any engine is built on this model object, since the engine installs
     Triton RMSNorm/SwiGLU on it in place; the RoPE install is process-global and is
@@ -282,29 +293,57 @@ def _stock_reference(loaded, prompts: list[str], max_new_tokens: int) -> list[li
     model.config._attn_implementation = "sdpa"
     if hasattr(model.config, "_attn_implementation_internal"):
         model.config._attn_implementation_internal = "sdpa"
-    outputs = []
+    outputs, margins = [], []
     with stock_rope(), torch.inference_mode():
         for prompt in prompts:
             ids = tokenizer(prompt, return_tensors="pt").input_ids.to(loaded.device)
             generated = model.generate(
                 ids, max_new_tokens=max_new_tokens, do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
+                pad_token_id=tokenizer.pad_token_id, output_scores=True,
+                return_dict_in_generate=True,
             )
-            outputs.append(generated[0, ids.shape[1]:].tolist())
-    return outputs
+            outputs.append(generated.sequences[0, ids.shape[1]:].tolist())
+            margins.append([
+                (lambda top: (top[0] - top[1]).item())(torch.topk(score[0].float(), 2).values)
+                for score in generated.scores
+            ])
+    return outputs, margins
 
 
-def _first_divergence(arm: list[list[int]], reference: list[list[int]]) -> list[int | None]:
-    """Per prompt, the index of the first token that differs from the reference, or None."""
+def _first_divergence(
+    arm: list[list[int]], reference: list[list[int]],
+    margins: list[list[float]] | None = None,
+) -> list[int | None]:
+    """Per prompt, the index of the first token that differs from the reference, or None.
+
+    A difference at a position whose stock margin is below `TIE_MARGIN` is a tie, not a
+    divergence: it is reported as None (the continuation after a tie is a different
+    greedy path and says nothing more). Returned indices are real disagreements.
+    """
     result = []
-    for produced, expected in zip(arm, reference):
+    for prompt_index, (produced, expected) in enumerate(zip(arm, reference)):
         index = next(
             (i for i, (a, b) in enumerate(zip(produced, expected)) if a != b), None,
         )
         if index is None and len(produced) != len(expected):
             index = min(len(produced), len(expected))
+        if (index is not None and margins is not None
+                and index < len(margins[prompt_index])
+                and margins[prompt_index][index] < TIE_MARGIN):
+            index = None
         result.append(index)
     return result
+
+
+def _ties(arm: list[list[int]], reference: list[list[int]], margins: list[list[float]]) -> list[str]:
+    """Positions where an arm first differs from stock on a tied logit, for the record."""
+    notes = []
+    for prompt_index, (produced, expected) in enumerate(zip(arm, reference)):
+        index = next((i for i, (a, b) in enumerate(zip(produced, expected)) if a != b), None)
+        if index is not None and index < len(margins[prompt_index]) \
+                and margins[prompt_index][index] < TIE_MARGIN:
+            notes.append(f"prompt {prompt_index} @ {index} (margin {margins[prompt_index][index]:.4f})")
+    return notes
 
 
 def _verdict(baseline: dict, variant: dict) -> str:  # noqa: D401
@@ -403,7 +442,7 @@ def main() -> int:
 
     # Stock greedy reference, computed before any engine patches the shared model. It
     # decides which arm is closer to the truth when the gate below finds a difference.
-    reference = _stock_reference(loaded, IDENTITY_PROMPTS, 48)
+    reference, margins = _stock_reference(loaded, IDENTITY_PROMPTS, 48)
 
     # Token-identity gate before anything is timed. Each arm generates the same fixed
     # prompts greedily on a warmed engine; the outputs must match unless the setting is
@@ -415,9 +454,11 @@ def main() -> int:
         identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
         del engine
     labels = list(makers)
-    divergence = {label: _first_divergence(identity[label], reference) for label in labels}
+    divergence = {label: _first_divergence(identity[label], reference, margins) for label in labels}
+    ties = {label: _ties(identity[label], reference, margins) for label in labels}
     for label in labels:
-        print(f"vs stock reference, first divergent token per prompt: {label}={divergence[label]}")
+        print(f"vs stock reference, first divergent token per prompt: {label}={divergence[label]}"
+              + (f"  (ties, not counted: {ties[label]})" if ties[label] else ""))
     early = {label: [i for i in divergence[label] if i is not None and i < args.min_identical_tokens]
              for label in labels}
     broken = [label for label in labels if early[label]]
@@ -525,7 +566,8 @@ def main() -> int:
         "git": git_record(),
         "clocks_before": clocks_before, "clocks_after": clocks_after,
         "token_identity": {"identical": not drift, "drifted_arms": drift,
-                           "first_divergence_vs_stock": divergence},
+                           "first_divergence_vs_stock": divergence,
+                           "ties_vs_stock": ties, "tie_margin": TIE_MARGIN},
         "order": "interleaved",
         "arms": {label: arm.to_dict() for label, arm in arms.items()},
         "comparison": comparison,

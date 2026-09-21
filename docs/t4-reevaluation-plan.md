@@ -77,7 +77,8 @@ Isolation tiers:
 | D13 | Fixed-width CUDA-graph bucket (16) | `2687241` | 37.2 → 9.7 ms/step (3.85x); 962 tok/s @16 | T | `cuda_graph_batch_sizes=None` vs `(16,)` |
 | D14 | Padded power-of-two graph buckets | `5086c14` | 3.4–4.1x at occupancies 1–16 | T | `cuda_graph_batch_sizes=(16,)` vs `(2,4,8,16)` |
 | D15 | Batched token transfer (`.tolist()`) | Phase 15 | host transfer 0.206 → 0.022 ms @16 (9.35x); e2e neutral | L | `token_transfer_ab.py` (isolated); ladder for e2e |
-| D18 | Decode attention, K/V tile shared across the GQA group (`decode_attention="gqa"`) | Phase 2c | rank-3 version **1.5-2.8x slower** (layout, not grid); rank-2 two-head unroll pending one sweep | T | `paged_decode_regime_sweep.py --kernel both`; `ab.py --setting decode_kernel --cuda-graphs` |
+| D18 | Decode attention, K/V tile shared across the GQA group (`decode_attention="gqa"`) | Phase 2c | rank-3 version **1.5-2.8x slower** (layout); rank-2 two-head unroll **0.95-1.06x, noise** - L2 already serves the second read. Closed, `per_head` stays | T | `paged_decode_regime_sweep.py --kernel both`; `ab.py --setting decode_kernel --cuda-graphs` |
+| D19 | Split-K paged decode (several programs per row/head over context slices, merged) | — | candidate: per-head kernel reaches ~160 GB/s at (8, 1024), parallelism-bound not traffic-bound | T | `paged_decode_regime_sweep.py`; `ab.py --setting decode_kernel` |
 | D16 | Decode metadata staging: slice copy per row | `5a9514c` | 3.4 → 0.18 ms/step host stage @16×64 blocks (off-GPU) | L | ladder `55ebb7a` → `5a9514c` (with D17, P6) |
 | D17 | Copy-on-write tail via one `_foreach_copy_` | `5a9514c` | 56 launches → 1 on first decode step after exact hit | L | ladder `55ebb7a` → `5a9514c` (with D16) |
 

@@ -72,6 +72,9 @@ where they disagree; the Colab decode-graph result is reproduced.
 | ITL p99 / p999, fused (0 in-window captures) | **33.0 / 51.4 ms** | **43.9 / 60.2 ms** |
 | ITL p99 / p999, separate forwards (0 in-window captures) | 38.4 / 56.0 ms | 49.5 / 68.5 ms |
 | CUDA graphs, decode step | 34.2 → 9.7 ms (−72%) | |
+| CUDA graphs, prefill-carrying step (fused, chat) | −56.7% step, −57.4% ITL p50 | |
+| warmup, cold → warmed (chat) | ITL p99 −71%, p999 −63%, p50 unchanged | |
+| decode attention, K/V shared across GQA group | 0.95-1.06x in isolation: L2 already dedups; `per_head` stays | |
 
 Decisions taken on these: `prefill_attention="sdpa"` default; `tiled` kept for sm_80+
 only (no `mma.sync` on the T4, see journal); prefill chunk 128 (cost fixed per
