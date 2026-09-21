@@ -55,6 +55,14 @@ from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
 #              compiles to FMA, spills, and runs one block per SM. Check with
 #              `benchmarks/kernels/prefill_attention_ab.py --ptx-only` before enabling.
 PREFILL_ATTENTION_KINDS = ("per_token", "sdpa", "tiled")
+
+
+def _prefill_context_bucket(total_len: int, floor: int = 256) -> int:
+    """Gathered-prefix length a captured SDPA prefill graph is shaped for."""
+    bucket = floor
+    while bucket < total_len:
+        bucket *= 2
+    return bucket
 from engine.runtime import GenerationRequest, RequestState
 from engine.scheduler import FCFSScheduler
 
@@ -246,6 +254,7 @@ class ContinuousBatchingEngine:
                  kv_cache_dtype: str = "fp16",
                  cuda_graph_batch_size: int | None = None,
                  cuda_graph_batch_sizes: tuple[int, ...] | None = None,
+                 prefill_cuda_graphs: bool = True,
                  fuse_mlp_gate_up: bool = False,
                  triton_rmsnorm: bool = True,
                  triton_rope: bool = True,
@@ -285,6 +294,10 @@ class ContinuousBatchingEngine:
         self.prefix_cache_blocks = prefix_cache_blocks
         self.kv_cache_dtype = kv_cache_dtype
         self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or ()
+        # Chunked prefill forwards are captured per (row bucket, kind, context bucket)
+        # when graph buckets are configured. Off keeps decode graphs and runs prefill
+        # eagerly on the same staged buffers, which is the A/B for the capture itself.
+        self.prefill_cuda_graphs = prefill_cuda_graphs
         self.fuse_mlp_gate_up = fuse_mlp_gate_up
         self.triton_rmsnorm = triton_rmsnorm
         self.triton_rope = triton_rope
@@ -391,6 +404,30 @@ class ContinuousBatchingEngine:
         self._device_block_tables = torch.empty(
             (max_active, num_blocks), dtype=torch.int32, device=device
         )
+        # Chunked prefill has the same shape discipline as decode: every chunk batch is
+        # staged into persistent buffers of fixed address, [max_active, chunk] wide, so a
+        # captured forward can be replayed against them. Rows past the batch and columns
+        # past a chunk are inert (chunk length 0 / pad token) and touch no KV.
+        chunk = prefill_chunk_size
+        self._prefill_host_input_ids = torch.empty((max_active, chunk), dtype=torch.long, pin_memory=True)
+        self._prefill_host_position_ids = torch.empty((max_active, chunk), dtype=torch.long, pin_memory=True)
+        self._prefill_host_starts = torch.empty((max_active,), dtype=torch.int32, pin_memory=True)
+        self._prefill_host_chunk_lens = torch.empty((max_active,), dtype=torch.int32, pin_memory=True)
+        self._prefill_host_block_tables = torch.empty(
+            (max_active, num_blocks), dtype=torch.int32, pin_memory=True
+        )
+        self._prefill_device_input_ids = torch.empty((max_active, chunk), dtype=torch.long, device=device)
+        self._prefill_device_position_ids = torch.empty((max_active, chunk), dtype=torch.long, device=device)
+        self._prefill_device_starts = torch.empty((max_active,), dtype=torch.int32, device=device)
+        self._prefill_device_chunk_lens = torch.empty((max_active,), dtype=torch.int32, device=device)
+        self._prefill_device_block_tables = torch.empty(
+            (max_active, num_blocks), dtype=torch.int32, device=device
+        )
+        self._prefill_graphs = {}
+        self._prefill_graph_pool = None
+        # Attention kinds whose forward could not be captured on this build; they run
+        # eagerly with the same staged buffers. Recorded once, with the reason.
+        self._prefill_graph_unsupported: dict[str, str] = {}
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
@@ -765,13 +802,17 @@ class ContinuousBatchingEngine:
             self.key_scale_pool, self.value_scale_pool,
         )
         timer = self._gpu_timer()
-        out = self.model(
+        hidden = self._decoder()(
             input_ids=ids, attention_mask=attention_mask,
             past_key_values=cache, use_cache=True, return_dict=True,
-        )
+        ).last_hidden_state
+        # Only each row's last prompt token produces a generated token. Projecting the
+        # whole padded chunk onto the vocabulary is ~20% of a prefill step's FLOPs for
+        # 1/padded_length of the output, so the projection is applied to the gathered
+        # last hidden states alone.
         rows = torch.arange(len(requests), device=self.device)
         last_positions = seq_lens.to(dtype=torch.long) - 1
-        next_tokens = out.logits[rows, last_positions].argmax(dim=-1).tolist()
+        next_tokens = self._lm_head()(hidden[rows, last_positions]).argmax(dim=-1).tolist()
         self._gpu_elapsed(timer, "prefill_gpu_ms")
 
         for request, token in zip(requests, next_tokens):
@@ -831,69 +872,181 @@ class ContinuousBatchingEngine:
         if hasattr(self.model.config, "_attn_implementation_internal"):
             self.model.config._attn_implementation_internal = self.PREFILL_ATTN_NAME
 
-        starts_list = [request.prefilled_token_count for request, _ in plans]
-        counts_list = [count for _, count in plans]
-        padded_length = max(counts_list)
-        max_blocks = max(len(request.block_table) for request, _ in plans)
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = next(iter(self.eos_ids), 0)
-        padded_ids = []
-        position_rows = []
-        padded_tables = []
-        for (request, count), start in zip(plans, starts_list):
-            chunk = request.prefill_token_ids[start:start + count]
-            padded_ids.append(chunk + [pad_token_id] * (padded_length - count))
-            # Padded positions are not semantically observed, but valid absolute
-            # positions are essential so RoPE agrees with future decode steps.
-            positions = list(range(start, start + count))
-            positions.extend([start] * (padded_length - count))
-            position_rows.append(positions)
-            padded_tables.append(
-                request.block_table + [-1] * (max_blocks - len(request.block_table))
-            )
-
-        ids = torch.tensor(padded_ids, dtype=torch.long, device=self.device)
-        position_ids = torch.tensor(position_rows, dtype=torch.long, device=self.device)
-        block_tables = torch.tensor(padded_tables, dtype=torch.int32, device=self.device)
-        starts = torch.tensor(starts_list, dtype=torch.int32, device=self.device)
-        chunk_lens = torch.tensor(counts_list, dtype=torch.int32, device=self.device)
-        _set_prefill_ctx(_PrefillContext(
-            self.key_pool, self.value_pool, block_tables, starts, chunk_lens,
-            self.key_scale_pool, self.value_scale_pool,
-            attention=self.prefill_attention,
-            total_len=max(start + count for start, count in zip(starts_list, counts_list)),
-            prefill_block_m=self.prefill_block_m,
-            prefill_block_n=self.prefill_block_n,
-        ))
+        count = len(plans)
+        row_bucket = next(
+            (size for size in self.cuda_graph_batch_sizes if count <= size <= self.max_active),
+            None,
+        )
+        use_graph = (
+            self.prefill_cuda_graphs and row_bucket is not None
+            and self.prefill_attention not in self._prefill_graph_unsupported
+        )
+        row_count = row_bucket if use_graph else count
+        total_len = max(request.prefilled_token_count + n for request, n in plans)
+        # Graphs are shape-fixed: the chunk width is the full chunk and, for the SDPA
+        # path, the gathered prefix length is rounded up to a bucket. Eager runs use the
+        # exact sizes.
+        if use_graph:
+            width = self.prefill_chunk_size
+            context_len = _prefill_context_bucket(total_len) if self.prefill_attention == "sdpa" else 0
+            key = (row_count, self.prefill_attention, context_len)
+            graph = self._prefill_graphs.get(key)
+            if graph is None:
+                # Capture stages inert rows of its own; the real batch is staged after.
+                graph = self._capture_prefill_graph(row_count, context_len)
+            if graph is None:  # capture failed for this kind: fall back to eager
+                use_graph = False
+                row_count = count
+        if not use_graph:
+            width = max(n for _, n in plans)
+            context_len = total_len
+        self._prepare_prefill_metadata(plans, row_count)
+        self._set_prefill_context(row_count, context_len if context_len else total_len)
         timer = self._gpu_timer()
         try:
-            out = self.model(
-                input_ids=ids, position_ids=position_ids,
-                use_cache=False, return_dict=True,
-            )
+            if use_graph:
+                next_tokens = graph.replay()
+            else:
+                next_tokens = self._prefill_forward(row_count, width)
+            # One device-to-host transfer for the batch.
+            tokens = next_tokens[:count].tolist()
         finally:
             _clear_prefill_ctx()
 
-        completed_rows: list[tuple[int, GenerationRequest]] = []
-        for row, (request, count) in enumerate(plans):
-            if not self.block_manager.append_tokens(request.request_id, count):
+        for row, (request, n) in enumerate(plans):
+            if not self.block_manager.append_tokens(request.request_id, n):
                 raise RuntimeError("prefill capacity was acquired but could not be committed")
-            request.advance_prefill(count)
+            request.advance_prefill(n)
             if request.remaining_prefill_tokens == 0:
-                completed_rows.append((row, request))
-
-        # Only the final prompt token produces the first generated token. Keeping this
-        # device-side until one list transfer avoids a scalar synchronization per row.
-        if completed_rows:
-            rows = torch.tensor([row for row, _ in completed_rows], device=self.device)
-            positions = torch.tensor(
-                [counts_list[row] - 1 for row, _ in completed_rows], device=self.device
-            )
-            tokens = out.logits[rows, positions].argmax(dim=-1).tolist()
-            for (_, request), token in zip(completed_rows, tokens):
-                self._complete_prefill(request, int(token))
+                self._complete_prefill(request, int(tokens[row]))
         self._gpu_elapsed(timer, "prefill_gpu_ms")
+
+    def _decoder(self):
+        """The transformer body without the vocabulary projection."""
+        decoder = getattr(self.model, "model", None)
+        if decoder is None and hasattr(self.model, "get_decoder"):
+            decoder = self.model.get_decoder()
+        if decoder is None:
+            raise RuntimeError("model does not expose its decoder body")
+        return decoder
+
+    def _lm_head(self):
+        head = getattr(self.model, "lm_head", None)
+        if head is None and hasattr(self.model, "get_output_embeddings"):
+            head = self.model.get_output_embeddings()
+        if head is None:
+            raise RuntimeError("model does not expose its output projection")
+        return head
+
+    def _prepare_prefill_metadata(
+        self, plans: list[tuple[GenerationRequest, int]], row_count: int,
+    ) -> None:
+        """Stage one chunk batch into the persistent prefill buffers.
+
+        Rows `len(plans)..row_count` and every column past a row's chunk are inert:
+        pad token, chunk length 0, position 0, block table -1. The write kernels store
+        nothing for them and the attention kernels visit no keys, so a captured graph
+        can be replayed on a smaller batch, and capture itself can run on no batch at all.
+        """
+        chunk = self.prefill_chunk_size
+        if row_count > self.max_active or len(plans) > row_count:
+            raise ValueError("invalid prefill row count")
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = next(iter(self.eos_ids), 0)
+        ids_rows, position_rows, starts, counts = [], [], [], []
+        for request, n in plans:
+            if n > chunk:
+                raise ValueError("prefill chunk exceeds the engine's chunk size")
+            start = request.prefilled_token_count
+            tokens = request.prefill_token_ids[start:start + n]
+            ids_rows.append(tokens + [pad_token_id] * (chunk - n))
+            # Padded positions are never observed, but valid absolute positions keep RoPE
+            # consistent with later decode steps; inert rows sit at position 0.
+            position_rows.append(list(range(start, start + n)) + [start] * (chunk - n))
+            starts.append(start)
+            counts.append(n)
+        for _ in range(row_count - len(plans)):
+            ids_rows.append([pad_token_id] * chunk)
+            position_rows.append([0] * chunk)
+            starts.append(0)
+            counts.append(0)
+        self._prefill_host_input_ids[:row_count] = torch.tensor(ids_rows, dtype=torch.long)
+        self._prefill_host_position_ids[:row_count] = torch.tensor(position_rows, dtype=torch.long)
+        self._prefill_host_starts[:row_count] = torch.tensor(starts, dtype=torch.int32)
+        self._prefill_host_chunk_lens[:row_count] = torch.tensor(counts, dtype=torch.int32)
+        tables = self._prefill_host_block_tables
+        for row in range(row_count):
+            if row < len(plans):
+                table = plans[row][0].block_table
+                tables[row, :len(table)] = torch.tensor(table, dtype=torch.int32)
+                tables[row, len(table):] = -1
+            else:
+                tables[row].fill_(-1)
+        self._prefill_device_input_ids[:row_count].copy_(
+            self._prefill_host_input_ids[:row_count], non_blocking=True)
+        self._prefill_device_position_ids[:row_count].copy_(
+            self._prefill_host_position_ids[:row_count], non_blocking=True)
+        self._prefill_device_starts[:row_count].copy_(
+            self._prefill_host_starts[:row_count], non_blocking=True)
+        self._prefill_device_chunk_lens[:row_count].copy_(
+            self._prefill_host_chunk_lens[:row_count], non_blocking=True)
+        self._prefill_device_block_tables[:row_count].copy_(
+            self._prefill_host_block_tables[:row_count], non_blocking=True)
+
+    def _set_prefill_context(self, row_count: int, total_len: int) -> None:
+        _set_prefill_ctx(_PrefillContext(
+            self.key_pool, self.value_pool,
+            self._prefill_device_block_tables[:row_count],
+            self._prefill_device_starts[:row_count],
+            self._prefill_device_chunk_lens[:row_count],
+            self.key_scale_pool, self.value_scale_pool,
+            attention=self.prefill_attention,
+            total_len=total_len,
+            prefill_block_m=self.prefill_block_m,
+            prefill_block_n=self.prefill_block_n,
+        ))
+
+    def _prefill_forward(self, row_count: int, width: int) -> torch.Tensor:
+        """One chunked prefill forward over the staged buffers -> next token per row.
+
+        The vocabulary projection runs on each row's last chunk token only; a row that
+        does not finish its prompt this step simply discards the result.
+        """
+        input_ids = self._prefill_device_input_ids[:row_count, :width]
+        position_ids = self._prefill_device_position_ids[:row_count, :width]
+        if width != self.prefill_chunk_size:
+            input_ids = input_ids.contiguous()
+            position_ids = position_ids.contiguous()
+        chunk_lens = self._prefill_device_chunk_lens[:row_count]
+        hidden = self._decoder()(
+            input_ids=input_ids, position_ids=position_ids, use_cache=False, return_dict=True,
+        ).last_hidden_state
+        last = (chunk_lens.to(torch.long) - 1).clamp_(min=0)
+        rows = torch.arange(row_count, device=hidden.device)
+        return self._lm_head()(hidden[rows, last]).argmax(dim=-1)
+
+    def _capture_prefill_graph(self, row_count: int, context_len: int):
+        """Capture one prefill graph, or record that this attention kind cannot be captured."""
+        from engine.graphs.paged_prefill_graph import capture_paged_prefill_graph
+
+        if self.prefill_attention in self._prefill_graph_unsupported:
+            return None
+        if self._prefill_graph_pool is None:
+            self._prefill_graph_pool = torch.cuda.graph_pool_handle()
+        try:
+            graph = capture_paged_prefill_graph(
+                self, rows=row_count, context_len=context_len, pool=self._prefill_graph_pool,
+            )
+        except RuntimeError as error:
+            # A kernel that is not capture-safe surfaces here (typically a synchronizing
+            # op inside the forward). Serving continues eagerly; the reason is kept so a
+            # benchmark can report it instead of silently measuring the eager path.
+            self._prefill_graph_unsupported[self.prefill_attention] = str(error).splitlines()[0][:200]
+            torch.cuda.synchronize()
+            return None
+        self._prefill_graphs[(row_count, self.prefill_attention, context_len)] = graph
+        return graph
 
     def _plan_prefill_chunks(self) -> list[tuple[GenerationRequest, int]]:
         return self.scheduler.plan_prefill(
@@ -1112,9 +1265,24 @@ class ContinuousBatchingEngine:
                     rounds += 1
         finally:
             self.eos_ids = eos_ids
+        # Prefill graphs are captured on inert rows, so every bucket can be taken directly
+        # rather than hoping the rounds above produced a chunk batch of each width.
+        if (self.prefill_cuda_graphs and self.cuda_graph_batch_sizes
+                and torch.device(self.device).type == "cuda"):
+            contexts = [0]
+            if self.prefill_attention == "sdpa":
+                contexts = [_prefill_context_bucket(length) for length in (256, 512, 1024, 2048)]
+            for rows in self.cuda_graph_batch_sizes:
+                for context_len in contexts:
+                    key = (rows, self.prefill_attention, context_len)
+                    if key not in self._prefill_graphs:
+                        if self._capture_prefill_graph(rows, context_len) is None:
+                            break
         summary = {
             "rounds": rounds,
             "graphs": len(self._decode_graphs),
+            "prefill_graphs": len(self._prefill_graphs),
+            "prefill_graph_unsupported": dict(self._prefill_graph_unsupported),
             "prefill_sdpa_calls": self.prefill_sdpa_calls,
             "prefill_chunked_calls": self.prefill_chunked_calls,
         }

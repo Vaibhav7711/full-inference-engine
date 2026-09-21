@@ -45,6 +45,10 @@ def main() -> int:
         problems.append(f"expected {expected} graphs (every bucket x block_n), got {summary['graphs']}")
     if not summary["prefill_sdpa_calls"] or not summary["prefill_chunked_calls"]:
         problems.append(f"both prefill paths must run during warmup: {summary}")
+    if summary.get("prefill_graph_unsupported"):
+        problems.append(f"prefill graph capture failed: {summary['prefill_graph_unsupported']}")
+    elif summary.get("prefill_graphs", 0) < len(args.buckets):
+        problems.append(f"expected a prefill graph per bucket, got {summary.get('prefill_graphs')}")
 
     engine.instrument = True
     prompts = ["Explain KV caching in one sentence."] * args.max_active

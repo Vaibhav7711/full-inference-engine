@@ -5,3 +5,4 @@ __all__ = [
     "GraphEligibility", "assess_graph_eligibility", "capture_decode_graph",
     "PagedDecodeGraph", "capture_paged_decode_graph",
 ]
+from .paged_prefill_graph import PagedPrefillGraph, capture_paged_prefill_graph

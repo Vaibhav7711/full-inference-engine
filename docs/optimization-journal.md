@@ -2528,3 +2528,31 @@ accuracy cost without a speed win on this model.
 Stock-divergence line, for the record: `per_token` matches stock on three of four identity
 prompts and diverges at token 13 on the fourth, as do every fp16 arm and the fresh-prompt
 path - that one is the engine's fp16 decode numerics, not any prefill kernel.
+
+## Phase 2a — CUDA graphs for chunked prefill (built, unmeasured)
+
+The decode step lost 72% of its time to graph capture. The chunked prefill forward is the
+same un-graphed Hugging Face forward, launch-bound in the same way (Phase B fit: ~21 ms
+fixed per invocation), and had no graph. It now has one:
+
+- Chunk batches are staged into persistent pinned/device buffers `[max_active, chunk]`
+  (`_prepare_prefill_metadata`), as decode batches are. Rows past the batch and columns
+  past a chunk are inert - chunk length 0, block table -1 - so the write kernels store
+  nothing and the attention kernels visit no keys for them.
+- One graph per `(row bucket, attention kind, context bucket)`; the row buckets are the
+  decode buckets, the context bucket is a power of two of the gathered prefix length and
+  applies to the SDPA kind only. All graphs share one memory pool. Captured on inert rows at
+  warm-up and lazily otherwise, so capture never touches a request's KV.
+- The vocabulary projection now runs on each row's last chunk token only, in both the
+  fresh-prompt path and the chunked path. Projecting the whole padded chunk was ~20% of a
+  prefill step's FLOPs for 1/128 of the output.
+- A kind whose forward refuses capture falls back to eager on the same buffers, and the
+  reason is reported (`warmup()` summary, `scripts/check_hooks.py`), so a benchmark cannot
+  silently measure the eager path as the graphed one.
+- `prefill_cuda_graphs=False` keeps decode graphs and disables prefill capture: the A/B
+  arm (`ab.py --setting prefill_graphs`), token-identical by construction.
+
+Expected: prefill step 48 → ~25-30 ms on the chat profile if the fixed cost behaves as it
+did for decode. Cost: a chunk shorter than the chunk size runs the full width under a
+graph (a 2-token tail pays a 128-token forward); under the fixed-cost regime that is the
+same time, and the planner change that avoids sliver chunks is still the right fix for it.

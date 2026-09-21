@@ -64,6 +64,12 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("sdpa", {"prefill_attention": "sdpa"}),
         ("tiled", {"prefill_attention": "tiled"}),
     ],
+    # Capturing the chunked prefill forward, on otherwise identical kernels. Decode
+    # graphs are on in both arms; only the prefill capture differs, so tokens must match.
+    "prefill_graphs": [
+        ("prefill_eager", {"prefill_cuda_graphs": False}),
+        ("prefill_graphed", {"prefill_cuda_graphs": True}),
+    ],
     # The two-arm form, once `tiled` has been measured on a device.
     "prefill_sdpa": [
         ("per_token", {"prefill_attention": "per_token"}),
@@ -125,11 +131,13 @@ FULL: dict = {
     "cuda_graph_batch_sizes": _padded_buckets,
     "prefix_cache_blocks": 64,
     "prefill_attention": "per_token",
+    "prefill_cuda_graphs": True,
     "triton_rmsnorm": True, "triton_rope": True, "triton_swiglu": True,
 }
 LEAVE_ONE_OUT: dict[str, dict] = {
     "graphs": {"cuda_graph_batch_sizes": None},
     "prefix_cache": {"prefix_cache_blocks": 0},
+    "prefill_graphs": {"prefill_cuda_graphs": False},
     "rmsnorm": {"triton_rmsnorm": False},
     "rope": {"triton_rope": False},
     "swiglu": {"triton_swiglu": False},
