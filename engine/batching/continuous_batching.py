@@ -104,6 +104,15 @@ class _PrefillContext:
     total_len: int = 0
     prefill_block_m: int | None = None
     prefill_block_n: int | None = None
+    # SDPA path: the causal mask and the page-index vector depend only on the batch's
+    # metadata, not the layer. Built on the first layer and reused by the other 27; each
+    # rebuild was ~15 small launches, which in a launch-bound forward cost more than the
+    # attention kernel saved.
+    sdpa_cache: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.sdpa_cache is None:
+            self.sdpa_cache = {}
 
     @property
     def tiled_prefill(self) -> bool:
@@ -199,7 +208,7 @@ def chunked_prefill_attention_forward(
             out = sdpa_paged_prefill(
                 query, key_pool, value_pool, ctx.block_tables,
                 ctx.start_positions, ctx.chunk_lens, scale=scaling,
-                total_len=ctx.total_len,
+                total_len=ctx.total_len, cache=ctx.sdpa_cache,
             )
         elif ctx.attention == "tiled":
             out = tiled_paged_prefill(

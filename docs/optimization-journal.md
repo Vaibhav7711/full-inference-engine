@@ -2556,3 +2556,30 @@ Expected: prefill step 48 → ~25-30 ms on the chat profile if the fixed cost be
 did for decode. Cost: a chunk shorter than the chunk size runs the full width under a
 graph (a 2-token tail pays a 128-token forward); under the fixed-cost regime that is the
 same time, and the planner change that avoids sliver chunks is still the right fix for it.
+
+### Kernel-level truth vs engine-level result: both alternatives are fast in isolation
+
+`prefill_attention_ab.py --chunks 64 128 256` on the T4, prefix 896, batch 4, one layer,
+ms per call:
+
+| chunk | per_token | tiled (8 warps) | dense SDPA bound | engine `sdpa_paged_prefill` |
+|---|---|---|---|---|
+| 64 | 8.85 | 4.27 | 1.07 | **0.89** |
+| 128 | 11.93 | 6.14 | 1.39 | **1.15** |
+| 256 | 26.50 | 11.78 | 2.06 | **1.75** |
+
+The engine's SDPA path is 10x faster than the per-token kernel here and beats the dense
+bound; the tiled kernel is 2x faster than per-token. The engine A/Bs said +18% and +110%
+slower respectively. Two causes, one per kernel, both in the engine rather than the kernels:
+
+- **Tiled ran at 4 warps in the engine, 8 in the benchmark.** `prefill_tile_defaults`
+  chose 4 at `BLOCK_M=32`; at 255 registers that doubles per-thread demand and the spills
+  with it. Default is now 8 warps at every tile, from the measured column.
+- **SDPA rebuilt its mask and page indices every layer**: ~15 small launches x 28 layers
+  in a forward that is launch-bound, which is exactly the fixed-cost regime the Phase B fit
+  describes. Roughly the +8 ms the A/B saw. They now build once per step on the first layer
+  and are reused (`_PrefillContext.sdpa_cache`), and the graphed prefill (Phase 2a) makes
+  the remaining launches free.
+
+INT8 KV on the long profile with drift allowed: every metric unresolved (decode -9% inside
+23% spread). No speed win at 1.8k context on this model; stays off.

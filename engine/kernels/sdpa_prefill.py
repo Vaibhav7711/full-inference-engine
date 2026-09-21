@@ -45,20 +45,28 @@ def chunk_causal_mask(
     return visible[:, None, :, :]
 
 
-def gather_pages(
-    pool: torch.Tensor, block_tables: torch.Tensor, total_len: int,
-) -> torch.Tensor:
-    """Dense `[B, H, total_len, D]` view of each row's first `total_len` logical tokens.
+def page_indices(block_tables: torch.Tensor, block_size: int, total_len: int) -> torch.Tensor:
+    """Flat `[B * blocks]` page ids covering each row's first `total_len` tokens.
 
     Block-table entries past a row's allocation are `-1`; they are clamped to page 0 and
     the positions they cover are never visible under the causal bound, since every row's
     visible keys end at its own `start + chunk`.
     """
+    blocks = -(-total_len // block_size)
+    return block_tables[:, :blocks].clamp(min=0).reshape(-1).to(torch.long)
+
+
+def gather_pages(
+    pool: torch.Tensor, block_tables: torch.Tensor, total_len: int,
+    indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Dense `[B, H, total_len, D]` view of each row's first `total_len` logical tokens."""
     batch = block_tables.shape[0]
     block_size = pool.shape[1]
     blocks = -(-total_len // block_size)
-    pages = block_tables[:, :blocks].clamp(min=0)
-    gathered = pool.index_select(0, pages.reshape(-1).to(torch.long))          # [B*blocks, S, H, D]
+    if indices is None:
+        indices = page_indices(block_tables, block_size, total_len)
+    gathered = pool.index_select(0, indices)                                     # [B*blocks, S, H, D]
     gathered = gathered.view(batch, blocks * block_size, *pool.shape[2:])[:, :total_len]
     return gathered.permute(0, 2, 1, 3)                                         # [B, H, T, D]
 
@@ -73,12 +81,16 @@ def sdpa_paged_prefill(
     *,
     total_len: int,
     scale: float | None = None,
+    cache: dict | None = None,
 ) -> torch.Tensor:
     """Attend each padded query chunk to its paged prefix plus its own causal region.
 
     Same signature and semantics as `paged_prefill`, plus `total_len`: the longest
     `start + chunk` in the batch, which the caller knows host-side at planning time (it
     must not be read back from the device tensors, that would be a sync per layer).
+    `cache`, when given, holds the mask and page indices across the layers of one step:
+    they depend on the batch metadata only, and rebuilding them per layer is ~15 launches
+    each time in a forward that is launch-bound.
     """
     if query.ndim != 4:
         raise ValueError("query must have shape [B,H,Q,D]")
@@ -88,12 +100,24 @@ def sdpa_paged_prefill(
         raise ValueError("query heads must be a multiple of KV heads")
     if total_len <= 0:
         raise ValueError("total_len must be positive")
-    keys = gather_pages(key_pages, block_tables, total_len)
-    values = gather_pages(value_pages, block_tables, total_len)
-    mask = chunk_causal_mask(start_positions, chunk_lens, query_len, total_len)
+    repeat = q_heads // kv_heads
+    key = (query_len, total_len, repeat)
+    cached = cache.get(key) if cache is not None else None
+    if cached is None:
+        indices = page_indices(block_tables, key_pages.shape[1], total_len)
+        mask = chunk_causal_mask(start_positions, chunk_lens, query_len, total_len)
+        if repeat > 1:
+            mask = mask.expand(batch, repeat, query_len, total_len).reshape(
+                batch, 1, repeat * query_len, total_len,
+            )
+        cached = (indices, mask)
+        if cache is not None:
+            cache[key] = cached
+    indices, mask = cached
+    keys = gather_pages(key_pages, block_tables, total_len, indices)
+    values = gather_pages(value_pages, block_tables, total_len, indices)
     if scale is None:
         scale = head_dim ** -0.5
-    repeat = q_heads // kv_heads
     if repeat == 1:
         return F.scaled_dot_product_attention(query, keys, values, attn_mask=mask, scale=scale)
     # GQA without `enable_gqa`: that flag is honoured only by the math backend on this
@@ -104,8 +128,5 @@ def sdpa_paged_prefill(
     # memory-efficient path applies. Query head h = kv * repeat + r, matching the Triton
     # kernels' `h // repeat` mapping.
     grouped = query.reshape(batch, kv_heads, repeat * query_len, head_dim)
-    grouped_mask = mask.expand(batch, repeat, query_len, total_len).reshape(
-        batch, 1, repeat * query_len, total_len,
-    )
-    out = F.scaled_dot_product_attention(grouped, keys, values, attn_mask=grouped_mask, scale=scale)
+    out = F.scaled_dot_product_attention(grouped, keys, values, attn_mask=mask, scale=scale)
     return out.reshape(batch, q_heads, query_len, head_dim)

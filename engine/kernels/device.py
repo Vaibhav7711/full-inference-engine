@@ -56,7 +56,11 @@ class DeviceProfile:
           parallelism from long sequences; a prefill *chunk* is not one.
         """
         block_m = 64 if query_len >= 256 else 32
-        warps = 8 if block_m * head_dim >= 64 * 128 else 4
+        # 8 warps at every tile: measured on the T4 (prefill_attention_ab, prefix 896,
+        # batch 4) the 32x64 tile at 8 warps ran 2x faster than the per-token kernel,
+        # while the engine's earlier 4-warp default ran 2x slower than it - the kernel is
+        # at 255 registers and halving the warps doubles the per-thread demand.
+        warps = 8
         stages = 3 if self.supports_async_copy else 2
         return {"block_m": block_m, "block_n": 64, "num_warps": warps,
                 "num_stages": stages}
