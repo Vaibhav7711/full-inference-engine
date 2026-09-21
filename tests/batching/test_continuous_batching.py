@@ -391,6 +391,75 @@ def test_padded_cuda_graph_bucket_matches_reference():
     assert len(eng._graph_dummy_blocks) == 3
 
 
+def _staggered_prompts():
+    """Prompts whose prefill spans several steps while earlier ones are decoding."""
+    long = (
+        "Explain how paged attention, continuous batching, and chunked prefill work "
+        "together in a production inference engine. Include scheduling and memory details, "
+        "and describe what happens when the KV pool runs out of free pages."
+    )
+    return ["The capital of France is", long, "2 + 2 =", long + " Be concise."]
+
+
+def _fused_engine(model, tok, **overrides):
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    settings = dict(
+        num_blocks=1024, block_size=16, max_active=4, prefix_cache_blocks=0,
+        prefill_chunk_size=16, max_prefill_tokens_per_iteration=16,
+    )
+    settings.update(overrides)
+    return ContinuousBatchingEngine(model, tok, "cuda", **settings)
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("graphs", [None, (2, 4)], ids=["eager", "graphed"])
+def test_fused_step_runs_decode_and_prefill_in_one_forward(graphs):
+    """A step carrying both decode rows and chunk rows runs one forward, token-identical
+    to the two-forward engine and to stock Transformers."""
+    prompts = _staggered_prompts()
+    max_new = 12
+    model, tok = _load()
+    refs = [_reference_greedy(tok, p, max_new) for p in prompts]
+    separate = _fused_engine(model, tok, fused_step=False, cuda_graph_batch_sizes=graphs)
+    fused = _fused_engine(model, tok, fused_step=True, cuda_graph_batch_sizes=graphs)
+    expected = separate.generate(prompts, max_new_tokens=max_new)
+    assert separate.fused_steps == 0
+    actual = fused.generate(prompts, max_new_tokens=max_new)
+    assert fused.fused_steps > 0, "no step carried decode and prefill together"
+    assert fused.prefill_steps >= fused.fused_steps
+    if graphs:
+        assert fused._fused_graphs, "fused steps never replayed a graph"
+        assert not fused._prefill_graph_unsupported
+    for prompt, out, ref, sep in zip(prompts, actual, refs, expected):
+        assert out == sep, f"fused diverged from the two-forward engine on {prompt!r}"
+        assert out == ref, f"fused diverged from stock on {prompt!r}"
+    assert fused.block_manager.snapshot()["used_blocks"] == fused.prefix_cache.snapshot()["cached_blocks"]
+
+
+@cuda
+@requires_cuda
+def test_fused_step_survives_preemption():
+    """Prefill capacity acquired after the decode rows may evict one of them; the fused
+    forward must then run without that row and every request must still finish."""
+    from engine.runtime import RequestState
+
+    model, tok = _load()
+    max_new = 24
+    refs = [_reference_greedy(tok, p, max_new) for p in _PRESSURE_PROMPTS]
+    eng = _fused_engine(
+        model, tok, max_active=4, prefill_chunk_size=32, max_prefill_tokens_per_iteration=32,
+        num_blocks=_pressure_blocks(tok, _PRESSURE_PROMPTS, max_new, reserved=3),
+        cuda_graph_batch_sizes=(2, 4),
+    )
+    requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
+    assert eng.scheduler.preemption_count > 0
+    assert all(r.state is RequestState.FINISHED for r in requests)
+    for request, ref in zip(requests, refs):
+        assert request.output_token_ids == ref, request.request_id
+
+
 @cuda
 @requires_cuda
 @pytest.mark.parametrize("prefill_attention", ["per_token", "sdpa"])

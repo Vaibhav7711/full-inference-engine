@@ -49,6 +49,8 @@ def main() -> int:
         problems.append(f"prefill graph capture failed: {summary['prefill_graph_unsupported']}")
     elif summary.get("prefill_graphs", 0) < len(args.buckets):
         problems.append(f"expected a prefill graph per bucket, got {summary.get('prefill_graphs')}")
+    if engine.fused_step and not summary.get("fused_graphs"):
+        problems.append(f"fused step graphs were not captured during warmup: {summary}")
 
     engine.instrument = True
     prompts = ["Explain KV caching in one sentence."] * args.max_active

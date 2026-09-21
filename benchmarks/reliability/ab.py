@@ -70,6 +70,14 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("prefill_eager", {"prefill_cuda_graphs": False}),
         ("prefill_graphed", {"prefill_cuda_graphs": True}),
     ],
+    # One forward per prefill-carrying step (decode rows and chunk rows packed into one
+    # token row) against the decode forward followed by the prefill forward. Same kernels
+    # either way; only the GEMM shapes differ, so late greedy drift is possible and the
+    # stock-reference gate decides.
+    "fused_step": [
+        ("separate_forwards", {"fused_step": False}),
+        ("fused_forward", {"fused_step": True}),
+    ],
     # The two-arm form, once `tiled` has been measured on a device.
     "prefill_sdpa": [
         ("per_token", {"prefill_attention": "per_token"}),
@@ -132,12 +140,14 @@ FULL: dict = {
     "prefix_cache_blocks": 64,
     "prefill_attention": "sdpa",
     "prefill_cuda_graphs": True,
+    "fused_step": True,
     "triton_rmsnorm": True, "triton_rope": True, "triton_swiglu": True,
 }
 LEAVE_ONE_OUT: dict[str, dict] = {
     "graphs": {"cuda_graph_batch_sizes": None},
     "prefix_cache": {"prefix_cache_blocks": 0},
     "prefill_graphs": {"prefill_cuda_graphs": False},
+    "fused_step": {"fused_step": False},
     "rmsnorm": {"triton_rmsnorm": False},
     "rope": {"triton_rope": False},
     "swiglu": {"triton_swiglu": False},
@@ -168,7 +178,7 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
 # with stock Transformers for the first `--min-identical-tokens` of every prompt, which a
 # wrong kernel fails immediately and a rounding difference does not.
 TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rmsnorm",
-                        "triton_rope", "triton_swiglu", "mlp_gate_up"}
+                        "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step"}
 
 
 def drift_expected(setting: str) -> bool:
@@ -448,7 +458,8 @@ def main() -> int:
                        "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms",
                        "step_timing.prefill_step_fraction",
                        "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
-                       "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50"):
+                       "step_timing.prefill_gpu_ms_p50", "step_timing.fused_gpu_ms_p50",
+                       "step_timing.sync_ms_p50"):
             stats = repeated.summary(metric)
             if stats.get("n"):
                 print(f"  {metric:24s} median={stats['median']:.3f}  "
@@ -483,7 +494,8 @@ def main() -> int:
                 "step_timing.prefill_step_fraction",
                 "step_timing.prefill_penalty_p50_ms", "waste_ratio",
                 "step_timing.host_stage_ms_p50", "step_timing.decode_gpu_ms_p50",
-                "step_timing.prefill_gpu_ms_p50", "step_timing.sync_ms_p50")
+                "step_timing.prefill_gpu_ms_p50", "step_timing.fused_gpu_ms_p50",
+                "step_timing.sync_ms_p50")
     baseline = arms[labels[0]]
     comparisons = {}
     for label in labels[1:]:

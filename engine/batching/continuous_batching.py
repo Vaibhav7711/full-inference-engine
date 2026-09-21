@@ -122,6 +122,22 @@ class _PrefillContext:
 
 
 _PREFILL_CTX: Optional[_PrefillContext] = None
+
+
+@dataclass
+class _FusedContext:
+    """Token layout of one fused step forward: `[1, decode_rows + prefill_rows * width]`.
+
+    The decode rows come first, one token each, then the prefill chunk batch flattened
+    row-major at the staged chunk width. The per-row metadata lives in `_BATCH_CTX` and
+    `_PREFILL_CTX` exactly as for the separate forwards; this only says where to cut.
+    """
+    decode_rows: int
+    prefill_rows: int
+    width: int
+
+
+_FUSED_CTX: Optional[_FusedContext] = None
 _ATTN_CALLS = 0
 
 
@@ -145,6 +161,40 @@ def _clear_prefill_ctx() -> None:
     _PREFILL_CTX = None
 
 
+def _set_fused_ctx(ctx: _FusedContext) -> None:
+    global _FUSED_CTX
+    _FUSED_CTX = ctx
+
+
+def _clear_fused_ctx() -> None:
+    global _FUSED_CTX
+    _FUSED_CTX = None
+
+
+def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, scaling):
+    """Write one new K/V per row, then attend `[N, heads, 1, D]` over each row's pages."""
+    key_pool = ctx.key_pool[layer_idx]      # [num_blocks, block_size, kv_heads, D]
+    value_pool = ctx.value_pool[layer_idx]
+    if ctx.key_scale_pool is None:
+        write_decode_kv(key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens)
+        return paged_decode_batched(
+            query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
+            scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
+            length_offset=1,
+        )
+    from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
+    write_decode_int8_kv(
+        key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+        ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
+    )
+    return paged_decode_batched_int8(
+        query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+        ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
+        scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
+        length_offset=1,
+    )
+
+
 def batched_decode_attention_forward(
     module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs,
 ):
@@ -158,46 +208,16 @@ def batched_decode_attention_forward(
 
     ctx = _BATCH_CTX
     assert ctx is not None, "batched decode context not set"
-    layer_idx = module.layer_idx
-
     N, num_q_heads, one, D = query.shape
     assert one == 1, "batched decode: 1 new token per sequence"
-
-    key_pool = ctx.key_pool[layer_idx]      # [num_blocks, block_size, kv_heads, D]
-    value_pool = ctx.value_pool[layer_idx]
-
-    if ctx.key_scale_pool is None:
-        write_decode_kv(key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens)
-        out = paged_decode_batched(
-            query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
-            scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
-            length_offset=1,
-        )
-    else:
-        from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
-        write_decode_int8_kv(
-            key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
-            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
-        )
-        out = paged_decode_batched_int8(
-            query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
-            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
-            scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
-            length_offset=1,
-        )
-
+    out = _decode_attention(ctx, module.layer_idx, query, key, value, scaling)
     # HF expects [N, 1, heads, D] (transposed form)
     out = out.transpose(1, 2).contiguous()   # [N, 1, num_q_heads, D]
     return out, None
 
 
-def chunked_prefill_attention_forward(
-    module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs,
-):
-    """Write a K/V chunk, then attend it to the paged prefix causally."""
-    ctx = _PREFILL_CTX
-    assert ctx is not None, "chunked prefill context not set"
-    layer_idx = module.layer_idx
+def _prefill_attention(ctx: _PrefillContext, layer_idx: int, query, key, value, scaling):
+    """Write a padded K/V chunk batch, then attend `[B, heads, Q, D]` to each paged prefix."""
     key_pool = ctx.key_pool[layer_idx]
     value_pool = ctx.value_pool[layer_idx]
     if ctx.key_scale_pool is None:
@@ -235,7 +255,69 @@ def chunked_prefill_attention_forward(
             ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.start_positions,
             ctx.chunk_lens, scale=scaling,
         )
+    return out
+
+
+def chunked_prefill_attention_forward(
+    module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs,
+):
+    """Write a K/V chunk, then attend it to the paged prefix causally."""
+    ctx = _PREFILL_CTX
+    assert ctx is not None, "chunked prefill context not set"
+    out = _prefill_attention(ctx, module.layer_idx, query, key, value, scaling)
     return out.transpose(1, 2).contiguous(), None
+
+
+def fused_step_attention_forward(
+    module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs,
+):
+    """Attention for one forward that carries a decode batch and a prefill chunk batch.
+
+    The model sees a single packed row: `query` is `[1, heads, T, D]` with the decode
+    tokens first and the chunk batch after them, so every per-token module (norms,
+    projections, MLP) runs once over both. Only attention cares which token belongs to
+    which request; this cuts the packed row into the two shapes the paged kernels take
+    and puts the results back in packed order. The cuts are contiguous copies of a few
+    hundred kilobytes per layer, which is well under the second forward they replace.
+    """
+    global _ATTN_CALLS
+    _ATTN_CALLS += 1
+
+    fused = _FUSED_CTX
+    assert fused is not None, "fused step context not set"
+    layer_idx = module.layer_idx
+    one, heads, total, head_dim = query.shape
+    assert one == 1, "fused step packs every token into one row"
+    decode_rows, prefill_rows, width = fused.decode_rows, fused.prefill_rows, fused.width
+    assert total == decode_rows + prefill_rows * width, "fused row layout mismatch"
+    parts = []
+    if decode_rows:
+        ctx = _BATCH_CTX
+        assert ctx is not None, "batched decode context not set"
+        # [1, heads, N, D] -> [N, heads, 1, D]
+        cut = slice(0, decode_rows)
+        out = _decode_attention(
+            ctx, layer_idx,
+            query[:, :, cut].transpose(0, 2).contiguous(),
+            key[:, :, cut].transpose(0, 2).contiguous(),
+            value[:, :, cut].transpose(0, 2).contiguous(),
+            scaling,
+        )
+        parts.append(out.transpose(1, 2).reshape(1, decode_rows, heads, head_dim))
+    if prefill_rows:
+        ctx = _PREFILL_CTX
+        assert ctx is not None, "chunked prefill context not set"
+
+        def rows(tensor):
+            # [1, h, B*W, D] -> [B, h, W, D]
+            h = tensor.shape[1]
+            return tensor[0, :, decode_rows:].reshape(h, prefill_rows, width, head_dim) \
+                .transpose(0, 1).contiguous()
+
+        out = _prefill_attention(ctx, layer_idx, rows(query), rows(key), rows(value), scaling)
+        parts.append(out.transpose(1, 2).reshape(1, prefill_rows * width, heads, head_dim))
+    out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+    return out.contiguous(), None
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +329,7 @@ class ContinuousBatchingEngine:
 
     ATTN_NAME = "batched_paged_decode"
     PREFILL_ATTN_NAME = "chunked_paged_prefill"
+    FUSED_ATTN_NAME = "fused_paged_decode_prefill"
     # Gate 1B removed the preemption-count limit. A count is the wrong criterion: a
     # healthy request waiting behind several long generations yields once per iteration
     # through no fault of its own, so any fixed bound fails valid work under load.
@@ -266,6 +349,7 @@ class ContinuousBatchingEngine:
                  cuda_graph_batch_size: int | None = None,
                  cuda_graph_batch_sizes: tuple[int, ...] | None = None,
                  prefill_cuda_graphs: bool = True,
+                 fused_step: bool = True,
                  fuse_mlp_gate_up: bool = False,
                  triton_rmsnorm: bool = True,
                  triton_rope: bool = True,
@@ -312,6 +396,11 @@ class ContinuousBatchingEngine:
         # when graph buckets are configured. Off keeps decode graphs and runs prefill
         # eagerly on the same staged buffers, which is the A/B for the capture itself.
         self.prefill_cuda_graphs = prefill_cuda_graphs
+        # A step that carries both decode rows and prefill chunks runs them as one packed
+        # forward (decode tokens first, chunk batch after) instead of two. The weights
+        # are read once for both, and the prefill's launch cost rides on the decode
+        # forward's. Off runs the two forwards back to back, which is the A/B.
+        self.fused_step = fused_step
         self.fuse_mlp_gate_up = fuse_mlp_gate_up
         self.triton_rmsnorm = triton_rmsnorm
         self.triton_rope = triton_rope
@@ -325,6 +414,8 @@ class ContinuousBatchingEngine:
         # very different amounts, and mixing them makes any latency percentile a blend.
         self.prefill_steps = 0
         self.decode_only_steps = 0
+        # Of the prefill-carrying steps, how many ran decode and prefill as one forward.
+        self.fused_steps = 0
         self.last_step_prefill_tokens = 0
         self.last_step_decode_rows = 0
         # Which prefill implementation ran. The SDPA fast path and the resumable chunk
@@ -438,6 +529,7 @@ class ContinuousBatchingEngine:
             (max_active, num_blocks), dtype=torch.int32, device=device
         )
         self._prefill_graphs = {}
+        self._fused_graphs = {}
         self._prefill_graph_pool = None
         # Attention kinds whose forward could not be captured on this build; they run
         # eagerly with the same staged buffers. Recorded once, with the reason.
@@ -458,6 +550,7 @@ class ContinuousBatchingEngine:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         ALL_ATTENTION_FUNCTIONS[self.ATTN_NAME] = batched_decode_attention_forward
         ALL_ATTENTION_FUNCTIONS[self.PREFILL_ATTN_NAME] = chunked_prefill_attention_forward
+        ALL_ATTENTION_FUNCTIONS[self.FUSED_ATTN_NAME] = fused_step_attention_forward
 
     def _reserve_graph_dummy_blocks(self) -> None:
         """Reserve permanent, non-customer pages for padded CUDA-Graph rows."""
@@ -501,7 +594,8 @@ class ContinuousBatchingEngine:
             lengths.append(allocation.sequence_length)
 
         if row_count > count:
-            if len(self._graph_dummy_blocks) < row_count - count:
+            if not self._graph_dummy_blocks or (
+                    count and len(self._graph_dummy_blocks) < row_count - count):
                 raise RuntimeError("graph dummy blocks were not reserved for this bucket")
             pad_token = self.tokenizer.pad_token_id
             if pad_token is None:
@@ -515,8 +609,12 @@ class ContinuousBatchingEngine:
         for row, request in enumerate(active):
             table = request.block_table
             self._host_block_tables[row, :len(table)] = torch.tensor(table, dtype=torch.int32)
+        # A live batch has at least one real row, so its inert rows get distinct dummy
+        # pages. A capture on no rows at all (the fused step graphs) wraps around: two
+        # inert rows then store the same pad token into the same slot, which is benign.
+        dummies = self._graph_dummy_blocks
         for row in range(count, row_count):
-            self._host_block_tables[row, 0] = self._graph_dummy_blocks[row - count]
+            self._host_block_tables[row, 0] = dummies[(row - count) % len(dummies)]
 
         input_ids = self._device_input_ids[:row_count]
         position_ids = self._device_position_ids[:row_count]
@@ -684,6 +782,7 @@ class ContinuousBatchingEngine:
             "prefix_cache_misses": int(cache.get("lookups", 0)) - int(cache.get("hits", 0)),
             "prefill_steps": self.prefill_steps,
             "decode_only_steps": self.decode_only_steps,
+            "fused_steps": self.fused_steps,
             "prefill_sdpa_calls": self.prefill_sdpa_calls,
             "prefill_chunked_calls": self.prefill_chunked_calls,
             "prefill_sdpa_tokens": self.prefill_sdpa_tokens,
@@ -868,29 +967,14 @@ class ContinuousBatchingEngine:
         self.prefill_chunked_tokens += sum(count for _, count in plans)
         self.last_step_prefill_path = "chunked"
 
-        viable_plans = []
-        for request, count in plans:
-            if request.state is not RequestState.PREFILLING:
-                continue  # preempted while making room for an earlier request
-            target = request.prefilled_token_count + count
-            if self._capacity_or_fail(request, target):
-                viable_plans.append((request, count))
-        plans = [
-            (request, count) for request, count in viable_plans
-            if request.state is RequestState.PREFILLING and request.allocation is not None
-        ]
+        plans = self._prefill_viable(plans)
         if not plans:
             return
 
-        self.model.config._attn_implementation = self.PREFILL_ATTN_NAME
-        if hasattr(self.model.config, "_attn_implementation_internal"):
-            self.model.config._attn_implementation_internal = self.PREFILL_ATTN_NAME
+        self._set_attention(self.PREFILL_ATTN_NAME)
 
         count = len(plans)
-        row_bucket = next(
-            (size for size in self.cuda_graph_batch_sizes if count <= size <= self.max_active),
-            None,
-        )
+        row_bucket = self._prefill_row_bucket(count)
         use_graph = (
             self.prefill_cuda_graphs and row_bucket is not None
             and self.prefill_attention not in self._prefill_graph_unsupported
@@ -927,12 +1011,7 @@ class ContinuousBatchingEngine:
         finally:
             _clear_prefill_ctx()
 
-        for row, (request, n) in enumerate(plans):
-            if not self.block_manager.append_tokens(request.request_id, n):
-                raise RuntimeError("prefill capacity was acquired but could not be committed")
-            request.advance_prefill(n)
-            if request.remaining_prefill_tokens == 0:
-                self._complete_prefill(request, int(tokens[row]))
+        self._commit_prefill(plans, tokens)
         self._gpu_elapsed(timer, "prefill_gpu_ms")
 
     def _decoder(self):
@@ -1094,7 +1173,14 @@ class ContinuousBatchingEngine:
             request for request in self.scheduler.active.values()
             if request.state is RequestState.DECODING
         ]
-        if decoding:
+        fused = self.fused_step and bool(decoding)
+        rows: list[GenerationRequest] = []
+        if fused:
+            # Capacity for the decode rows is taken before admission, as the separate
+            # decode forward would have; the forward itself waits for the prefill plan so
+            # both can share it.
+            rows = self._decode_viable(decoding)
+        elif decoding:
             self.decode_step(decoding)
         admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
         for request in admitted:
@@ -1104,11 +1190,224 @@ class ContinuousBatchingEngine:
         self.last_step_prefill_tokens = sum(count for _, count in plans)
         self.last_step_decode_rows = len(decoding)
         self.last_step_prefill_path = ""
-        if plans:
+        if fused:
+            if self._fused_rows_step(rows, plans):
+                self.fused_steps += 1
+        elif plans:
             self.prefill_chunks(plans)
+        if plans:
             self.prefill_steps += 1
         elif decoding:
             self.decode_only_steps += 1
+
+    def _set_attention(self, name: str) -> None:
+        config = self.model.config
+        config._attn_implementation = name
+        if hasattr(config, "_attn_implementation_internal"):
+            config._attn_implementation_internal = name
+
+    def _graph_bucket(self, count: int) -> int | None:
+        return next(
+            (size for size in self.cuda_graph_batch_sizes if count <= size <= self.max_active),
+            None,
+        )
+
+    # Chunk batches are usually one or two rows under the 128-token budget, and every
+    # padded row costs a full chunk of per-token work, so the row buckets start at 1
+    # rather than at the smallest decode bucket. Above this many rows the fused graph
+    # would spend more on inert rows than a second forward costs; eager runs exact.
+    FUSED_PREFILL_ROW_LIMIT = 4
+
+    def _prefill_row_bucket(self, count: int, limit: int | None = None) -> int | None:
+        if not self.cuda_graph_batch_sizes:
+            return None
+        sizes = (1,) + self.cuda_graph_batch_sizes
+        bucket = next((size for size in sizes if count <= size <= self.max_active), None)
+        if bucket is not None and limit is not None and bucket > limit:
+            return None
+        return bucket
+
+    def _prefill_viable(
+        self, plans: list[tuple[GenerationRequest, int]],
+    ) -> list[tuple[GenerationRequest, int]]:
+        """Acquire KV capacity for each planned chunk, dropping preempted requests."""
+        viable_plans = []
+        for request, count in plans:
+            if request.state is not RequestState.PREFILLING:
+                continue  # preempted while making room for an earlier request
+            target = request.prefilled_token_count + count
+            if self._capacity_or_fail(request, target):
+                viable_plans.append((request, count))
+        return [
+            (request, count) for request, count in viable_plans
+            if request.state is RequestState.PREFILLING and request.allocation is not None
+        ]
+
+    def _commit_prefill(
+        self, plans: list[tuple[GenerationRequest, int]], tokens: list[int],
+    ) -> None:
+        for (request, n), token in zip(plans, tokens):
+            if not self.block_manager.append_tokens(request.request_id, n):
+                raise RuntimeError("prefill capacity was acquired but could not be committed")
+            request.advance_prefill(n)
+            if request.remaining_prefill_tokens == 0:
+                self._complete_prefill(request, int(token))
+
+    def _commit_decode(self, active: list[GenerationRequest], tokens: list[int]) -> None:
+        for s, token in zip(active, tokens):
+            self.block_manager.append_tokens(s.request_id)
+            tok = int(token)
+            s.next_token_id = tok
+            s.append_token(tok)
+            if tok in self.eos_ids or len(s.output_token_ids) >= s.max_new_tokens:
+                reason = "EOS" if tok in self.eos_ids else "LENGTH"
+                self.scheduler.finish(s.request_id, reason=reason)
+
+    def _set_fused_contexts(
+        self, *, decode_rows: int, block_tables, seq_lens, block_n: int, num_warps: int,
+        prefill_rows: int, total_len: int, width: int,
+    ) -> None:
+        _set_batch_ctx(_BatchContext(
+            key_pool=self.key_pool, value_pool=self.value_pool,
+            block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
+            decode_block_n=block_n, decode_num_warps=num_warps,
+            key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
+        ))
+        self._set_prefill_context(prefill_rows, total_len)
+        _set_fused_ctx(_FusedContext(decode_rows, prefill_rows, width))
+
+    @staticmethod
+    def _clear_fused_contexts() -> None:
+        _clear_fused_ctx()
+        _clear_prefill_ctx()
+        _clear_batch_ctx()
+
+    def _fused_forward(self, decode_rows: int, prefill_rows: int, width: int) -> torch.Tensor:
+        """One packed forward over the staged decode and prefill buffers -> next tokens.
+
+        Returns `[decode_rows + prefill_rows]` greedy tokens: the decode rows' next
+        tokens, then each chunk row's prediction at its last valid token (discarded by
+        the caller for rows whose prompt is not finished). The vocabulary projection runs
+        on exactly those rows.
+        """
+        decode_ids = self._device_input_ids[:decode_rows].reshape(1, decode_rows)
+        decode_positions = self._device_position_ids[:decode_rows].reshape(1, decode_rows)
+        chunk_ids = self._prefill_device_input_ids[:prefill_rows, :width].reshape(1, -1)
+        chunk_positions = self._prefill_device_position_ids[:prefill_rows, :width].reshape(1, -1)
+        input_ids = torch.cat((decode_ids, chunk_ids), dim=1)
+        position_ids = torch.cat((decode_positions, chunk_positions), dim=1)
+        hidden = self._decoder()(
+            input_ids=input_ids, position_ids=position_ids, use_cache=False, return_dict=True,
+        ).last_hidden_state[0]
+        chunk_lens = self._prefill_device_chunk_lens[:prefill_rows]
+        last = (
+            decode_rows
+            + torch.arange(prefill_rows, device=hidden.device) * width
+            + (chunk_lens.to(torch.long) - 1).clamp_(min=0)
+        )
+        picked = torch.cat((hidden[:decode_rows], hidden[last]), dim=0)
+        return self._lm_head()(picked).argmax(dim=-1)
+
+    def _capture_fused_graph(self, key: tuple):
+        """Capture one fused step graph, or record that this attention kind cannot be."""
+        from engine.graphs.fused_step_graph import capture_fused_step_graph
+
+        decode_rows, prefill_rows, kind, context_len, block_n, num_warps = key
+        tag = f"fused:{kind}"
+        if tag in self._prefill_graph_unsupported:
+            return None
+        if self._prefill_graph_pool is None:
+            self._prefill_graph_pool = torch.cuda.graph_pool_handle()
+        try:
+            graph = capture_fused_step_graph(
+                self, decode_rows=decode_rows, prefill_rows=prefill_rows,
+                context_len=context_len, block_n=block_n, num_warps=num_warps,
+                pool=self._prefill_graph_pool,
+            )
+        except RuntimeError as error:
+            self._prefill_graph_unsupported[tag] = str(error).splitlines()[0][:200]
+            torch.cuda.synchronize()
+            return None
+        self._fused_graphs[key] = graph
+        return graph
+
+    def _fused_rows_step(
+        self, rows: list[GenerationRequest], plans: list[tuple[GenerationRequest, int]],
+    ) -> bool:
+        """Advance the decode rows and the planned chunks in one forward.
+
+        Falls back to the separate paths when one side is empty: a decode-only step is
+        the plain decode forward, and a prefill-only step keeps the fresh-prompt fast
+        path. Returns True when the fused forward ran.
+        """
+        plans = self._prefill_viable(plans) if plans else []
+        # Prefill capacity may have preempted a decode row admitted after the prefilling
+        # request; such a row has no KV to write into anymore.
+        rows = [r for r in rows if r.state is RequestState.DECODING and r.allocation is not None]
+        if not plans:
+            if rows:
+                self._decode_rows(rows)
+            return False
+        if not rows:
+            self.prefill_chunks(plans)
+            return False
+
+        host_started = perf_counter() if self.instrument else None
+        self.prefill_chunked_calls += 1
+        self.prefill_chunked_tokens += sum(count for _, count in plans)
+        self.last_step_prefill_path = "fused"
+        decode_count, prefill_count = len(rows), len(plans)
+        max_sequence_length = max(r.allocation.sequence_length + 1 for r in rows)
+        block_n, num_warps = select_paged_decode_config(max_sequence_length, decode_count)
+        decode_bucket = self._graph_bucket(decode_count)
+        prefill_bucket = self._prefill_row_bucket(prefill_count, self.FUSED_PREFILL_ROW_LIMIT)
+        total_len = max(request.prefilled_token_count + n for request, n in plans)
+        use_graph = (
+            self.prefill_cuda_graphs and decode_bucket is not None and prefill_bucket is not None
+            and f"fused:{self.prefill_attention}" not in self._prefill_graph_unsupported
+        )
+        graph = None
+        if use_graph:
+            width = self.prefill_chunk_size
+            context_len = _prefill_context_bucket(total_len) if self.prefill_attention == "sdpa" else 0
+            key = (decode_bucket, prefill_bucket, self.prefill_attention, context_len, block_n, num_warps)
+            graph = self._fused_graphs.get(key)
+            if graph is None:
+                graph = self._capture_fused_graph(key)
+            use_graph = graph is not None
+        if use_graph:
+            decode_rows, prefill_rows = decode_bucket, prefill_bucket
+        else:
+            decode_rows, prefill_rows = decode_count, prefill_count
+            width = max(n for _, n in plans)
+            context_len = total_len
+        self._set_attention(self.FUSED_ATTN_NAME)
+        _, _, block_tables, seq_lens = self._prepare_decode_metadata(
+            rows, graph_bucket_size=decode_rows if use_graph else None,
+        )
+        self._prepare_prefill_metadata(plans, prefill_rows)
+        self._host_elapsed(host_started, "host_stage_ms")
+        timer = self._gpu_timer()
+        self._set_fused_contexts(
+            decode_rows=decode_rows, block_tables=block_tables, seq_lens=seq_lens,
+            block_n=block_n, num_warps=num_warps, prefill_rows=prefill_rows,
+            total_len=context_len if context_len else total_len, width=width,
+        )
+        try:
+            if use_graph:
+                next_tokens = graph.replay()
+            else:
+                next_tokens = self._fused_forward(decode_rows, prefill_rows, width)
+            # One device-to-host transfer for decode and prefill together.
+            sync_started = perf_counter() if self.instrument else None
+            tokens = next_tokens.tolist()
+            self._host_elapsed(sync_started, "sync_ms")
+        finally:
+            self._clear_fused_contexts()
+        self._gpu_elapsed(timer, "fused_gpu_ms")
+        self._commit_decode(rows, tokens[:decode_count])
+        self._commit_prefill(plans, tokens[decode_rows:decode_rows + prefill_count])
+        return True
 
     # ------------------------------------------------------------------
     # D2: one batched decode step over all active sequences
@@ -1116,30 +1415,30 @@ class ContinuousBatchingEngine:
     @torch.inference_mode()
     def decode_step(self, active: list[GenerationRequest]) -> None:
         """Advance all active sequences by one token via a single batched forward."""
-        N = len(active)
-        if N == 0:
-            return
-        host_started = perf_counter() if self.instrument else None
+        active = self._decode_viable(active)
+        if active:
+            self._decode_rows(active)
 
-        # Switch to the batched K4 attention fn
-        self.model.config._attn_implementation = self.ATTN_NAME
-        if hasattr(self.model.config, "_attn_implementation_internal"):
-            self.model.config._attn_implementation_internal = self.ATTN_NAME
+    def _decode_viable(self, active: list[GenerationRequest]) -> list[GenerationRequest]:
+        """Acquire each row's next KV slot, in FCFS priority order.
 
-        # Grow in FCFS priority order. A request that cannot grow preempts newer requests
-        # (which then vanish from this batch) and is failed only when nothing older can
-        # help. Victims are always later in priority order, but a resumed request sits at
-        # the end of the admission order with an old arrival time, so re-check at the end.
+        A request that cannot grow preempts newer requests (which then vanish from this
+        batch) and is failed only when nothing older can help. Victims are always later
+        in priority order, but a resumed request sits at the end of the admission order
+        with an old arrival time, so re-check at the end.
+        """
         viable = []
         for s in sorted(active, key=lambda item: (item.created_ns, item.request_id)):
             if s.state is not RequestState.DECODING or s.allocation is None:
                 continue  # preempted earlier in this loop
             if self._capacity_or_fail(s, s.allocation.sequence_length + 1):
                 viable.append(s)
-        active = [s for s in viable if s.state is RequestState.DECODING and s.allocation is not None]
-        if not active:
-            return
+        return [s for s in viable if s.state is RequestState.DECODING and s.allocation is not None]
 
+    def _decode_rows(self, active: list[GenerationRequest]) -> None:
+        """Stage, run and commit one decode forward over rows that already have capacity."""
+        host_started = perf_counter() if self.instrument else None
+        self._set_attention(self.ATTN_NAME)
         max_sequence_length = max(
             request.allocation.sequence_length + 1 for request in active
         )
@@ -1195,14 +1494,7 @@ class ContinuousBatchingEngine:
         next_tokens = logits[:len(active), -1, :].argmax(dim=-1).tolist()
         self._host_elapsed(sync_started, "sync_ms")
         self._gpu_elapsed(timer, "decode_gpu_ms")
-        for s, token in zip(active, next_tokens):
-            self.block_manager.append_tokens(s.request_id)
-            tok = int(token)
-            s.next_token_id = tok
-            s.append_token(tok)
-            if tok in self.eos_ids or len(s.output_token_ids) >= s.max_new_tokens:
-                reason = "EOS" if tok in self.eos_ids else "LENGTH"
-                self.scheduler.finish(s.request_id, reason=reason)
+        self._commit_decode(active, next_tokens)
 
     # ------------------------------------------------------------------
     # D3: the continuous loop
@@ -1286,22 +1578,41 @@ class ContinuousBatchingEngine:
             contexts = [0]
             if self.prefill_attention == "sdpa":
                 contexts = [_prefill_context_bucket(length) for length in (256, 512, 1024, 2048)]
-            for rows in self.cuda_graph_batch_sizes:
+            for rows in (1,) + self.cuda_graph_batch_sizes:
                 for context_len in contexts:
                     key = (rows, self.prefill_attention, context_len)
                     if key not in self._prefill_graphs:
                         if self._capture_prefill_graph(rows, context_len) is None:
                             break
+            # Fused step graphs for the common shapes: every decode bucket carrying one or
+            # two chunk rows, at the contexts a chat prompt reaches, in both decode kernel
+            # regimes. Rarer shapes are captured on first use.
+            if self.fused_step:
+                fused_contexts = [0]
+                if self.prefill_attention == "sdpa":
+                    fused_contexts = [_prefill_context_bucket(length) for length in (256, 512, 1024)]
+                for decode_rows in self.cuda_graph_batch_sizes:
+                    for prefill_rows in (1, 2):
+                        if self._prefill_row_bucket(prefill_rows, self.FUSED_PREFILL_ROW_LIMIT) != prefill_rows:
+                            continue
+                        for context_len in fused_contexts:
+                            for block_n, num_warps in ((64, 4), (128, 4)):
+                                key = (decode_rows, prefill_rows, self.prefill_attention,
+                                       context_len, block_n, num_warps)
+                                if key not in self._fused_graphs:
+                                    if self._capture_fused_graph(key) is None:
+                                        break
         summary = {
             "rounds": rounds,
             "graphs": len(self._decode_graphs),
             "prefill_graphs": len(self._prefill_graphs),
+            "fused_graphs": len(self._fused_graphs),
             "prefill_graph_unsupported": dict(self._prefill_graph_unsupported),
             "prefill_sdpa_calls": self.prefill_sdpa_calls,
             "prefill_chunked_calls": self.prefill_chunked_calls,
         }
         self.reset()
-        self.prefill_steps = self.decode_only_steps = 0
+        self.prefill_steps = self.decode_only_steps = self.fused_steps = 0
         self.last_step_prefill_tokens = self.last_step_decode_rows = 0
         self.prefill_sdpa_calls = self.prefill_chunked_calls = 0
         self.prefill_sdpa_tokens = self.prefill_chunked_tokens = 0

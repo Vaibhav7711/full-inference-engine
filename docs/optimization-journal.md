@@ -2624,3 +2624,63 @@ per-step cache and made irrelevant by graphing the forward; and with both in pla
 wins by 2-3x on the step. The remaining prefill cost is the un-attention part of the forward
 plus the decode it carries, i.e. the same fixed-cost regime decode was in before graphs.
 Phase 2a's `prefill_graphs` A/B measures that piece on its own.
+
+## Phase 2b — one forward per step: decode rows and prefill chunks packed together (built, unmeasured)
+
+A prefill-carrying step after Phase 2a still ran two graphed forwards back to back: the
+decode batch (10.3 ms p50) and then the chunk batch (27.0 ms p50 for the whole step, so
+~17 ms for the prefill forward). Both are the same 28-layer forward over the same weights.
+Every weight is read twice, every launch is issued twice, and there are two device-to-host
+syncs (one per argmax). The attention kernels are per-request either way; nothing else in
+the forward cares which request a token belongs to.
+
+**What was built.** `fused_step=True` (default) runs both as one forward over a single
+packed row of tokens, `[1, decode_rows + prefill_rows * chunk]`: decode tokens first, the
+chunk batch flattened after them, per-token `position_ids` for each. Norms, projections
+and the MLP run once over the union. A third attention function
+(`fused_step_attention_forward`) cuts the row at the boundary, hands the decode slice to
+the paged decode kernel as `[N, heads, 1, D]` and the chunk slice to the chunk attention
+(`sdpa` over gathered pages, or the Triton kernels) as `[B, heads, chunk, D]`, and packs the
+two results back. The cuts are contiguous copies of a few hundred KB per layer. The
+vocabulary projection runs on the decode rows plus each chunk row's last valid token, one
+argmax, one `.tolist()` for both sides.
+
+The forward is captured per (decode bucket, chunk-row bucket, attention kind, context
+bucket, decode kernel regime) on inert rows, sharing the prefill graphs' memory pool.
+Chunk-row buckets now start at 1 (also for the prefill-only graphs): under the 128-token
+budget a chunk batch is nearly always one or two rows, and each padded row costs a whole
+chunk of per-token work, so padding a single row to the smallest decode bucket (2) had
+been doubling the prefill forward's non-attention cost. Above four chunk rows the fused
+step runs eagerly at exact sizes rather than padding. Warmup captures every decode bucket
+x {1, 2} chunk rows x {256, 512, 1024} context x both kernel regimes; other shapes are
+captured on first use.
+
+Scheduling order changed by one detail: with fusion the decode rows acquire their next KV
+slot *before* admission and planning (the separate decode forward did this too, it just
+also ran before admission), and the forward runs after. A chunk's capacity acquisition can
+still preempt a decode row that was admitted after the prefilling request; such a row is
+dropped from the batch before staging, as it would have been dropped from the next step.
+A request finishing with EOS now frees its pages after admission rather than before, so
+admission in a full pool can lag one step. `fused_step=False` restores the two-forward
+step exactly.
+
+**What the arithmetic says.** The fused forward's cost is bounded below by the larger of
+the two it replaces, not their sum: the weight read (the decode floor, ~4 ms of the 10 ms
+step) is shared, and the 128 chunk tokens' compute is the same. The expected prefill step
+p50 is therefore in the region of 17-20 ms against 27 ms, and the decode rows' ITL
+penalty on a prefill step drops by the same amount. The `sync_ms` phase halves on those
+steps. Nothing else moves; the decode-only step is untouched.
+
+**Correctness.** Same kernels in both arms, but the GEMMs see a different M dimension
+(`N + 128` rather than `N` and `128` separately), so cuBLAS may pick a different tiling
+and fp16 accumulation order can differ. Bit-identity across the arms is therefore not
+guaranteed and `fused_step` is in `TOKEN_DRIFT_EXPECTED`; the stock-reference gate
+(`first_divergence_vs_stock`, `--min-identical-tokens`) decides. The CUDA tests compare
+the fused engine against both the two-forward engine and stock Transformers on staggered
+prompts (eager and graphed), and under KV pressure with preemption.
+
+**How it is measured.** `ab.py --setting fused_step --cuda-graphs` (`separate_forwards`
+vs `fused_forward`), chat and long profiles, 5 x 30 s interleaved; notebook Phase 2b.
+Decision metric: `prefill_step_p50_ms` and `expected_gap_ms`; `fused_gpu_ms_p50` is the
+fused forward on its own. `check_hooks` fails if `fused_graphs` is zero after warmup.
+Result to be recorded here when the run is pasted.

@@ -74,6 +74,11 @@ only (no `mma.sync` on the T4, see journal); prefill chunk 128 (cost fixed per
 invocation on the real kernel); prefix cache and INT8 KV off by default (unresolved or
 negative on these workloads).
 
+Built after this table, not yet measured: `fused_step` (Phase 2b) runs a prefill-carrying
+step's decode rows and chunk rows as one packed forward; on by default, `fused_step=False`
+is the A/B arm. Expected to move the prefill step p50 from 27 ms toward the 17-20 ms
+region; the number goes here when the Kaggle run is in.
+
 ### Preemption (Gate 1B)
 
 Rebuild 37.53 ms, independent of token count (32 and 22 tokens both 37.53 ms). Queue wait
