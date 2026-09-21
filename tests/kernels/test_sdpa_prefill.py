@@ -75,7 +75,8 @@ def test_sdpa_chunked_prefill_matches_per_token_kernel_output() -> None:
     batch, q_heads, kv_heads, head_dim = 3, 16, 8, 128
     key_pool = torch.randn(64, 16, kv_heads, head_dim, device="cuda", dtype=torch.float16)
     value_pool = torch.randn_like(key_pool)
-    tables = torch.arange(64, device="cuda", dtype=torch.int32).view(batch, -1)[:, :20].contiguous()
+    # 20 distinct pages per row (320 slots, enough for start 200 + chunk 64), 60 of 64 pages.
+    tables = torch.arange(batch * 20, device="cuda", dtype=torch.int32).view(batch, 20).contiguous()
     starts = torch.tensor([200, 0, 37], device="cuda", dtype=torch.int32)
     chunks = torch.tensor([64, 64, 9], device="cuda", dtype=torch.int32)
     query = torch.randn(batch, q_heads, 64, head_dim, device="cuda", dtype=torch.float16)
@@ -84,3 +85,26 @@ def test_sdpa_chunked_prefill_matches_per_token_kernel_output() -> None:
     for b in range(batch):
         n = int(chunks[b])
         torch.testing.assert_close(actual[b, :, :n], reference[b, :, :n], rtol=2e-2, atol=2e-2)
+
+
+@cuda
+@requires_cuda
+def test_sdpa_chunked_prefill_is_eligible_for_the_memory_efficient_backend() -> None:
+    """GQA folded into the query axis must run on the memory-efficient kernel, not math.
+
+    Forcing the backend makes torch raise if the shapes or mask are not supported by it;
+    the math backend silently accepting the call is exactly the slow path being avoided.
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    torch.manual_seed(6)
+    batch, q_heads, kv_heads, head_dim = 2, 16, 8, 128
+    key_pool = torch.randn(32, 16, kv_heads, head_dim, device="cuda", dtype=torch.float16)
+    value_pool = torch.randn_like(key_pool)
+    tables = torch.arange(32, device="cuda", dtype=torch.int32).view(batch, -1)
+    starts = torch.tensor([100, 0], device="cuda", dtype=torch.int32)
+    chunks = torch.tensor([128, 77], device="cuda", dtype=torch.int32)
+    query = torch.randn(batch, q_heads, 128, head_dim, device="cuda", dtype=torch.float16)
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        out = sdpa_paged_prefill(query, key_pool, value_pool, tables, starts, chunks, total_len=228)
+    assert out.shape == query.shape and torch.isfinite(out[0]).all()
