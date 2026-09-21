@@ -1,6 +1,6 @@
 """Run the whole prefill investigation in one GPU session and fit the cost model.
 
-See `docs/experiment-plan-prefill.md` for the pre-registered plan, predictions and decision
+See `docs/t4-reevaluation-plan.md` for the plan, predictions and decision
 rule. This script executes Phase B: three sweeps, one model load, one JSON artefact.
 
 Why a sweep rather than another A/B: the question is not "is 128 better than 512" but "what

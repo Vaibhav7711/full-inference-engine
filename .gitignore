@@ -11,3 +11,6 @@ __pycache__/
 results/*.trace
 results/*.prof
 *.nsys-rep
+
+# local archives
+*.zip
