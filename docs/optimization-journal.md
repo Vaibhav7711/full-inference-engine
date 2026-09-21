@@ -2747,3 +2747,28 @@ the same class as `per_token`'s drift. Recorded, not chased.
 
 **Decision:** `fused_step=True` stays the default. Prefill-carrying steps are now 20.7 ms
 on chat against 98 ms at the start of the T4 work (tiled, eager, two forwards).
+
+**Re-run with warmup covering the fused shapes** (commit `2dcecfd`, same protocol,
+`lazy_graph_captures` now reported per arm):
+
+| | separate_forwards | fused_forward |
+|---|---|---|
+| chat: ITL p50 / p99 / p999 | 24.2 / 38.4 / 56.0 ms | **19.8 / 33.0 / 51.4 ms** |
+| chat: captures inside the window, per run | 0 | 0 |
+| long: ITL p50 / p99 / p999 | 27.2 / 64.5 / 114 ms | **22.6 / 44.6** / 151 ms |
+| long: captures inside the window, per run | 1-3 | 3-8 |
+| prefill-carrying step p50 | 24.9 / 26.3 ms | **20.5 / 23.0 ms** (−17.6% / −12.6%) |
+
+Chat is now clean at every percentile: with zero captures in either arm, fused wins p50 by
+18%, p99 by 14%, p999 by 8%. Long wins p99 by 31% and still loses p999, and the counter
+says why: both arms capture inside the window there, the baseline 1-3 times, fused 3-8.
+The uncovered shape is the 4096 context bucket - a long prompt plus its generation
+crosses 2048 tokens, and a request re-prefilling after preemption gathers all of it.
+Fused has three times the keys per context (row buckets x regimes), so it pays three
+times the captures, which is the whole p999 difference. Warmup now derives the context
+buckets from the engine's capacity (pool size, bounded by the model context) instead of a
+fixed list ending at 2048. Cost: at 1024 blocks that is seven context buckets and ~126
+fused captures, roughly 20 s more warmup, paid once.
+
+The result stands as measured for everything but long-profile p999, which is expected
+to follow p99 once the counter reads zero there.

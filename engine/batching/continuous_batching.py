@@ -1125,6 +1125,26 @@ class ContinuousBatchingEngine:
         rows = torch.arange(row_count, device=hidden.device)
         return self._lm_head()(hidden[rows, last]).argmax(dim=-1)
 
+    def _warmup_context_buckets(self) -> list[int]:
+        """Every gathered-context bucket a chunk batch can reach on this engine.
+
+        A chunk's context is its prompt so far - or prompt plus generated tokens for a
+        request re-prefilling after preemption - bounded by the model context and by the
+        pool. A fixed list ending at 2048 left the long profile capturing 4096-context
+        graphs inside the timed window (journal, Phase 2b): p999 rose while p99 fell.
+        """
+        capacity = self.key_pool[0].shape[0] * self.block_size
+        if self.max_model_len:
+            capacity = min(capacity, int(self.max_model_len))
+        buckets = []
+        bucket = 256
+        while True:
+            buckets.append(bucket)
+            if bucket >= capacity:
+                break
+            bucket *= 2
+        return buckets
+
     def _capture_prefill_graph(self, row_count: int, context_len: int):
         """Capture one prefill graph, or record that this attention kind cannot be captured."""
         from engine.graphs.paged_prefill_graph import capture_paged_prefill_graph
@@ -1585,7 +1605,7 @@ class ContinuousBatchingEngine:
                 and torch.device(self.device).type == "cuda"):
             contexts = [0]
             if self.prefill_attention == "sdpa":
-                contexts = [_prefill_context_bucket(length) for length in (256, 512, 1024, 2048)]
+                contexts = self._warmup_context_buckets()
             for rows in (1,) + self.cuda_graph_batch_sizes:
                 for context_len in contexts:
                     key = (rows, self.prefill_attention, context_len)
