@@ -2792,3 +2792,31 @@ so Phase 2b is closed: **fused step, default on**. Prefill-carrying step p50 on 
 Lesson recorded for the method: a tail percentile compared across arms is only a
 result when both arms report zero graph captures inside the window. `lazy_graph_captures`
 is now in every soak/A/B JSON and `check_hooks` fails on a non-zero count.
+
+## Phase 2c — decode attention with the K/V tile shared across the GQA group (built, unmeasured)
+
+With prefill-carrying steps at 20 ms, decode-only steps (10.2 ms p50, 75-90% of all
+steps) are where the time is. The step's floor is the weight read, ~4-5 ms at the T4's
+measured 258 GB/s; the rest is attention over paged KV plus per-layer overhead. The
+per-head decode kernel runs one program per (row, query head) and each program streams
+its KV head's tiles from the pool, so under Qwen3-0.6B's 2:1 GQA every K/V byte is read
+twice per layer. At batch 8 and ~700 tokens that is 8 x 700 x 8 heads x 128 x 2 B x 2 (K,V)
+= 23 MB per layer, 640 MB per step at the double read, i.e. of the same order as the
+1.2 GB weight read. Adjacent head programs may already share through L2 (4 MB on the
+T4), which is why this is measured before it is believed.
+
+**What was built.** `paged_decode_gqa`: one program per (row, KV head), carrying the
+online-softmax state of all `n_rep` heads (`[REP]` max and sum, `[REP, D]` accumulator);
+each K/V tile is loaded once and used for the group. The products broadcast over
+`[REP, BLOCK_N, D]` in registers, so the regime policy halves BLOCK_N for this kernel
+(64 -> 32, 128 -> 64) to keep the per-head kernel's footprint; the static check that
+forbids rank-3 intermediates has a stated exemption for this bounded case. The grid
+shrinks by `n_rep`: at batch 8 that is 64 programs on 40 SMs, which is the risk. Engine
+flag `decode_attention="gqa"` (default stays `"per_head"`), A/B setting `decode_kernel`,
+sweep `paged_decode_regime_sweep.py --kernel both` with a best-config ratio table.
+
+**What decides.** The sweep's `gqa/per_head` ratio at (batch 4-8, 512-1024 tokens) and
+the engine A/B's `decode_step_p50_ms`. If the kernel wins in isolation but the step does
+not move, the decode step is not attention-bound at this operating point and the next
+lever is elsewhere (per-layer launch count inside the graph, or the lm_head GEMM). If
+neither moves, the L2 already absorbed the double read and the item is closed.

@@ -70,6 +70,12 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("prefill_eager", {"prefill_cuda_graphs": False}),
         ("prefill_graphed", {"prefill_cuda_graphs": True}),
     ],
+    # Decode attention kernel: per query head (baseline) vs the K/V tile shared across a
+    # GQA group. Same math, different reduction tiling, so drift is possible.
+    "decode_kernel": [
+        ("per_head", {"decode_attention": "per_head"}),
+        ("gqa_shared", {"decode_attention": "gqa"}),
+    ],
     # One forward per prefill-carrying step (decode rows and chunk rows packed into one
     # token row) against the decode forward followed by the prefill forward. Same kernels
     # either way; only the GEMM shapes differ, so late greedy drift is possible and the
@@ -178,7 +184,8 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
 # with stock Transformers for the first `--min-identical-tokens` of every prompt, which a
 # wrong kernel fails immediately and a rounding difference does not.
 TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rmsnorm",
-                        "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step"}
+                        "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step",
+                        "decode_kernel"}
 
 
 def drift_expected(setting: str) -> bool:

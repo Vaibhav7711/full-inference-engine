@@ -45,7 +45,7 @@ def capture_fused_step_graph(
         raise ValueError("fused step graph capture requires a CUDA engine")
     if not 0 < decode_rows <= engine.max_active or not 0 < prefill_rows <= engine.max_active:
         raise ValueError("row counts must be within the engine's active-batch limit")
-    if block_n not in {64, 128} or num_warps not in {4, 8}:
+    if block_n not in {16, 32, 64, 128} or num_warps not in {2, 4, 8}:
         raise ValueError("unsupported paged decode graph kernel regime")
 
     width = engine.prefill_chunk_size

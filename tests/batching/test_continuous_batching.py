@@ -440,6 +440,23 @@ def test_fused_step_runs_decode_and_prefill_in_one_forward(graphs):
 
 @cuda
 @requires_cuda
+@pytest.mark.parametrize("graphs", [None, (2, 4)], ids=["eager", "graphed"])
+def test_gqa_shared_decode_kernel_matches_reference(graphs):
+    """The shared-KV decode kernel, eager and under graphs, through the full loop."""
+    prompts = _staggered_prompts()
+    max_new = 12
+    model, tok = _load()
+    refs = [_reference_greedy(tok, p, max_new) for p in prompts]
+    eng = _fused_engine(model, tok, decode_attention="gqa", cuda_graph_batch_sizes=graphs)
+    outs = eng.generate(prompts, max_new_tokens=max_new)
+    for prompt, out, ref in zip(prompts, outs, refs):
+        assert out == ref, f"gqa decode diverged from stock on {prompt!r}"
+    if graphs:
+        assert eng._decode_graphs and all(key[1] in (32, 64) for key in eng._decode_graphs)
+
+
+@cuda
+@requires_cuda
 def test_fused_step_survives_preemption():
     """Prefill capacity acquired after the decode rows may evict one of them; the fused
     forward must then run without that row and every request must still finish."""

@@ -77,6 +77,7 @@ Isolation tiers:
 | D13 | Fixed-width CUDA-graph bucket (16) | `2687241` | 37.2 → 9.7 ms/step (3.85x); 962 tok/s @16 | T | `cuda_graph_batch_sizes=None` vs `(16,)` |
 | D14 | Padded power-of-two graph buckets | `5086c14` | 3.4–4.1x at occupancies 1–16 | T | `cuda_graph_batch_sizes=(16,)` vs `(2,4,8,16)` |
 | D15 | Batched token transfer (`.tolist()`) | Phase 15 | host transfer 0.206 → 0.022 ms @16 (9.35x); e2e neutral | L | `token_transfer_ab.py` (isolated); ladder for e2e |
+| D18 | Decode attention, K/V tile shared across the GQA group (`decode_attention="gqa"`) | Phase 2c | unmeasured; halves KV traffic, halves the grid | T | `paged_decode_regime_sweep.py --kernel both`; `ab.py --setting decode_kernel --cuda-graphs` |
 | D16 | Decode metadata staging: slice copy per row | `5a9514c` | 3.4 → 0.18 ms/step host stage @16×64 blocks (off-GPU) | L | ladder `55ebb7a` → `5a9514c` (with D17, P6) |
 | D17 | Copy-on-write tail via one `_foreach_copy_` | `5a9514c` | 56 launches → 1 on first decode step after exact hit | L | ladder `55ebb7a` → `5a9514c` (with D16) |
 

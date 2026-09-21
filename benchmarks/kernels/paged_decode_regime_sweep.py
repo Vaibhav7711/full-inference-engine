@@ -60,6 +60,9 @@ def main() -> None:
     parser.add_argument("--seq-lens", default="64,128,256,512,1024,2048")
     parser.add_argument("--batches", default="1,4,8,16")
     parser.add_argument("--configs", default="16x2,32x2,32x4,64x4,64x8,128x4,128x8")
+    parser.add_argument("--kernel", default="per_head", choices=["per_head", "gqa", "both"],
+                        help="per_head: one program per query head (baseline); gqa: the K/V "
+                             "tile shared across a GQA group; both: interleaved rows")
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=30)
@@ -69,36 +72,56 @@ def main() -> None:
         raise SystemExit("Requires CUDA")
 
     from engine.kernels.paged_decode_batched import paged_decode_batched
+    from engine.kernels.paged_decode_gqa import paged_decode_gqa
+
+    kernels = {"per_head": paged_decode_batched, "gqa": paged_decode_gqa}
+    names = list(kernels) if args.kernel == "both" else [args.kernel]
 
     seq_lens = _parse_ints(args.seq_lens)
     batches = _parse_ints(args.batches)
     configs = _parse_configs(args.configs)
     result = {"config": vars(args), "rows": []}
     print("\nPaged decode regime sweep (Qwen3-0.6B geometry: H=16, KVH=8, D=128)")
-    print(f"{'context':>8} {'batch':>6} {'tile':>6} {'warps':>6} {'median ms':>11} {'tok/s':>12}")
+    print(f"{'context':>8} {'batch':>6} {'kernel':>9} {'tile':>6} {'warps':>6} {'median ms':>11} {'tok/s':>12}")
     for seq_len in seq_lens:
         for batch in batches:
             tensors = _build_pool(batch, seq_len, block_size=args.block_size, kv_heads=8, head_dim=128)
             for block_n, num_warps in configs:
-                def run(block_n=block_n, num_warps=num_warps):
-                    return paged_decode_batched(*tensors, block_n=block_n, num_warps=num_warps)
+              for name in names:
+                kernel = kernels[name]
+                def run(kernel=kernel, block_n=block_n, num_warps=num_warps):
+                    return kernel(*tensors, block_n=block_n, num_warps=num_warps)
                 try:
                     elapsed_ms = _time(run, warmup=args.warmup, repeats=args.repeats)
                 except Exception as error:
-                    row = {"seq_len": seq_len, "batch": batch, "block_n": block_n,
+                    row = {"seq_len": seq_len, "batch": batch, "kernel": name, "block_n": block_n,
                            "num_warps": num_warps, "error": repr(error)}
                     result["rows"].append(row)
-                    print(f"{seq_len:>8} {batch:>6} {block_n:>6} {num_warps:>6} {'ERROR':>11}")
+                    print(f"{seq_len:>8} {batch:>6} {name:>9} {block_n:>6} {num_warps:>6} {'ERROR':>11}")
                     continue
-                row = {"seq_len": seq_len, "batch": batch, "block_n": block_n,
+                row = {"seq_len": seq_len, "batch": batch, "kernel": name, "block_n": block_n,
                        "num_warps": num_warps, "median_ms": elapsed_ms,
                        "tokens_per_second": batch / (elapsed_ms / 1000)}
                 result["rows"].append(row)
-                print(f"{seq_len:>8} {batch:>6} {block_n:>6} {num_warps:>6} "
+                print(f"{seq_len:>8} {batch:>6} {name:>9} {block_n:>6} {num_warps:>6} "
                       f"{elapsed_ms:>11.4f} {row['tokens_per_second']:>12.0f}")
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as handle:
         json.dump(result, handle, indent=2)
+    if len(names) > 1:
+        # Best config per kernel at each operating point, and the ratio: the number the
+        # engine A/B has to reproduce, or explain.
+        print(f"\n{'context':>8} {'batch':>6} {'per_head best':>16} {'gqa best':>16} {'gqa/per_head':>13}")
+        for seq_len in seq_lens:
+            for batch in batches:
+                best = {}
+                for row in result["rows"]:
+                    if row["seq_len"] == seq_len and row["batch"] == batch and "median_ms" in row:
+                        if row["kernel"] not in best or row["median_ms"] < best[row["kernel"]][0]:
+                            best[row["kernel"]] = (row["median_ms"], f"{row['block_n']}x{row['num_warps']}")
+                if len(best) == 2:
+                    a, b = best["per_head"], best["gqa"]
+                    print(f"{seq_len:>8} {batch:>6} {a[0]:>9.4f} {a[1]:>6} {b[0]:>9.4f} {b[1]:>6} {b[0] / a[0]:>13.2f}")
     print(f"\nSaved -> {args.output}")
 
 

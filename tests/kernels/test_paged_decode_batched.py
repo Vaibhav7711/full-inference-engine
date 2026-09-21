@@ -182,6 +182,8 @@ def test_t4_regime_selector_boundaries() -> None:
     assert select_paged_decode_config(127, 16) == (64, 4)
     assert select_paged_decode_config(128, 1) == (128, 4)
     assert select_paged_decode_config(2048, 16) == (128, 4)
+    assert select_paged_decode_config(64, 8, "gqa") == (32, 4)
+    assert select_paged_decode_config(2048, 16, "gqa") == (64, 4)
     with pytest.raises(ValueError):
         select_paged_decode_config(0, 1)
 
@@ -274,3 +276,48 @@ def test_batched_equals_separate_launches():
         assert max_diff < 5e-3, (
             f"sequence {s}: K4 batched != K2 single launch, max diff {max_diff:.4e}"
         )
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("block_n", [16, 32, 64])
+@pytest.mark.parametrize("num_q_heads,kv_heads,D", [
+    (8, 8, 128),    # REP 1
+    (16, 8, 128),   # GQA 2:1 (Qwen3-0.6B)
+    (8, 2, 64),     # GQA 4:1
+])
+def test_gqa_shared_decode_matches_per_head_kernel(block_n, num_q_heads, kv_heads, D):
+    """One program per KV head, all of its query heads: bit-close to the per-head kernel
+    and to SDPA, with an offset length and shuffled block tables."""
+    from engine.kernels.paged_decode_batched import paged_decode_batched
+    from engine.kernels.paged_decode_gqa import paged_decode_gqa
+
+    torch.manual_seed(1)
+    device, dtype, block_size = "cuda", torch.float16, 16
+    seq_lens = [1, 7, 16, 33, 64, 100, 257]
+    queries, seqs_kv = [], []
+    for n in seq_lens:
+        queries.append(torch.randn(num_q_heads, 1, D, device=device, dtype=dtype))
+        seqs_kv.append((torch.randn(kv_heads, n, D, device=device, dtype=dtype),
+                        torch.randn(kv_heads, n, D, device=device, dtype=dtype)))
+    key_pages, value_pages, block_tables, seq_lens_t = _build_shared_pool(
+        seqs_kv, block_size, kv_heads, D, device, dtype,
+    )
+    query_batched = torch.stack(queries, dim=0)
+    per_head = paged_decode_batched(query_batched, key_pages, value_pages, block_tables, seq_lens_t)
+    shared = paged_decode_gqa(query_batched, key_pages, value_pages, block_tables, seq_lens_t,
+                              block_n=block_n)
+    torch.testing.assert_close(shared, per_head, rtol=2e-3, atol=2e-3)
+
+    n_rep = num_q_heads // kv_heads
+    for s, n in enumerate(seq_lens):
+        k = seqs_kv[s][0].repeat_interleave(n_rep, dim=0)
+        v = seqs_kv[s][1].repeat_interleave(n_rep, dim=0)
+        ref = _sdpa_decode_reference(queries[s], k, v)
+        assert (shared[s] - ref).abs().max().item() < 5e-3, f"sequence {s} (len {n})"
+
+    # The engine stores pre-write lengths and asks the kernel to add one.
+    shorter = seq_lens_t - 1
+    offset = paged_decode_gqa(query_batched, key_pages, value_pages, block_tables, shorter,
+                              block_n=block_n, length_offset=1)
+    torch.testing.assert_close(offset, shared, rtol=2e-3, atol=2e-3)

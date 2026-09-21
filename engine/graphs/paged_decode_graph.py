@@ -34,7 +34,7 @@ def capture_paged_decode_graph(engine, *, batch_size: int, block_n: int, num_war
         raise ValueError("paged decode graph capture requires a CUDA engine")
     if not 0 < batch_size <= engine.max_active:
         raise ValueError("batch_size must be within the engine's active-batch limit")
-    if block_n not in {64, 128} or num_warps not in {4, 8}:
+    if block_n not in {16, 32, 64, 128} or num_warps not in {2, 4, 8}:
         raise ValueError("unsupported paged decode graph kernel regime")
 
     from engine.batching.continuous_batching import _BatchContext, _clear_batch_ctx, _set_batch_ctx
@@ -48,6 +48,7 @@ def capture_paged_decode_graph(engine, *, batch_size: int, block_n: int, num_war
         seq_lens=lengths, block_size=engine.block_size, decode_block_n=block_n,
         decode_num_warps=num_warps, key_scale_pool=engine.key_scale_pool,
         value_scale_pool=engine.value_scale_pool,
+        decode_kernel=getattr(engine, "decode_attention", "per_head"),
     )
     engine.model.config._attn_implementation = engine.ATTN_NAME
     if hasattr(engine.model.config, "_attn_implementation_internal"):

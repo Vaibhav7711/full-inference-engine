@@ -40,7 +40,8 @@ from engine.kernels.kv_write import write_decode_kv
 from engine.kernels.paged_decode_batched import (
     paged_decode_batched,
 )
-from engine.kernels.paged_decode_config import select_paged_decode_config
+from engine.kernels.paged_decode_config import DECODE_ATTENTION_KINDS, select_paged_decode_config
+from engine.kernels.paged_decode_gqa import paged_decode_gqa
 from engine.kernels.paged_prefill import paged_prefill
 from engine.kernels.sdpa_prefill import sdpa_paged_prefill
 from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
@@ -85,6 +86,9 @@ class _BatchContext:
     decode_num_warps: int
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
+    # "per_head": one program per (row, query head). "gqa": one per (row, KV head), the
+    # K/V tile read once for the whole group. See `paged_decode_gqa`.
+    decode_kernel: str = "per_head"
 
 
 _BATCH_CTX: Optional[_BatchContext] = None
@@ -177,7 +181,8 @@ def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, sca
     value_pool = ctx.value_pool[layer_idx]
     if ctx.key_scale_pool is None:
         write_decode_kv(key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens)
-        return paged_decode_batched(
+        attend = paged_decode_gqa if ctx.decode_kernel == "gqa" else paged_decode_batched
+        return attend(
             query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
             scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
             length_offset=1,
@@ -339,6 +344,7 @@ class ContinuousBatchingEngine:
                  num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
                  prefill_attention: str | None = None,
+                 decode_attention: str = "per_head",
                  tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
                  prefill_block_n: int | None = None,
@@ -385,6 +391,13 @@ class ContinuousBatchingEngine:
             raise ValueError(f"prefill_attention must be one of {PREFILL_ATTENTION_KINDS}")
         self.prefill_attention = prefill_attention
         self.tiled_prefill = prefill_attention == "tiled"
+        if decode_attention not in DECODE_ATTENTION_KINDS:
+            raise ValueError(f"decode_attention must be one of {DECODE_ATTENTION_KINDS}")
+        if decode_attention == "gqa" and kv_cache_dtype != "fp16":
+            raise ValueError("the GQA-shared decode kernel has no INT8 variant")
+        # Decode attention kernel: the per-head kernel is the measured baseline; "gqa"
+        # reads each K/V tile once per group instead of once per query head.
+        self.decode_attention = decode_attention
         self.prefill_block_m = prefill_block_m
         self.prefill_block_n = prefill_block_n
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
@@ -1298,6 +1311,7 @@ class ContinuousBatchingEngine:
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
             decode_block_n=block_n, decode_num_warps=num_warps,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
+            decode_kernel=self.decode_attention,
         ))
         self._set_prefill_context(prefill_rows, total_len)
         _set_fused_ctx(_FusedContext(decode_rows, prefill_rows, width))
@@ -1384,7 +1398,9 @@ class ContinuousBatchingEngine:
         self.last_step_prefill_path = "fused"
         decode_count, prefill_count = len(rows), len(plans)
         max_sequence_length = max(r.allocation.sequence_length + 1 for r in rows)
-        block_n, num_warps = select_paged_decode_config(max_sequence_length, decode_count)
+        block_n, num_warps = select_paged_decode_config(
+            max_sequence_length, decode_count, self.decode_attention,
+        )
         decode_bucket = self._graph_bucket(decode_count)
         prefill_bucket = self._prefill_row_bucket(prefill_count, self.FUSED_PREFILL_ROW_LIMIT)
         total_len = max(request.prefilled_token_count + n for request, n in plans)
@@ -1470,7 +1486,7 @@ class ContinuousBatchingEngine:
             request.allocation.sequence_length + 1 for request in active
         )
         decode_block_n, decode_num_warps = select_paged_decode_config(
-            max_sequence_length, len(active)
+            max_sequence_length, len(active), self.decode_attention,
         )
         graph_bucket_size = next(
             (
@@ -1491,6 +1507,7 @@ class ContinuousBatchingEngine:
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
             decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
+            decode_kernel=self.decode_attention,
         )
         graph_key = (graph_bucket_size, decode_block_n, decode_num_warps)
         use_graph = graph_bucket_size is not None
@@ -1620,6 +1637,10 @@ class ContinuousBatchingEngine:
             # ITL p99 doubled (64.7 -> 126.9 ms) while p50 fell 17%. A capture is two
             # eager forwards plus syncs in a live step; it belongs in warmup or nowhere.
             if self.fused_step:
+                regimes = sorted({
+                    select_paged_decode_config(length, 1, self.decode_attention)
+                    for length in (64, 128)
+                })
                 fused_rows = [
                     rows for rows in (1,) + self.cuda_graph_batch_sizes
                     if self._prefill_row_bucket(rows, self.FUSED_PREFILL_ROW_LIMIT) == rows
@@ -1627,7 +1648,7 @@ class ContinuousBatchingEngine:
                 for decode_rows in self.cuda_graph_batch_sizes:
                     for prefill_rows in fused_rows:
                         for context_len in contexts:
-                            for block_n, num_warps in ((64, 4), (128, 4)):
+                            for block_n, num_warps in regimes:
                                 key = (decode_rows, prefill_rows, self.prefill_attention,
                                        context_len, block_n, num_warps)
                                 if key not in self._fused_graphs:
