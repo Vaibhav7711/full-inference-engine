@@ -854,3 +854,74 @@ def test_g1b_recompute_cost_is_measured_not_just_survived():
     print("\nGate 1B recompute cost:", report)
     for request in requests:
         print(" ", request.request_id, request.recompute_overhead())
+
+
+@cuda
+@requires_cuda
+def test_sampling_runs_through_the_engine_without_disturbing_greedy_rows():
+    """Sampled and greedy requests share a step; the greedy ones stay token-identical."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import GREEDY, SamplingParams
+
+    model, tok = _load()
+    prompts = ["The capital of France is", "2 + 2 =", "Water is composed of"]
+    max_new = 8
+    refs = [_reference_greedy(tok, prompt, max_new) for prompt in prompts]
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
+        prefix_cache_blocks=0, cuda_graph_batch_sizes=(2, 4),
+    )
+    settings = [GREEDY, SamplingParams(temperature=0.9, top_p=0.95, seed=17), GREEDY]
+    outputs = eng.generate(prompts, max_new_tokens=max_new, sampling=settings)
+    assert outputs[0] == refs[0], "a greedy row changed because another row sampled"
+    assert outputs[2] == refs[2]
+    assert len(outputs[1]) == max_new
+
+
+@cuda
+@requires_cuda
+def test_seeded_sampling_is_reproducible_across_engines():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import SamplingParams
+
+    model, tok = _load()
+    prompt = "Write one sentence about paged attention:"
+    setting = SamplingParams(temperature=1.0, top_p=0.9, seed=4242)
+    outputs = []
+    for _ in range(2):
+        eng = ContinuousBatchingEngine(
+            model, tok, "cuda", num_blocks=512, block_size=16, max_active=2,
+            prefix_cache_blocks=0,
+        )
+        outputs.append(eng.generate([prompt], max_new_tokens=12, sampling=setting)[0])
+    assert outputs[0] == outputs[1]
+
+
+@cuda
+@requires_cuda
+def test_stop_token_ids_and_logprobs_are_honoured():
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import GenerationRequest, RequestState, SamplingParams
+
+    model, tok = _load()
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=512, block_size=16, max_active=2,
+        prefix_cache_blocks=0,
+    )
+    ids = tok("The capital of France is", return_tensors="pt").input_ids[0].tolist()
+    # Stop on whatever greedy decoding would produce second, so STOP is reachable.
+    reference = eng.generate(["The capital of France is"], max_new_tokens=4)[0]
+    eng.reset()
+    request = GenerationRequest(
+        "stopper", prompt_token_count=len(ids), max_new_tokens=8, prompt_token_ids=ids,
+        sampling=SamplingParams(stop_token_ids=frozenset({reference[1]}), logprobs=3),
+    )
+    eng.submit(request)
+    while eng.has_unfinished_requests:
+        eng.step()
+    assert request.state is RequestState.FINISHED
+    assert request.finish_reason == "STOP"
+    assert request.output_token_ids == reference[:2]
+    assert len(request.output_logprobs) == len(request.output_token_ids)
+    for entries in request.output_logprobs:
+        assert entries and entries[0][1] <= 0.0

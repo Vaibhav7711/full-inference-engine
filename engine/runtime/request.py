@@ -7,6 +7,7 @@ from enum import StrEnum
 from time import perf_counter_ns
 
 from engine.cache import KVBlockAllocation
+from engine.runtime.sampling import GREEDY, SamplingParams
 
 
 class RequestState(StrEnum):
@@ -47,6 +48,12 @@ class GenerationRequest:
     prompt_token_ids: list[int] = field(default_factory=list)
     allocation: KVBlockAllocation | None = None
     output_token_ids: list[int] = field(default_factory=list)
+    # How this request's logits become tokens. The default is greedy decoding, which is
+    # what every benchmark and the token-identity gate assume.
+    sampling: SamplingParams = GREEDY
+    # Per generated token, [(token_id, logprob), ...] when the request asked for
+    # logprobs; empty otherwise. Positionally aligned with `output_token_ids`.
+    output_logprobs: list[list[tuple[int, float]]] = field(default_factory=list)
     next_token_id: int | None = None
     finish_reason: str | None = None
     prefilled_token_count: int = 0

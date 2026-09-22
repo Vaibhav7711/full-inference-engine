@@ -26,11 +26,11 @@ class PagedPrefillGraph:
     rows: int
     attention: str
     context_len: int
-    next_tokens: torch.Tensor
+    logits: torch.Tensor    # [rows, vocab], a view of the engine's shared buffer
 
     def replay(self) -> torch.Tensor:
         self.graph.replay()
-        return self.next_tokens
+        return self.logits
 
 
 def capture_paged_prefill_graph(
@@ -67,8 +67,8 @@ def capture_paged_prefill_graph(
         engine._set_prefill_context(rows, total_len)
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
-            next_tokens = engine._prefill_forward(rows, width)
+            logits = engine._prefill_forward(rows, width)
     finally:
         _clear_prefill_ctx()
     torch.cuda.synchronize()
-    return PagedPrefillGraph(graph, rows, engine.prefill_attention, context_len, next_tokens)
+    return PagedPrefillGraph(graph, rows, engine.prefill_attention, context_len, logits)

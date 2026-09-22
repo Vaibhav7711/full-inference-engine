@@ -18,16 +18,18 @@ from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 
 _DEMO_UI = Path(__file__).with_name("static") / "index.html"
 
+from engine.metrics.prometheus import ServerMetrics
 from engine.runtime import RequestState
 from engine.server.continuous import (
     ContinuousBatchingService, RequestHandle, ServerShutdown, SubmitError,
 )
+from engine.server.openai import install_openai_routes
 
 
 class GenerateRequest(BaseModel):
@@ -93,12 +95,14 @@ def create_app(
     max_pending_requests: int = 256, max_prompt_tokens: int = 4096,
     request_timeout_s: float = 120.0, drain_timeout_s: float = 30.0,
     engine_factory: Callable[[], object] | None = None,
+    metrics: ServerMetrics | None = None,
 ) -> FastAPI:
     if min(max_active, num_blocks, max_pending_requests, max_prompt_tokens) <= 0:
         raise ValueError("server capacity limits must be positive")
     if request_timeout_s <= 0 or drain_timeout_s < 0:
         raise ValueError("request_timeout_s must be positive and drain_timeout_s non-negative")
     service: ContinuousBatchingService | None = None
+    exporter = metrics if metrics is not None else ServerMetrics()
 
     def build_engine():
         if engine_factory is not None:
@@ -112,7 +116,9 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         nonlocal service
         engine = await asyncio.to_thread(build_engine)
-        service = ContinuousBatchingService(engine, max_pending_submissions=max_pending_requests)
+        service = ContinuousBatchingService(
+            engine, max_pending_submissions=max_pending_requests, metrics=exporter,
+        )
         service.start()
         try:
             yield
@@ -127,6 +133,12 @@ def create_app(
     @app.get("/", include_in_schema=False)
     async def demo_ui() -> FileResponse:
         return FileResponse(_DEMO_UI)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics() -> Response:
+        # Scraped while the worker generates; `render` only reads the exporter's own
+        # copies, never live scheduler state.
+        return Response(content=exporter.render(), media_type="text/plain; version=0.0.4")
 
     def require_service() -> ContinuousBatchingService:
         if service is None:
@@ -312,4 +324,10 @@ def create_app(
             headers={"x-request-id": handle.request.request_id},
         )
 
+    # The OpenAI-compatible surface shares this app's service, limits and timeouts; it
+    # is a translation layer over the same submissions the native routes make.
+    install_openai_routes(
+        app, require_service=require_service, model_name=model_name,
+        max_prompt_tokens=max_prompt_tokens, request_timeout_s=request_timeout_s,
+    )
     return app

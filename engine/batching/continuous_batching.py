@@ -66,7 +66,9 @@ def _prefill_context_bucket(total_len: int, floor: int = 256) -> int:
     while bucket < total_len:
         bucket *= 2
     return bucket
+from engine.batching.sampler import BatchedSampler
 from engine.runtime import GenerationRequest, RequestState
+from engine.runtime.sampling import GREEDY, SamplingParams
 from engine.scheduler import FCFSScheduler
 
 
@@ -359,7 +361,8 @@ class ContinuousBatchingEngine:
                  fuse_mlp_gate_up: bool = False,
                  triton_rmsnorm: bool = True,
                  triton_rope: bool = True,
-                 triton_swiglu: bool = True):
+                 triton_swiglu: bool = True,
+                 sampling_seed: int | None = None):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
@@ -483,6 +486,12 @@ class ContinuousBatchingEngine:
         else:
             self.triton_swiglu_modules = 0
 
+        # One sampler for the engine. Requests that ask for nothing sample greedily,
+        # which is the argmax path every recorded benchmark measured; `sampling_seed`
+        # seeds the shared generator for requests that sample without their own seed.
+        self.sampler = BatchedSampler(device, generator_seed=sampling_seed)
+        self.vocab_size = int(getattr(cfg, "vocab_size", 0))
+
         self.eos_ids = set()
         ce = model.generation_config.eos_token_id
         if isinstance(ce, int):
@@ -541,6 +550,18 @@ class ContinuousBatchingEngine:
         self._prefill_device_block_tables = torch.empty(
             (max_active, num_blocks), dtype=torch.int32, device=device
         )
+        # Captured prefill and fused graphs end in the vocabulary projection, and their
+        # output has to live at a fixed address for replay. A private `[rows, vocab]`
+        # tensor per graph would be ~5 MB each and there are dozens of shapes, so every
+        # graph copies into this one buffer instead. Decode graphs keep the model's own
+        # logits tensor, of which there are only a handful.
+        # A fused step needs one row per decode row plus one per chunk row, and both
+        # are bounded by `max_active`.
+        self._logits_buffer = torch.empty(
+            (2 * max_active, self.vocab_size), dtype=next(model.parameters()).dtype,
+            device=device,
+        ) if self.vocab_size else None
+        self._live_row_index: dict[tuple[int, int, int], torch.Tensor] = {}
         self._prefill_graphs = {}
         self._fused_graphs = {}
         self._prefill_graph_pool = None
@@ -857,8 +878,8 @@ class ContinuousBatchingEngine:
         self._publish_prefix(request, request.next_token_id)
         self.scheduler.mark_decoding(request.request_id)
         request.append_token(request.next_token_id)
-        if request.next_token_id in self.eos_ids or len(request.output_token_ids) >= request.max_new_tokens:
-            reason = "EOS" if request.next_token_id in self.eos_ids else "LENGTH"
+        reason = self._finish_reason(request, request.next_token_id)
+        if reason is not None:
             self.scheduler.finish(request.request_id, reason=reason)
 
     # ------------------------------------------------------------------
@@ -943,7 +964,7 @@ class ContinuousBatchingEngine:
         # last hidden states alone.
         rows = torch.arange(len(requests), device=self.device)
         last_positions = seq_lens.to(dtype=torch.long) - 1
-        next_tokens = self._lm_head()(hidden[rows, last_positions]).argmax(dim=-1).tolist()
+        next_tokens = self._sample(self._lm_head()(hidden[rows, last_positions]), requests)
         self._gpu_elapsed(timer, "prefill_gpu_ms")
 
         for request, token in zip(requests, next_tokens):
@@ -1022,11 +1043,11 @@ class ContinuousBatchingEngine:
         timer = self._gpu_timer()
         try:
             if use_graph:
-                next_tokens = graph.replay()
+                logits = graph.replay()
             else:
-                next_tokens = self._prefill_forward(row_count, width)
+                logits = self._prefill_forward(row_count, width)
             # One device-to-host transfer for the batch.
-            tokens = next_tokens[:count].tolist()
+            tokens = self._sample(logits[:count], [request for request, _ in plans])
         finally:
             _clear_prefill_ctx()
 
@@ -1120,10 +1141,12 @@ class ContinuousBatchingEngine:
         ))
 
     def _prefill_forward(self, row_count: int, width: int) -> torch.Tensor:
-        """One chunked prefill forward over the staged buffers -> next token per row.
+        """One chunked prefill forward over the staged buffers -> `[rows, vocab]` logits.
 
         The vocabulary projection runs on each row's last chunk token only; a row that
-        does not finish its prompt this step simply discards the result.
+        does not finish its prompt this step simply discards the result. Logits rather
+        than tokens, because sampling is per request and cannot live inside a graph
+        captured for a shape rather than for a set of requests.
         """
         input_ids = self._prefill_device_input_ids[:row_count, :width]
         position_ids = self._prefill_device_position_ids[:row_count, :width]
@@ -1136,7 +1159,19 @@ class ContinuousBatchingEngine:
         ).last_hidden_state
         last = (chunk_lens.to(torch.long) - 1).clamp_(min=0)
         rows = torch.arange(row_count, device=hidden.device)
-        return self._lm_head()(hidden[rows, last]).argmax(dim=-1)
+        return self._write_logits(self._lm_head()(hidden[rows, last]))
+
+    def _write_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Copy a forward's logits into the shared buffer and return that view.
+
+        Under capture the copy is recorded, so every graph writes its result to the same
+        address and replay leaves it there for the sampler.
+        """
+        if self._logits_buffer is None:
+            return logits
+        target = self._logits_buffer[:logits.shape[0]]
+        target.copy_(logits)
+        return target
 
     def _warmup_context_buckets(self) -> list[int]:
         """Every gathered-context bucket a chunk batch can reach on this engine.
@@ -1292,14 +1327,65 @@ class ContinuousBatchingEngine:
             if request.remaining_prefill_tokens == 0:
                 self._complete_prefill(request, int(token))
 
+    def _sample(self, logits, requests: list[GenerationRequest]) -> list[int]:
+        """One token per row under each request's own sampling parameters.
+
+        `logits` is `[len(requests), vocab]`. Penalty contexts are assembled only when a
+        request actually asks for penalties, so the common greedy batch costs one argmax
+        and one device-to-host copy, exactly as before sampling existed.
+        """
+        params = [request.sampling for request in requests]
+        contexts = None
+        if any(setting.has_penalties for setting in params):
+            contexts = [
+                (request.prompt_token_ids + request.output_token_ids)
+                if request.sampling.penalize_prompt else request.output_token_ids
+                for request in requests
+            ]
+        result = self.sampler.sample(logits, params, contexts)
+        for row, entries in result.logprobs.items():
+            requests[row].output_logprobs.append(entries)
+        return result.token_ids
+
+    def _finish_reason(self, request: GenerationRequest, token: int) -> str | None:
+        """Why this token ends the request, or None if it does not.
+
+        Per-request stop tokens come first: a caller that asked to stop on a token gets
+        `STOP` even if that token is also the model's EOS. `ignore_eos` lets a benchmark
+        or a continuation request run to its length bound.
+        """
+        sampling = request.sampling
+        if token in sampling.stop_token_ids:
+            return "STOP"
+        if not sampling.ignore_eos and token in self.eos_ids:
+            return "EOS"
+        if len(request.output_token_ids) >= request.max_new_tokens:
+            return "LENGTH"
+        return None
+
+    def _live_rows(self, decode_count: int, decode_rows: int, prefill_count: int):
+        """Index of the live rows inside a fused step's `[decode_rows + prefill_rows]`
+        logits buffer: the real decode rows, then the real chunk rows, skipping the
+        padding the graph's shape requires. Cached because it is a host-to-device copy
+        on the step's critical path."""
+        key = (decode_count, decode_rows, prefill_count)
+        index = self._live_row_index.get(key)
+        if index is None:
+            rows = list(range(decode_count)) + [
+                decode_rows + row for row in range(prefill_count)
+            ]
+            index = torch.tensor(rows, dtype=torch.long, device=self.device)
+            self._live_row_index[key] = index
+        return index
+
     def _commit_decode(self, active: list[GenerationRequest], tokens: list[int]) -> None:
         for s, token in zip(active, tokens):
             self.block_manager.append_tokens(s.request_id)
             tok = int(token)
             s.next_token_id = tok
             s.append_token(tok)
-            if tok in self.eos_ids or len(s.output_token_ids) >= s.max_new_tokens:
-                reason = "EOS" if tok in self.eos_ids else "LENGTH"
+            reason = self._finish_reason(s, tok)
+            if reason is not None:
                 self.scheduler.finish(s.request_id, reason=reason)
 
     def _set_fused_contexts(
@@ -1323,12 +1409,12 @@ class ContinuousBatchingEngine:
         _clear_batch_ctx()
 
     def _fused_forward(self, decode_rows: int, prefill_rows: int, width: int) -> torch.Tensor:
-        """One packed forward over the staged decode and prefill buffers -> next tokens.
+        """One packed forward over the staged decode and prefill buffers -> logits.
 
-        Returns `[decode_rows + prefill_rows]` greedy tokens: the decode rows' next
-        tokens, then each chunk row's prediction at its last valid token (discarded by
-        the caller for rows whose prompt is not finished). The vocabulary projection runs
-        on exactly those rows.
+        Returns `[decode_rows + prefill_rows, vocab]`: the decode rows first, then each
+        chunk row at its last valid token (the caller discards rows whose prompt is not
+        finished). The vocabulary projection runs on exactly those rows, and the result
+        lands in the shared logits buffer so a captured graph has a fixed output address.
         """
         decode_ids = self._device_input_ids[:decode_rows].reshape(1, decode_rows)
         decode_positions = self._device_position_ids[:decode_rows].reshape(1, decode_rows)
@@ -1346,7 +1432,7 @@ class ContinuousBatchingEngine:
             + (chunk_lens.to(torch.long) - 1).clamp_(min=0)
         )
         picked = torch.cat((hidden[:decode_rows], hidden[last]), dim=0)
-        return self._lm_head()(picked).argmax(dim=-1)
+        return self._write_logits(self._lm_head()(picked))
 
     def _capture_fused_graph(self, key: tuple):
         """Capture one fused step graph, or record that this attention kind cannot be."""
@@ -1438,18 +1524,23 @@ class ContinuousBatchingEngine:
         )
         try:
             if use_graph:
-                next_tokens = graph.replay()
+                logits = graph.replay()
             else:
-                next_tokens = self._fused_forward(decode_rows, prefill_rows, width)
-            # One device-to-host transfer for decode and prefill together.
+                logits = self._fused_forward(decode_rows, prefill_rows, width)
+            # One device-to-host transfer for decode and prefill together: the padded
+            # rows a graph's shape requires are dropped on the device first.
             sync_started = perf_counter() if self.instrument else None
-            tokens = next_tokens.tolist()
+            live = logits.index_select(
+                0, self._live_rows(decode_count, decode_rows, prefill_count),
+            )
+            tokens = self._sample(live, rows + [request for request, _ in plans])
             self._host_elapsed(sync_started, "sync_ms")
         finally:
             self._clear_fused_contexts()
         self._gpu_elapsed(timer, "fused_gpu_ms")
+        # `tokens` is already compacted to the live rows: decode rows, then chunk rows.
         self._commit_decode(rows, tokens[:decode_count])
-        self._commit_prefill(plans, tokens[decode_rows:decode_rows + prefill_count])
+        self._commit_prefill(plans, tokens[decode_count:decode_count + prefill_count])
         return True
 
     # ------------------------------------------------------------------
@@ -1536,7 +1627,7 @@ class ContinuousBatchingEngine:
         # One device-to-host synchronization for the complete batch. Calling `.item()`
         # per row serializes N scalar copies and N Python-visible CUDA waits.
         sync_started = perf_counter() if self.instrument else None
-        next_tokens = logits[:len(active), -1, :].argmax(dim=-1).tolist()
+        next_tokens = self._sample(logits[:len(active), -1, :], active)
         self._host_elapsed(sync_started, "sync_ms")
         self._gpu_elapsed(timer, "decode_gpu_ms")
         self._commit_decode(active, next_tokens)
@@ -1545,16 +1636,27 @@ class ContinuousBatchingEngine:
     # D3: the continuous loop
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def generate(self, prompts: list[str], max_new_tokens: int = 32) -> list[list[int]]:
-        """Run all prompts through continuous batching. Returns output token ids per prompt."""
+    def generate(
+        self, prompts: list[str], max_new_tokens: int = 32,
+        sampling: SamplingParams | list[SamplingParams] | None = None,
+    ) -> list[list[int]]:
+        """Run all prompts through continuous batching. Returns output token ids per prompt.
+
+        `sampling` is one setting for every prompt, or one per prompt; the default is
+        greedy, which is what the correctness gates compare against stock Transformers.
+        """
+        if isinstance(sampling, list) and len(sampling) != len(prompts):
+            raise ValueError("one SamplingParams per prompt is required")
         requests = []
         for i, p in enumerate(prompts):
             ids = self.tokenizer(p, return_tensors="pt").input_ids[0].tolist()
+            setting = sampling[i] if isinstance(sampling, list) else sampling
             request = GenerationRequest(
                 request_id=f"seq{i}",
                 prompt_token_count=len(ids),
                 max_new_tokens=max_new_tokens,
                 prompt_token_ids=ids,
+                sampling=setting or GREEDY,
             )
             requests.append(request)
             self.submit(request)

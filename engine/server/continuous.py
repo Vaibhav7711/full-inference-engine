@@ -18,7 +18,8 @@ from time import monotonic
 from typing import Callable, Sequence
 from uuid import uuid4
 
-from engine.runtime import GenerationRequest
+from engine.metrics.prometheus import ServerMetrics
+from engine.runtime import GREEDY, GenerationRequest, SamplingParams
 
 
 class ServerShutdown(RuntimeError):
@@ -98,10 +99,16 @@ class ContinuousBatchingService:
     immutable token IDs to the bounded inbox and observe the request lifecycle.
     """
 
-    def __init__(self, engine, *, max_pending_submissions: int = 256) -> None:
+    def __init__(
+        self, engine, *, max_pending_submissions: int = 256,
+        metrics: ServerMetrics | None = None,
+    ) -> None:
         if max_pending_submissions <= 0:
             raise ValueError("max_pending_submissions must be positive")
         self.engine = engine
+        # Metrics are optional: an embedded engine or a test does not need an exporter,
+        # and nothing on the serving path may depend on one existing.
+        self.metrics = metrics
         self._inbox: Queue[RequestHandle] = Queue(maxsize=max_pending_submissions)
         self._cancellations: Queue[tuple[str, str]] = Queue()
         self._active: dict[str, RequestHandle] = {}
@@ -188,7 +195,10 @@ class ContinuousBatchingService:
         return self._fatal_error
 
     # ------------------------------------------------------------------ submission
-    def submit(self, prompt_token_ids: Sequence[int], max_new_tokens: int) -> RequestHandle:
+    def submit(
+        self, prompt_token_ids: Sequence[int], max_new_tokens: int,
+        sampling: SamplingParams | None = None,
+    ) -> RequestHandle:
         if self._fatal_error is not None:
             raise SubmitError("engine worker is unavailable", status_code=503)
         if self._thread is not None and not self._thread.is_alive():
@@ -202,6 +212,7 @@ class ContinuousBatchingService:
         request = GenerationRequest(
             request_id=uuid4().hex, prompt_token_count=len(prompt_token_ids),
             max_new_tokens=max_new_tokens, prompt_token_ids=list(prompt_token_ids),
+            sampling=sampling or GREEDY,
         )
         handle = RequestHandle(request)
         try:
@@ -230,6 +241,7 @@ class ContinuousBatchingService:
                 # already carries its terminal reason; the API maps it to a status.
                 with self._lock:
                     self._failed_count += 1
+                self._record(handle.request, "rejected")
                 handle._complete(RuntimeError(handle.request.finish_reason or "request rejected"))
                 continue
             with self._lock:
@@ -250,6 +262,7 @@ class ContinuousBatchingService:
             with self._lock:
                 self._active.pop(request_id, None)
                 self._cancelled_count += 1
+            self._record(handle.request, "cancelled")
             handle._complete()
 
     def _publish_completed(self) -> None:
@@ -266,6 +279,8 @@ class ContinuousBatchingService:
                 else:
                     self._completed_count += 1
         for _, handle in completed:
+            state = handle.request.state.name
+            self._record(handle.request, "failed" if state == "FAILED" else state.lower())
             handle._complete()
 
     def _publish_engine_stats(self, *, force: bool = False) -> None:
@@ -281,6 +296,18 @@ class ContinuousBatchingService:
         with self._lock:
             self._engine_stats = dict(stats)
             self._engine_stats_at = now
+        if self.metrics is not None:
+            self.metrics.observe_engine(stats)
+
+    def _record(self, request, outcome: str) -> None:
+        """Hand one terminal request to the exporter. Worker thread only, and never
+        allowed to interrupt serving."""
+        if self.metrics is None:
+            return
+        try:
+            self.metrics.observe_request(request, outcome)
+        except Exception:
+            pass
 
     def snapshot(self) -> dict[str, object]:
         """Thread-safe service counters plus the worker's last published engine stats."""

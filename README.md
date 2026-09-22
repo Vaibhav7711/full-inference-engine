@@ -24,8 +24,11 @@ prefill, fused step, warmup at startup, per-head paged decode kernel. Retired wi
 evidence: tiled Triton prefill on sm_75 (no tensor cores from `tl.dot`), GQA-shared
 decode reads (L2 already dedups), prefix cache and INT8 KV on these workloads.
 
-Not production-ready: greedy sampling only, no OpenAI-compatible API, no Prometheus
-metrics, speculative decoding not integrated. See "Roadmap".
+Serving surface: OpenAI-compatible `/v1/completions` and `/v1/chat/completions` (with
+streaming, `usage`, logprobs, stop strings), per-request sampling (temperature, top-p,
+top-k, min-p, penalties, seeds, stop tokens), Prometheus `/metrics`, health/readiness,
+graceful drain. Not yet: speculative decoding in the batched path, quantized weights,
+multi-GPU, structured output. See "Roadmap".
 
 ## Quick start
 
@@ -36,6 +39,13 @@ python -m pytest -q -m cuda        # GPU correctness gates (downloads Qwen/Qwen3
 python scripts/check_hooks.py      # warmup captures every graph; step phases report
 uvicorn engine.server.api:create_app --factory --port 8000
 curl -N localhost:8000/generate/stream -d '{"prompt":"Explain KV caching.","max_new_tokens":64}'
+
+# or the OpenAI-compatible surface, with any OpenAI client pointed at /v1
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [{"role": "user", "content": "Explain KV caching in one sentence."}],
+  "temperature": 0.7, "top_p": 0.95, "max_tokens": 64, "stream": true}'
+curl localhost:8000/metrics
 ```
 
 Engine in a script:
@@ -98,8 +108,7 @@ scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
 
 ## Roadmap
 
-Tier 1 (serving): batched sampling (temperature/top-p/top-k, stop, logprobs),
-OpenAI-compatible `/v1/chat/completions`, Prometheus metrics.
+Tier 1 (serving): **done** - batched sampling, OpenAI-compatible routes, Prometheus metrics.
 Tier 2 (performance, next GPU is an RTX 4060 - `docs/rtx4060-plan.md`): tiled prefill
 behind the PTX gate, FlashAttention-2, split-K decode attention, weight-only INT8/INT4,
 batched speculative decoding.

@@ -29,11 +29,11 @@ class FusedStepGraph:
     context_len: int
     block_n: int
     num_warps: int
-    next_tokens: torch.Tensor    # [decode_rows + prefill_rows]
+    logits: torch.Tensor    # [decode_rows + prefill_rows, vocab], the engine's shared buffer
 
     def replay(self) -> torch.Tensor:
         self.graph.replay()
-        return self.next_tokens
+        return self.logits
 
 
 def capture_fused_step_graph(
@@ -70,11 +70,11 @@ def capture_fused_step_graph(
         set_contexts()
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
-            next_tokens = engine._fused_forward(decode_rows, prefill_rows, width)
+            logits = engine._fused_forward(decode_rows, prefill_rows, width)
     finally:
         engine._clear_fused_contexts()
     torch.cuda.synchronize()
     return FusedStepGraph(
         graph, decode_rows, prefill_rows, engine.prefill_attention, context_len,
-        block_n, num_warps, next_tokens,
+        block_n, num_warps, logits,
     )

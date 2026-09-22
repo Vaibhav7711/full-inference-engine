@@ -82,6 +82,8 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `batching/static.py` | baseline | Stage-9 fixed-membership batching (prefill all, then decode all, no admission mid-run). The "no continuous batching" comparison. |
 | `batching/batched_speculative.py` | parked | N sequences speculating together in a padded batch; not wired to the scheduler. |
 | `scheduler/scheduler.py` | live | `FCFSScheduler`: `waiting` deque, `active` dict, `submit`, `admit_available` (capacity check incl. prefix-cache hits), `plan_prefill` (round-robin chunks under a token budget), `preempt` (LIFO victim, requeue in arrival order), `cancel`, `finish/fail`, progress epoch. |
+| `runtime/sampling.py` | live | `SamplingParams`: temperature, top-p/top-k/min-p, repetition/presence/frequency penalties, per-request seed, stop token ids, `ignore_eos`, logprobs. Defaults are exactly greedy decoding. |
+| `batching/sampler.py` | live | `BatchedSampler`: applies per-row parameters to one step's `[N, vocab]` logits as whole-batch tensor ops; an all-greedy batch short-circuits to the argmax the engine always used. Seeded rows draw from their own generator so a row's output never depends on its neighbours. |
 | `runtime/request.py` | live | `GenerationRequest` and `RequestState` (WAITING → PREFILLING → DECODING → FINISHED / CANCELLED / FAILED / REJECTED; PREFILLING/DECODING → WAITING is preemption). Holds prompt ids, `prefilled_token_count`, `allocation`, `next_token_id`, output ids, timing (`latency_report()`), recompute accounting. Transitions are validated. |
 | `cache/paging.py` | live | `KVBlockManager` + `KVBlockAllocation`: block ownership per request (`reserve`, `ensure_capacity`, `append_tokens`, `release`, `attach_prefix`, `copy_on_write_tail`). The allocator underneath is refcounted so prefix-cache blocks can be shared. |
 | `cache/prefix.py` | live (off by default) | `PrefixCache`: block-aligned radix tree + exact-match entries over the shared allocator; `lookup` returns reusable blocks, `publish` after prefill, LRU eviction with refcount awareness. |
@@ -106,6 +108,8 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `model/loader.py` | live | `load_model(name)` → fp16 on CUDA, tokenizer, `tie_output_embeddings` (transformers 5 refuses to tie when both tensors ship; we tie explicitly). |
 | `model/runner.py` | baseline | Explicit single-request prefill/decode loop with a contiguous cache - the Stage-1 reference. |
 | `server/continuous.py` | live | `ContinuousBatchingService`: one worker **thread** owns the engine; async handlers `submit()` into a bounded queue and get a `RequestHandle` with `on_accept` / `on_complete` callbacks; cancellations go through the worker; drain/stop semantics. |
+| `server/openai.py` | live | `/v1/models`, `/v1/completions`, `/v1/chat/completions` with streaming, `usage`, logprobs, stop strings, chat template. Translation only: request fields become `SamplingParams`, unsupported ones (`n>1`, `echo`, `best_of`, `logit_bias`) are refused rather than ignored. |
+| `metrics/prometheus.py` | live | `ServerMetrics`: counters, gauges and histograms in Prometheus text format (TTFT, ITL, e2e, queue time, prompt/generation tokens, KV utilization, running/waiting, in-service graph captures). No client dependency. |
 | `server/api.py` | live | FastAPI app: `POST /generate`, `POST /generate/stream` (SSE), `GET /health`, `GET /ready`; status-code mapping for every terminal state; `default_engine_factory` builds the engine and runs `warmup()` before readiness. |
 | `quantization/int8.py`, `quantization/kv_int8.py` | parked / live-off | Reference weight-only INT8 (`Int8Linear`), KV INT8 helpers. |
 | `speculative/vanilla.py`, `speculative/optimized.py` | parked | Single-sequence draft-model speculative decoding with greedy acceptance. Not integrated with batching (roadmap Tier 2 rebuilds it inside the batched step). |
@@ -186,6 +190,16 @@ capacity.
 
 ## 5. Flows
 
+### 5.0 Sampling and stop conditions
+
+Each request carries `SamplingParams`. The engine samples once per step for all rows
+together (`_sample`), so a batch of greedy requests costs exactly one argmax and one
+device-to-host copy; penalties are assembled only for rows that ask for them. Stop
+conditions are per request: `_finish_reason` checks the request's own stop token ids
+first, then EOS (unless `ignore_eos`), then the length bound. Stop *strings* are applied
+in the API layer, which has the detokenized text, and a request that hits one is
+cancelled so its KV pages are released rather than generating to its bound.
+
 ### 5.1 HTTP request to first token
 1. `POST /generate/stream` → `submit()`: tokenize (off the event loop), check
    `max_prompt_tokens` and the model context, `service.submit(token_ids, max_new)`.
@@ -233,7 +247,13 @@ decode rows (`append_tokens`, EOS/length checks) and prefill rows.
    every row at slot `seq_len` of its block table; `paged_decode_batched` attends each
    row's single query to its `seq_len + 1` keys (the `+1` is the `length_offset`, so the
    engine can stage pre-write lengths and never touch them between the two kernels).
-3. Final norm → `lm_head` → logits `[N, 1, vocab]` → `argmax` → one `.tolist()`.
+3. Final norm → `lm_head` → logits `[N, 1, vocab]` → `BatchedSampler` (argmax when every
+   row is greedy, which is the default) → one `.tolist()`.
+
+Prefill and fused forwards end the same way, except that their logits are copied into a
+single shared `[2*max_active, vocab]` buffer (`_write_logits`) before sampling: a captured
+graph needs a fixed output address, and a private vocabulary-sized tensor per captured
+shape would cost hundreds of megabytes across the dozens of shapes.
 
 The fused variant runs the same forward on one packed row `[1, N + rows*chunk]`; only
 `fused_step_attention_forward` knows the boundary and hands each slice to the right

@@ -2919,3 +2919,51 @@ loop. Phase 2a closed.
 **Gate failures in the CUDA suite** (`test_d4[*-graphed]`, `test_fused_step[graphed]`):
 one wrong assertion of mine - graph dummy pages are permanently reserved and count as
 used blocks - after every token assertion had passed. Fixed in `59dc024`.
+
+## Serving surface: per-request sampling, OpenAI routes, Prometheus metrics (2026-09-22)
+
+The engine decoded greedily for its whole measurement history, which is what made every
+A/B comparable against stock Transformers. That is not a serving engine: real traffic
+sets a temperature, sends stop strings, wants `usage` and logprobs, and arrives through
+an OpenAI client. Three pieces, none of which changes a measured number.
+
+**`SamplingParams` per request, applied per batch.** `engine/batching/sampler.py` treats
+one step's `[N, vocab]` logits as a batch: penalties by one gather-scatter, temperature
+by a `[N, 1]` divide, top-k by a per-row threshold from one `topk`, top-p by one sort,
+min-p by one max. Two invariants decided the design. (1) A batch where every row is
+greedy and asks for no penalties returns `logits.argmax(-1).tolist()` before any of that
+machinery runs, so the default path is bit-identical to what every benchmark measured.
+(2) A row's token must not depend on its neighbours, which per-row parameters give for
+free and a per-request `seed` extends to the draw itself - at the cost of one
+`torch.multinomial` per seeded row, since generators cannot be batched. Greedy is not
+the same as "nothing to do": penalties change which token the argmax picks, as they do
+in `transformers`, so they are applied before the shortcut is taken.
+
+**Graphs now return logits, not tokens.** Sampling is per request and a graph is captured
+for a *shape*, so the argmax could no longer live inside the captured forward. The
+prefill and fused forwards end by copying their `[rows, vocab]` logits into one shared
+buffer (`_write_logits`) whose address every graph records. A private vocabulary-sized
+output per captured shape would have been ~5 MB x dozens of shapes; the shared buffer is
+9.7 MB total and costs one extra copy per step. The fused step also compacts its live
+rows on the device before the transfer, so it still pays exactly one device-to-host copy
+per step for decode and prefill together.
+
+**Stop conditions** are per request: the request's own stop token ids, then EOS unless
+`ignore_eos`, then the length bound. Stop *strings* live in the API layer, which has the
+detokenized text; a request that hits one is cancelled so its KV pages return to the pool
+instead of generating to its bound.
+
+**OpenAI routes** (`engine/server/openai.py`): `/v1/models`, `/v1/completions`,
+`/v1/chat/completions`, streaming for both, `usage` including
+`stream_options.include_usage`, logprobs, the model's own chat template. Parameters the
+engine does not honour (`n > 1`, `echo`, `best_of`, `logit_bias`) are refused with 400
+rather than ignored - a serving surface that silently drops a parameter is worse than one
+that says no. 17 CPU tests cover the contract against a scripted engine.
+
+**Prometheus `/metrics`** (`engine/metrics/prometheus.py`): the numbers the soak already
+computed, exported in the text format without a client dependency - TTFT, inter-token
+latency, end-to-end latency, queue time, prompt and generation token histograms, and
+gauges for running/waiting requests, decode batch, KV utilization and
+`graph_captures_in_service` (the counter that caught two false tail regressions on the
+T4). Recording happens on the worker thread as requests terminate; `render()` only reads
+the exporter's own copies, never live scheduler state.
