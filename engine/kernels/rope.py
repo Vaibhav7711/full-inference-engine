@@ -118,42 +118,85 @@ def triton_rope_qk(
     return query_out, key_out
 
 
-def _original_apply_rotary_pos_emb():
+# Modules patched by `install_triton_rope`, so uninstall and the `stock_rope` context
+# manager can restore exactly what was replaced. Patching is process-global because
+# transformers looks `apply_rotary_pos_emb` up in the modeling module at call time.
+_PATCHED: dict[str, object] = {}
+
+_ATTRIBUTE = "_pre_triton_apply_rotary_pos_emb"
+
+
+def _default_module():
+    """The Qwen3 modeling module, for callers that patch without a model in hand."""
     import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
 
-    return getattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb", None)
+    return modeling_qwen3
+
+
+def install_triton_rope(model=None) -> int:
+    """Replace `apply_rotary_pos_emb` in the modeling module of `model`.
+
+    Every transformers decoder calls this one module-level function, so patching it
+    covers all layers. The module is found from the model's class (see
+    `engine.model.adapters.modeling_module`), which means a new family needs no entry
+    anywhere; with no model, the Qwen3 module is patched, which is what the older
+    `install_triton_qwen_rope()` did.
+    """
+    if model is None:
+        modules = [_default_module()]
+    else:
+        from engine.model.adapters import modeling_module
+
+        module = modeling_module(model)
+        modules = [module] if module is not None else []
+    installed = 0
+    for module in modules:
+        if not hasattr(module, _ATTRIBUTE):
+            setattr(module, _ATTRIBUTE, module.apply_rotary_pos_emb)
+            module.apply_rotary_pos_emb = triton_rope_qk
+            _PATCHED[module.__name__] = module
+        installed += 1
+    return installed
+
+
+def uninstall_triton_rope(model=None) -> int:
+    """Restore the original RoPE function. With no model, every patched module."""
+    if model is None:
+        modules = list(_PATCHED.values())
+    else:
+        from engine.model.adapters import modeling_module
+
+        module = modeling_module(model)
+        modules = [module] if module is not None else []
+    restored = 0
+    for module in modules:
+        original = getattr(module, _ATTRIBUTE, None)
+        if original is not None:
+            module.apply_rotary_pos_emb = original
+            delattr(module, _ATTRIBUTE)
+            _PATCHED.pop(module.__name__, None)
+            restored += 1
+    return restored
 
 
 class stock_rope:
-    """Context manager that temporarily restores Transformers' RoPE for reference runs."""
+    """Temporarily restore Transformers' own RoPE, for reference generations."""
 
     def __enter__(self):
-        import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
-
-        self._was_installed = hasattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb")
-        if self._was_installed:
-            uninstall_triton_qwen_rope()
+        self._restored = list(_PATCHED.values())
+        for module in self._restored:
+            original = getattr(module, _ATTRIBUTE, None)
+            if original is not None:
+                module.apply_rotary_pos_emb = original
         return self
 
     def __exit__(self, *exc):
-        if self._was_installed:
-            install_triton_qwen_rope()
+        for module in self._restored:
+            if hasattr(module, _ATTRIBUTE):
+                module.apply_rotary_pos_emb = triton_rope_qk
         return False
 
 
-def install_triton_qwen_rope() -> None:
-    """Replace Qwen3's module-global RoPE function used by every attention layer."""
-    import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
-
-    if not hasattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb"):
-        modeling_qwen3._pre_triton_apply_rotary_pos_emb = modeling_qwen3.apply_rotary_pos_emb
-        modeling_qwen3.apply_rotary_pos_emb = triton_rope_qk
-
-
-def uninstall_triton_qwen_rope() -> None:
-    import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
-
-    original = getattr(modeling_qwen3, "_pre_triton_apply_rotary_pos_emb", None)
-    if original is not None:
-        modeling_qwen3.apply_rotary_pos_emb = original
-        del modeling_qwen3._pre_triton_apply_rotary_pos_emb
+# Older names, unchanged in behaviour for the Qwen3 module.
+install_triton_qwen_rope = install_triton_rope
+uninstall_triton_qwen_rope = uninstall_triton_rope

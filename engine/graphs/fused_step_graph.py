@@ -58,6 +58,9 @@ def capture_fused_step_graph(
             decode_rows=decode_rows, block_tables=block_tables, seq_lens=seq_lens,
             block_n=block_n, num_warps=num_warps, prefill_rows=prefill_rows,
             total_len=context_len if context_len else 1, width=width,
+            # Capture on inert rows: the split-K bound is the context this graph is
+            # shaped for, so replay uses the same split count it recorded.
+            max_sequence_length=max(context_len, 1),
         )
 
     set_contexts()

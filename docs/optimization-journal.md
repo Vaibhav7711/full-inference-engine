@@ -2967,3 +2967,59 @@ gauges for running/waiting requests, decode batch, KV utilization and
 `graph_captures_in_service` (the counter that caught two false tail regressions on the
 T4). Recording happens on the worker thread as requests terminate; `render()` only reads
 the exporter's own copies, never live scheduler state.
+
+## Hooks: making the engine portable across models, GPUs and kernels (2026-09-23)
+
+Everything measured so far is one model on one GPU, and the code said so in three places:
+the SwiGLU installer matched the class name `Qwen3MLP`, the RoPE installer imported
+`transformers.models.qwen3.modeling_qwen3` by path, and the attention implementation was
+an `if/elif` over three constants whose defaults were whatever won on a T4. None of those
+is wrong; all three are unextendable, and the RTX 4060 is about to make each one bind.
+
+**Model hook** (`engine/model/adapters.py`). Fusion targets are now found structurally -
+any module with `gate_proj`/`up_proj`/`down_proj`, any class whose name ends in `RMSNorm`
+with a 1-D weight - and RoPE is patched in `type(model).__module__`, the model's own
+modeling file. A Llama or Mistral checkpoint therefore gets the same fused kernels with
+no new code. What *is* declared is what the kernels cannot serve: `ensure_supported()`
+refuses head_dim above 128, non-divisible GQA, sliding-window attention, mixture-of-
+experts and MLA at load time, with the reason. Serving a windowed model on kernels that
+attend to the whole prefix would have produced a plausible-looking wrong answer.
+
+**Kernel hook** (`engine/backends/`). A backend is a name, a phase, a `run` and an
+`available(profile, geometry)` that returns the reason it cannot run here or None.
+`resolve("auto")` takes the highest-priority available backend; a named backend that
+cannot run raises with the reason rather than falling back, because a silent fallback is
+exactly how Phase 2a measured an eager forward for a week and called it a graph result.
+`describe()` prints the whole table with reasons, which is what
+`check_hooks.py --backends-only` now reports in seconds on an unfamiliar machine.
+
+**Device hook** (`engine/backends/policy.py`). `MEASURED` holds, per architecture, the
+settings an A/B on that architecture chose, each with its journal entry - sm_75 is
+`per_head` + `sdpa` + fp16 and says why. Anything else gets capability-led defaults
+(highest-priority runnable backend, bf16 from sm_80) and every reason string carries the
+word `unmeasured` plus the command that would settle it. The engine keeps the whole
+decision in `backend_reasons`, so a result can always answer "why this kernel".
+
+**Two new kernels**, both registered rather than wired in:
+
+* `paged_decode_split_k.py` - FlashDecoding's structure. The per-head kernel reaches
+  ~160 GB/s at (batch 8, 1024 tokens) with 128 programs on 40 SMs; at batch 1 it has 16.
+  Splitting the key range gives each slice its own program and merges the partial
+  softmaxes in a second pass. `choose_splits` refuses to split a grid that is already
+  wide enough (16 rows x 16 heads returns 1) and the wrapper then calls the single-pass
+  kernel, so this can only cost a launch when it is not needed. Unmeasured; the arm is
+  `ab.py --setting decode_split_k`.
+* `flash_paged.py` - `flash_attn_with_kvcache` over the existing pool for both phases.
+  The pool layout is already what flash wants (`[blocks, page, kv_heads, head_dim]` plus
+  an int32 block table), so this is a mapping, not a port: no gather for prefill, no mask
+  tensor, GQA native, internal splitting for decode. Import-guarded; on sm_75 its absence
+  is a reason in the table rather than an error.
+
+Two consequences worth stating. The engine now refuses a named backend it cannot run,
+which is a behaviour change from "fall back to the default" - intentional, and the
+message names the reason. And `DECODE_ATTENTION_KINDS` / `PREFILL_ATTENTION_KINDS` are no
+longer the source of truth; the registry is, and those tuples remain only for callers
+that enumerate the built-ins.
+
+Nothing here changes a measured number: the T4's defaults are what `MEASURED[75]`
+returns, and the CPU suite (288 tests) plus the CUDA gates cover the new paths.

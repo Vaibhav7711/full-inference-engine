@@ -49,6 +49,11 @@ def capture_paged_decode_graph(engine, *, batch_size: int, block_n: int, num_war
         decode_num_warps=num_warps, key_scale_pool=engine.key_scale_pool,
         value_scale_pool=engine.value_scale_pool,
         decode_kernel=getattr(engine, "decode_attention", "per_head"),
+        decode_backend=engine.decode_backend,
+        # A graph is captured for one shape, and a split-K decode backend picks its split
+        # count from this bound; the bucket's longest possible row is what replay must
+        # assume, so capture records the same value the regime was chosen for.
+        decode_max_len=128 if block_n >= 128 else 127,
     )
     engine.model.config._attn_implementation = engine.ATTN_NAME
     if hasattr(engine.model.config, "_attn_implementation_internal"):

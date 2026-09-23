@@ -76,6 +76,19 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("per_head", {"decode_attention": "per_head"}),
         ("gqa_shared", {"decode_attention": "gqa"}),
     ],
+    # Split-K decode (FlashDecoding structure) against the single-pass kernel. The
+    # per-head kernel is parallelism-bound at small batches, which is exactly where a
+    # local GPU serves; this is where that claim is tested.
+    "decode_split_k": [
+        ("per_head", {"decode_attention": "per_head"}),
+        ("split_k", {"decode_attention": "split_k"}),
+    ],
+    # FlashAttention-2 over the pages, where a wheel exists (sm_80+). Both phases at
+    # once, because flash replaces the gather and the mask as well as the kernel.
+    "flash_attention": [
+        ("triton_paged", {"decode_attention": "per_head", "prefill_attention": "sdpa"}),
+        ("flash_paged", {"decode_attention": "flash", "prefill_attention": "flash"}),
+    ],
     # One forward per prefill-carrying step (decode rows and chunk rows packed into one
     # token row) against the decode forward followed by the prefill forward. Same kernels
     # either way; only the GEMM shapes differ, so late greedy drift is possible and the
@@ -185,7 +198,7 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
 # wrong kernel fails immediately and a rounding difference does not.
 TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rmsnorm",
                         "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step",
-                        "decode_kernel"}
+                        "decode_kernel", "decode_split_k", "flash_attention"}
 
 
 def drift_expected(setting: str) -> bool:

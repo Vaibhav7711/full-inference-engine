@@ -65,9 +65,9 @@ def test_fused_swiglu_reads_split_projection_halves_in_place(shape) -> None:
 
 @cuda
 @requires_cuda
-def test_qwen_swiglu_installer_covers_every_layer() -> None:
+def test_swiglu_installer_covers_every_layer() -> None:
     from transformers import AutoModelForCausalLM
-    from engine.kernels.swiglu import install_triton_qwen_swiglu, uninstall_triton_qwen_swiglu
+    from engine.kernels.swiglu import install_triton_swiglu, uninstall_triton_swiglu
 
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen3-0.6B", dtype=torch.float16, device_map="cuda", trust_remote_code=True
@@ -75,9 +75,9 @@ def test_qwen_swiglu_installer_covers_every_layer() -> None:
     mlps = [module for module in model.modules() if module.__class__.__name__.lower() == "qwen3mlp"]
     hidden = torch.randn(2, model.config.hidden_size, device="cuda", dtype=torch.float16)
     reference = mlps[0](hidden)
-    assert install_triton_qwen_swiglu(model, fuse_gate_up=True) == 28
+    assert install_triton_swiglu(model, fuse_gate_up=True) == 28
     assert mlps[0].gate_proj is None
     assert mlps[0].up_proj is None
     torch.testing.assert_close(mlps[0](hidden), reference, rtol=3e-3, atol=3e-3)
-    assert uninstall_triton_qwen_swiglu(model) == 28
+    assert uninstall_triton_swiglu(model) == 28
     torch.testing.assert_close(mlps[0](hidden), reference, rtol=2e-3, atol=2e-3)

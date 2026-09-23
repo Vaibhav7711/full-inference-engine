@@ -95,7 +95,11 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `graphs/cuda_graphs.py` | historical | Stage-15 eligibility check and a contiguous-cache decode capture. |
 | `kernels/paged_decode_batched.py` | live | **Decode attention** over paged KV, one program per (row, query head). Section 6. |
 | `kernels/paged_decode_gqa.py` | baseline (negative result) | Same, one program per (row, KV head) sharing tiles across the GQA pair. Measured 0.95-1.06x; L2 already serves the second read. |
-| `kernels/paged_decode_config.py` | live | Tile/warp regime by context length (64x4 below 128 tokens, 128x4 above). |
+| `kernels/paged_decode_config.py` | live | Tile/warp regime by context length (64x4 below 128 tokens, 128x4 above) and `choose_splits` for the split-K backend. No Triton import, so the policy is readable and testable anywhere. |
+| `kernels/paged_decode_split_k.py` | live (opt-in) | FlashDecoding structure: the key range cut into slices, one program each, partial `(m, l, acc)` merged by a second kernel. For small batches and long contexts, where the per-head grid is too narrow to fill the GPU. |
+| `kernels/flash_paged.py` | live (sm_80+) | `flash_attn_with_kvcache` over this engine's pages for both decode and chunked prefill - no gather, no mask, GQA native, splits internally. Import-guarded: absence is a backend *reason*, not an error. |
+| `backends/registry.py`, `backends/builtin.py`, `backends/policy.py` | live | The kernel hook. See section 9. |
+| `model/adapters.py` | live | The model hook. See section 9. |
 | `kernels/kv_write.py` | live | Two kernels: write one decode token's K/V per row into its page slot; write a padded prefill chunk per row starting at its position. |
 | `kernels/sdpa_prefill.py` | live (default chunked prefill attention) | Gather each row's pages into a dense `[B, kv_heads, T, D]`, build the chunk causal mask once per step, fold the GQA pair into the query axis, call torch SDPA (memory-efficient backend, tensor cores). |
 | `kernels/paged_prefill.py` | live (fallback, `prefill_attention="per_token"`) | Chunked prefill attention in Triton, one program per (row, head, query token); reads pages in place, no gather. Slower than SDPA on T4. |
@@ -379,6 +383,66 @@ dequantize per tile. Halves KV bytes; on T4 the decode step did not move and the
 prefill path drifts from stock (quantized prompt K/V) - off by default.
 
 ---
+
+## 9. Hooks: adding a model, a GPU, or a kernel
+
+Three things used to be hard-coded and are now explicit seams. Each one is the answer to
+a question of the form "what happens when this is not Qwen3-0.6B on a T4?".
+
+### A different model
+
+`engine/model/adapters.py`. Nothing is keyed by family name:
+
+* **Fusions find their modules structurally.** `mlp_modules()` returns anything with
+  `gate_proj`/`up_proj`/`down_proj` (every Llama-style MLP: Qwen, Llama, Mistral,
+  Gemma); `norm_modules()` matches the `RMSNorm` class-name suffix and a 1-D weight.
+* **RoPE is patched in the model's own modeling module**, found with
+  `type(model).__module__`, so a family the engine has never seen needs no entry.
+* **`ensure_supported(config)` refuses what the kernels cannot serve**, at load, with the
+  reason: head_dim above 128, query heads not divisible by KV heads, sliding-window
+  attention, mixture-of-experts, MLA. This is the difference between an error message
+  and a wrong answer.
+
+Adding a family that breaks one of those assumptions means writing the kernel support
+and removing the check - the check is the specification.
+
+### A different GPU
+
+`engine/backends/policy.py`. `MEASURED` maps an architecture to the settings an A/B *on
+that architecture* chose, each with the journal entry that decided it. A device that is
+not in the table gets capability-led defaults (highest-priority runnable backend, bf16
+from sm_80) and every reason string says `unmeasured`, with the command to fix that. The
+engine records the whole decision in `backend_reasons`, so a result JSON always says why
+it ran what it ran.
+
+### A different kernel
+
+`engine/backends/registry.py`. A backend is a name, a phase, a `run`, and an `available`
+that returns *the reason it cannot run here* or None:
+
+```python
+register(Backend(
+    name="my_decode", phase="decode", run=my_kernel, priority=70,
+    available=lambda profile, geometry: None if profile.sm >= 90 else "needs sm_90",
+))
+```
+
+`resolve(phase, "auto", profile, geometry)` picks the highest-priority available one;
+`resolve(phase, "my_decode", ...)` raises with the reason if it cannot run, rather than
+falling back silently - a silent fallback is how the T4 measured an eager path for a week
+and reported it as a graph result. `describe()` returns the whole table, which
+`scripts/check_hooks.py --backends-only` prints in seconds on a new machine:
+
+```
+  ok decode   per_head   p50
+  no decode   flash      p80  <- flash_attn wheels require sm_80+; this device is sm_75x
+  no prefill  tiled      p60  <- tl.dot does not reach the tensor cores on sm_75
+defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
+```
+
+Engine keywords accept any registered name or `"auto"`, and the benchmark harness has
+arms for each (`--setting decode_split_k`, `--setting flash_attention`), so a new kernel
+is measurable the moment it is registered.
 
 ## 7. How to read a result
 

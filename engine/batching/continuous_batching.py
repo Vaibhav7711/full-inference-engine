@@ -40,24 +40,14 @@ from engine.kernels.kv_write import write_decode_kv
 from engine.kernels.paged_decode_batched import (
     paged_decode_batched,
 )
-from engine.kernels.paged_decode_config import DECODE_ATTENTION_KINDS, select_paged_decode_config
-from engine.kernels.paged_decode_gqa import paged_decode_gqa
-from engine.kernels.paged_prefill import paged_prefill
-from engine.kernels.sdpa_prefill import sdpa_paged_prefill
-from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
+from engine.kernels.paged_decode_config import select_paged_decode_config
 
-# Chunked-prefill attention implementations, by name:
-#   sdpa       (default) gather the prefix pages into a dense tensor and call torch SDPA -
-#              the same kernel the fresh-prompt fast path uses; reaches the tensor cores
-#              on sm_75. Measured -40%/-66% prefill step vs per_token on the T4 and
-#              token-identical to stock Transformers on the identity prompts.
-#   per_token  Triton, one program per (row, head, query token); lean, bandwidth-bound on
-#              redundant prefix reads. The previous default and the measured baseline.
-#   tiled      Triton FlashAttention structure over paged KV with `tl.dot`. Only a
-#              candidate on devices where `tl.dot` lowers to mma (sm_80+); on the T4 it
-#              compiles to FMA, spills, and runs one block per SM. Check with
-#              `benchmarks/kernels/prefill_attention_ab.py --ptx-only` before enabling.
-PREFILL_ATTENTION_KINDS = ("per_token", "sdpa", "tiled")
+# Attention implementations live in `engine/backends`, which knows what each one needs
+# and which of them can run on this device. `prefill_attention` / `decode_attention`
+# accept any registered name or "auto"; these tuples remain for callers that enumerate
+# the built-ins (benchmark arms, older scripts).
+PREFILL_ATTENTION_KINDS = ("per_token", "sdpa", "tiled", "flash")
+DECODE_ATTENTION_KINDS = ("per_head", "gqa", "split_k", "flash")
 
 
 def _prefill_context_bucket(total_len: int, floor: int = 256) -> int:
@@ -66,6 +56,7 @@ def _prefill_context_bucket(total_len: int, floor: int = 256) -> int:
     while bucket < total_len:
         bucket *= 2
     return bucket
+from engine.backends import Geometry, defaults_for, resolve
 from engine.batching.sampler import BatchedSampler
 from engine.runtime import GenerationRequest, RequestState
 from engine.runtime.sampling import GREEDY, SamplingParams
@@ -91,6 +82,10 @@ class _BatchContext:
     # "per_head": one program per (row, query head). "gqa": one per (row, KV head), the
     # K/V tile read once for the whole group. See `paged_decode_gqa`.
     decode_kernel: str = "per_head"
+    # The resolved backend for this step, and the longest row in it: a split-K or flash
+    # kernel needs the bound host-side, since reading `seq_lens` would synchronize.
+    decode_backend: object = None
+    decode_max_len: int = 0
 
 
 _BATCH_CTX: Optional[_BatchContext] = None
@@ -104,8 +99,10 @@ class _PrefillContext:
     chunk_lens: torch.Tensor
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
-    # One of PREFILL_ATTENTION_KINDS. See the note at the top of the module.
+    # Name of the resolved prefill backend, kept for graph keys and reporting.
     attention: str = "sdpa"
+    # The backend itself; set by `_set_prefill_context`.
+    backend: object = None
     # Longest start + chunk in this batch, known host-side at planning time. The SDPA
     # path gathers this many logical tokens per row; reading it from the device tensors
     # would be a synchronization per layer.
@@ -183,11 +180,10 @@ def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, sca
     value_pool = ctx.value_pool[layer_idx]
     if ctx.key_scale_pool is None:
         write_decode_kv(key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens)
-        attend = paged_decode_gqa if ctx.decode_kernel == "gqa" else paged_decode_batched
-        return attend(
+        return ctx.decode_backend.run(
             query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
             scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
-            length_offset=1,
+            length_offset=1, max_sequence_length=ctx.decode_max_len,
         )
     from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
     write_decode_int8_kv(
@@ -233,23 +229,12 @@ def _prefill_attention(ctx: _PrefillContext, layer_idx: int, query, key, value, 
             key, value, key_pool, value_pool, ctx.block_tables,
             ctx.chunk_lens, ctx.start_positions,
         )
-        if ctx.attention == "sdpa":
-            out = sdpa_paged_prefill(
-                query, key_pool, value_pool, ctx.block_tables,
-                ctx.start_positions, ctx.chunk_lens, scale=scaling,
-                total_len=ctx.total_len, cache=ctx.sdpa_cache,
-            )
-        elif ctx.attention == "tiled":
-            out = tiled_paged_prefill(
-                query, key_pool, value_pool, ctx.block_tables,
-                ctx.start_positions, ctx.chunk_lens, scale=scaling,
-                block_m=ctx.prefill_block_m, block_n=ctx.prefill_block_n,
-            )
-        else:
-            out = paged_prefill(
-                query, key_pool, value_pool, ctx.block_tables,
-                ctx.start_positions, ctx.chunk_lens, scale=scaling,
-            )
+        out = ctx.backend.run(
+            query, key_pool, value_pool, ctx.block_tables,
+            ctx.start_positions, ctx.chunk_lens, scale=scaling,
+            total_len=ctx.total_len, cache=ctx.sdpa_cache,
+            block_m=ctx.prefill_block_m, block_n=ctx.prefill_block_n,
+        )
     else:
         from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
         write_prefill_int8_kv_batched(
@@ -384,23 +369,40 @@ class ContinuousBatchingEngine:
         self.block_size = block_size
         self.max_active = max_active
         self.prefill_chunk_size = prefill_chunk_size
-        # `tiled_prefill` is the older boolean form of the same choice. Default: SDPA over
-        # gathered pages - measured on the T4 (journal, "SDPA under graphs") at -40% chat
-        # and -66% long prefill step against the per-token kernel, and the only chunked
-        # path that matches stock Transformers token-for-token on the identity prompts.
+        # Attention backends are resolved against this device and this geometry rather
+        # than hard-coded: "auto" (the default) takes the measured default for the
+        # architecture, or the highest-priority runnable backend on one nobody has
+        # measured. A named backend that cannot run here raises, with the reason - a
+        # silent fallback is how a week of T4 results measured the wrong path.
+        # `tiled_prefill=True` is the older boolean spelling of `prefill_attention="tiled"`.
+        from engine.kernels.device import current_device
+
+        config_geometry = Geometry(
+            num_q_heads=int(cfg.num_attention_heads),
+            num_kv_heads=int(getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)),
+            head_dim=int(getattr(cfg, "head_dim", 0)
+                         or cfg.hidden_size // cfg.num_attention_heads),
+            block_size=block_size,
+            dtype=str(next(model.parameters()).dtype).removeprefix("torch."),
+            kv_dtype="int8" if kv_cache_dtype == "int8" else "float16",
+        )
+        self.device_profile = current_device()
+        self.geometry = config_geometry
+        device_defaults = defaults_for(self.device_profile, config_geometry)
+        self.backend_reasons = dict(device_defaults.reasons)
         if prefill_attention is None:
-            prefill_attention = "tiled" if tiled_prefill else "sdpa"
-        if prefill_attention not in PREFILL_ATTENTION_KINDS:
-            raise ValueError(f"prefill_attention must be one of {PREFILL_ATTENTION_KINDS}")
-        self.prefill_attention = prefill_attention
-        self.tiled_prefill = prefill_attention == "tiled"
-        if decode_attention not in DECODE_ATTENTION_KINDS:
-            raise ValueError(f"decode_attention must be one of {DECODE_ATTENTION_KINDS}")
-        if decode_attention == "gqa" and kv_cache_dtype != "fp16":
-            raise ValueError("the GQA-shared decode kernel has no INT8 variant")
-        # Decode attention kernel: the per-head kernel is the measured baseline; "gqa"
-        # reads each K/V tile once per group instead of once per query head.
-        self.decode_attention = decode_attention
+            prefill_attention = "tiled" if tiled_prefill else device_defaults.prefill_attention
+        if decode_attention in (None, "auto"):
+            decode_attention = device_defaults.decode_attention
+        self.prefill_backend = resolve(
+            "prefill", prefill_attention, self.device_profile, config_geometry,
+        )
+        self.decode_backend = resolve(
+            "decode", decode_attention, self.device_profile, config_geometry,
+        )
+        self.prefill_attention = self.prefill_backend.name
+        self.decode_attention = self.decode_backend.name
+        self.tiled_prefill = self.prefill_attention == "tiled"
         self.prefill_block_m = prefill_block_m
         self.prefill_block_n = prefill_block_n
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
@@ -424,6 +426,11 @@ class ContinuousBatchingEngine:
         self._decode_graphs = {}
 
         cfg = model.config
+        # Refuse a checkpoint whose geometry the paged kernels cannot serve, at load,
+        # with the reason - rather than a wrong answer or a launch failure later.
+        from engine.model.adapters import ensure_supported
+
+        ensure_supported(cfg)
         self.num_layers = cfg.num_hidden_layers
         self.max_model_len = getattr(cfg, "max_position_embeddings", None)
         # Step accounting: a prefill-carrying iteration and a decode-only iteration cost
@@ -463,24 +470,26 @@ class ContinuousBatchingEngine:
         # restores the stock implementation, because benchmarks build several engines
         # on one shared model object and a previous engine may have patched it.
         from engine.kernels.rmsnorm import install_triton_rmsnorm, uninstall_triton_rmsnorm
-        from engine.kernels.rope import install_triton_qwen_rope, uninstall_triton_qwen_rope
-        from engine.kernels.swiglu import install_triton_qwen_swiglu, uninstall_triton_qwen_swiglu
+        from engine.kernels.rope import install_triton_rope, uninstall_triton_rope
+        from engine.kernels.swiglu import install_triton_swiglu, uninstall_triton_swiglu
         if triton_rmsnorm:
             self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
         else:
             uninstall_triton_rmsnorm(model)
             self.triton_rmsnorm_modules = 0
+        # RoPE is patched in this model's own modeling module, so a family the engine has
+        # never seen is covered without an entry anywhere.
         if triton_rope:
-            install_triton_qwen_rope()
+            install_triton_rope(model)
         else:
-            uninstall_triton_qwen_rope()
+            uninstall_triton_rope(model)
         if fuse_mlp_gate_up and not triton_swiglu:
             raise ValueError("fuse_mlp_gate_up requires triton_swiglu=True")
         # Re-install when the fusion mode changes: the installer is a no-op on an
         # already patched module, so a prior engine's choice would otherwise persist.
-        uninstall_triton_qwen_swiglu(model)
+        uninstall_triton_swiglu(model)
         if triton_swiglu:
-            self.triton_swiglu_modules = install_triton_qwen_swiglu(
+            self.triton_swiglu_modules = install_triton_swiglu(
                 model, fuse_gate_up=fuse_mlp_gate_up,
             )
         else:
@@ -1135,6 +1144,7 @@ class ContinuousBatchingEngine:
             self._prefill_device_chunk_lens[:row_count],
             self.key_scale_pool, self.value_scale_pool,
             attention=self.prefill_attention,
+            backend=self.prefill_backend,
             total_len=total_len,
             prefill_block_m=self.prefill_block_m,
             prefill_block_n=self.prefill_block_n,
@@ -1390,7 +1400,7 @@ class ContinuousBatchingEngine:
 
     def _set_fused_contexts(
         self, *, decode_rows: int, block_tables, seq_lens, block_n: int, num_warps: int,
-        prefill_rows: int, total_len: int, width: int,
+        prefill_rows: int, total_len: int, width: int, max_sequence_length: int = 0,
     ) -> None:
         _set_batch_ctx(_BatchContext(
             key_pool=self.key_pool, value_pool=self.value_pool,
@@ -1398,6 +1408,7 @@ class ContinuousBatchingEngine:
             decode_block_n=block_n, decode_num_warps=num_warps,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
+            decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
         ))
         self._set_prefill_context(prefill_rows, total_len)
         _set_fused_ctx(_FusedContext(decode_rows, prefill_rows, width))
@@ -1521,6 +1532,7 @@ class ContinuousBatchingEngine:
             decode_rows=decode_rows, block_tables=block_tables, seq_lens=seq_lens,
             block_n=block_n, num_warps=num_warps, prefill_rows=prefill_rows,
             total_len=context_len if context_len else total_len, width=width,
+            max_sequence_length=max_sequence_length,
         )
         try:
             if use_graph:
@@ -1599,6 +1611,7 @@ class ContinuousBatchingEngine:
             decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
+            decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
         )
         graph_key = (graph_bucket_size, decode_block_n, decode_num_warps)
         use_graph = graph_bucket_size is not None

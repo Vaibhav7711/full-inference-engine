@@ -320,3 +320,79 @@ def test_gqa_shared_decode_matches_per_head_kernel(block_n, num_q_heads, kv_head
     offset = paged_decode_gqa(query_batched, key_pages, value_pages, block_tables, shorter,
                               block_n=block_n, length_offset=1)
     torch.testing.assert_close(offset, shared, rtol=2e-3, atol=2e-3)
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("splits", [2, 4, 8])
+@pytest.mark.parametrize("block_n", [32, 64])
+def test_split_k_decode_matches_the_single_pass_kernel(splits, block_n):
+    """Splitting the key range and merging the partial softmaxes changes nothing."""
+    from engine.kernels.paged_decode_batched import paged_decode_batched
+    from engine.kernels.paged_decode_split_k import paged_decode_split_k
+
+    torch.manual_seed(5)
+    device, dtype, block_size = "cuda", torch.float16, 16
+    num_q_heads, kv_heads, D = 16, 8, 128
+    # Lengths that straddle split boundaries, including a row with a single key and one
+    # long enough that late splits are empty.
+    seq_lens = [1, 15, 16, 17, 63, 200, 511]
+    queries, seqs_kv = [], []
+    for n in seq_lens:
+        queries.append(torch.randn(num_q_heads, 1, D, device=device, dtype=dtype))
+        seqs_kv.append((torch.randn(kv_heads, n, D, device=device, dtype=dtype),
+                        torch.randn(kv_heads, n, D, device=device, dtype=dtype)))
+    key_pages, value_pages, block_tables, seq_lens_t = _build_shared_pool(
+        seqs_kv, block_size, kv_heads, D, device, dtype,
+    )
+    query = torch.stack(queries, dim=0)
+    reference = paged_decode_batched(query, key_pages, value_pages, block_tables, seq_lens_t,
+                                     block_n=block_n)
+    actual = paged_decode_split_k(
+        query, key_pages, value_pages, block_tables, seq_lens_t, block_n=block_n,
+        splits=splits, max_sequence_length=max(seq_lens),
+    )
+    torch.testing.assert_close(actual, reference, rtol=2e-3, atol=2e-3)
+
+    # And against SDPA directly, so a shared bug in both paged kernels cannot hide.
+    n_rep = num_q_heads // kv_heads
+    for s, n in enumerate(seq_lens):
+        k = seqs_kv[s][0].repeat_interleave(n_rep, dim=0)
+        v = seqs_kv[s][1].repeat_interleave(n_rep, dim=0)
+        expected = _sdpa_decode_reference(queries[s], k, v)
+        assert (actual[s] - expected).abs().max().item() < 5e-3, f"sequence {s} (len {n})"
+
+
+@cuda
+@requires_cuda
+def test_split_k_honours_the_length_offset_like_the_single_pass_kernel():
+    from engine.kernels.paged_decode_split_k import paged_decode_split_k
+
+    torch.manual_seed(6)
+    device, dtype, block_size = "cuda", torch.float16, 16
+    seqs_kv = [(torch.randn(8, n, 128, device=device, dtype=dtype),
+                torch.randn(8, n, 128, device=device, dtype=dtype)) for n in (33, 129)]
+    key_pages, value_pages, block_tables, seq_lens_t = _build_shared_pool(
+        seqs_kv, block_size, 8, 128, device, dtype,
+    )
+    query = torch.randn(2, 16, 1, 128, device=device, dtype=dtype)
+    full = paged_decode_split_k(query, key_pages, value_pages, block_tables, seq_lens_t,
+                                splits=4, max_sequence_length=129)
+    offset = paged_decode_split_k(query, key_pages, value_pages, block_tables, seq_lens_t - 1,
+                                  splits=4, length_offset=1, max_sequence_length=129)
+    torch.testing.assert_close(offset, full, rtol=2e-3, atol=2e-3)
+
+
+def test_choose_splits_widens_a_narrow_grid_and_leaves_a_wide_one_alone() -> None:
+    # Imported from the policy module, which has no Triton dependency, so the heuristic
+    # that decides whether to split is testable wherever the tests run.
+    from engine.kernels.paged_decode_config import choose_splits
+
+    # One request, 16 heads, long context: 16 programs on 40 SMs wants splitting.
+    assert choose_splits(1, 16, 2048, multiprocessors=40) >= 4
+    # Sixteen requests at 16 heads is already 256 programs; splitting only adds a merge.
+    assert choose_splits(16, 16, 2048, multiprocessors=40) == 1
+    # A short context cannot be split into useful tiles whatever the grid says.
+    assert choose_splits(1, 1, 64, multiprocessors=108, block_n=64) == 1
+    for splits in (choose_splits(rows, 16, 4096) for rows in (1, 2, 4, 8)):
+        assert splits & (splits - 1) == 0, "splits must be a power of two for tl.arange"

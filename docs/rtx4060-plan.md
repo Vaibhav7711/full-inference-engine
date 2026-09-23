@@ -63,6 +63,13 @@ margin narrows (compute is cheaper); tiled kernel becomes competitive or wins; G
 still neutral.
 
 ### Phase R2 - FlashAttention-2 over paged KV (the big one)
+
+*Built since this plan was written*: `engine/kernels/flash_paged.py` maps both phases onto
+`flash_attn_with_kvcache`, registered as the `flash` backend for decode and prefill and
+selected automatically once the wheel imports (priority 80). R2 is now a measurement, not
+an implementation: install the wheel, run `check_hooks.py --backends-only` to confirm the
+table says `ok`, then `ab.py --setting flash_attention` on both profiles. Same for
+split-K decode (`--setting decode_split_k`), which is the D19 candidate.
 `flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=..., block_table=...,
 causal=True)` accepts our pool layout `[num_blocks, block_size, kv_heads, head_dim]`
 directly (FA2's paged KV requires the page size to be a multiple of 16 tokens - ours is

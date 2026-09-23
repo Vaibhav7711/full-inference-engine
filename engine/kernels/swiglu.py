@@ -62,7 +62,7 @@ def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def _triton_qwen_mlp_forward(module, hidden_states: torch.Tensor) -> torch.Tensor:
+def _triton_mlp_forward(module, hidden_states: torch.Tensor) -> torch.Tensor:
     fused_projection = getattr(module, "fused_gate_up_proj", None)
     if fused_projection is None:
         gate = module.gate_proj(hidden_states)
@@ -92,15 +92,20 @@ class FusedGateUpProjection(nn.Module):
         return output.split(self.gate_features, dim=-1)
 
 
-def install_triton_qwen_swiglu(model: torch.nn.Module, *, fuse_gate_up: bool = False) -> int:
-    """Patch Qwen3 MLP modules and return the number installed."""
+def install_triton_swiglu(model: torch.nn.Module, *, fuse_gate_up: bool = False) -> int:
+    """Patch every SwiGLU feed-forward in the model and return the number installed.
+
+    Modules are found structurally - anything with `gate_proj`, `up_proj` and
+    `down_proj` - so this covers Qwen, Llama, Mistral and every other Llama-style MLP
+    without a per-family name list. See `engine/model/adapters.py`.
+    """
+    from engine.model.adapters import mlp_modules
+
     installed = 0
-    for module in model.modules():
-        if module.__class__.__name__.lower() != "qwen3mlp":
-            continue
+    for module in mlp_modules(model):
         if not hasattr(module, "_pre_triton_swiglu_forward"):
             module._pre_triton_swiglu_forward = module.forward.__func__
-            module.forward = MethodType(_triton_qwen_mlp_forward, module)
+            module.forward = MethodType(_triton_mlp_forward, module)
             if fuse_gate_up:
                 gate, up = module.gate_proj, module.up_proj
                 fused = FusedGateUpProjection(gate, up)
@@ -114,11 +119,14 @@ def install_triton_qwen_swiglu(model: torch.nn.Module, *, fuse_gate_up: bool = F
                 module.fused_gate_up_proj = fused
         installed += 1
     if installed == 0:
-        raise RuntimeError("model contains no Qwen3MLP modules")
+        raise RuntimeError(
+            "model contains no gate/up/down SwiGLU modules; this engine's MLP fusion "
+            "does not apply to its feed-forward"
+        )
     return installed
 
 
-def uninstall_triton_qwen_swiglu(model: torch.nn.Module) -> int:
+def uninstall_triton_swiglu(model: torch.nn.Module) -> int:
     restored = 0
     for module in model.modules():
         original = getattr(module, "_pre_triton_swiglu_forward", None)
@@ -134,3 +142,9 @@ def uninstall_triton_qwen_swiglu(model: torch.nn.Module) -> int:
             module.fused_gate_up_proj = None
         restored += 1
     return restored
+
+
+# The Qwen-specific names these installers used to have. Kept so older benchmarks and
+# notebooks keep working; they are the same functions.
+install_triton_qwen_swiglu = install_triton_swiglu
+uninstall_triton_qwen_swiglu = uninstall_triton_swiglu

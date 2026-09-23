@@ -28,13 +28,55 @@ def main() -> int:
     parser.add_argument("--max-active", type=int, default=8)
     parser.add_argument("--buckets", type=int, nargs="+", default=[2, 4, 8])
     parser.add_argument("--out", default=None)
+    parser.add_argument("--backends-only", action="store_true",
+                        help="print what this GPU and checkpoint can run, then exit; "
+                             "no warmup, no graphs, seconds rather than minutes")
     args = parser.parse_args()
 
     from benchmarks.common import device_clock_record, environment_record, git_record
     from engine.batching.continuous_batching import ContinuousBatchingEngine
     from engine.model import load_model
 
+    from engine.backends import Geometry, report
+    from engine.kernels.device import current_device
+    from engine.model import adapters
+
     loaded = load_model(args.model)
+    model_report = adapters.describe(loaded.model)
+    geometry = Geometry(
+        num_q_heads=model_report["geometry"]["num_q_heads"],
+        num_kv_heads=model_report["geometry"]["num_kv_heads"],
+        head_dim=model_report["geometry"]["head_dim"],
+        block_size=16,
+        dtype=str(loaded.dtype).removeprefix("torch."),
+    )
+    backend_report = report(current_device(), geometry)
+    print(f"\nmodel: {model_report['model_type']} ({model_report['class']}), "
+          f"{model_report['geometry']['num_layers']} layers, "
+          f"{model_report['geometry']['num_q_heads']}/{model_report['geometry']['num_kv_heads']} heads, "
+          f"head_dim {model_report['geometry']['head_dim']}, "
+          f"{model_report['kv_bytes_per_token'] / 1024:.0f} KiB KV per token")
+    print(f"  fusions: {model_report['mlp_modules']} MLP, {model_report['norm_modules']} norm, "
+          f"rope in {model_report['rope_module']}")
+    if model_report["unsupported_reason"]:
+        print(f"  UNSUPPORTED: {model_report['unsupported_reason']}")
+    print(f"device: {backend_report['device']} "
+          f"({'measured' if backend_report['measured'] else 'not yet measured'})")
+    for phase in ("decode", "prefill"):
+        for row in backend_report[f"{phase}_backends"]:
+            mark = "ok " if row["available"] else "no "
+            note = "" if row["available"] else f"  <- {row['reason']}"
+            print(f"  {mark}{phase:8s} {row['name']:10s} p{row['priority']:<3d}{note}")
+    print(f"defaults: {backend_report['defaults']}")
+    for key, value in backend_report["reasons"].items():
+        print(f"  {key}: {value}")
+    if args.backends_only:
+        if args.out:
+            with open(args.out, "w") as handle:
+                json.dump({"model": model_report, "backends": backend_report}, handle,
+                          indent=2, default=str)
+        return 0
+
     engine = ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, loaded.device, num_blocks=args.num_blocks,
         max_active=args.max_active, cuda_graph_batch_sizes=tuple(args.buckets),
@@ -70,6 +112,7 @@ def main() -> int:
         problems.append(f"{engine.lazy_graph_captures} graph capture(s) happened after warmup")
 
     record = {
+        "model": model_report, "backends": backend_report,
         "warmup_s": warmup_s, "warmup": summary, "captured_graphs": captured,
         "last_step_timing_ms": timing, "git": git_record(),
         "environment": environment_record(loaded.device), "clocks": device_clock_record(),
