@@ -70,10 +70,10 @@ class PrefixCache:
         self.hit_tokens = 0
         self.evictions = 0
 
-    def lookup(self, token_ids: list[int]) -> PrefixMatch:
+    def lookup(self, token_ids: list[int], *, allow_exact: bool = True) -> PrefixMatch:
         """Return the longest complete-block prefix, always leaving one prompt token."""
         self.lookups += 1
-        exact = self._exact.get(tuple(token_ids))
+        exact = self._exact.get(tuple(token_ids)) if allow_exact else None
         if exact is not None:
             self._touch(exact)
             self.hits += 1

@@ -83,5 +83,15 @@ class SamplingParams:
         """True when repeating the request reproduces the tokens exactly."""
         return self.greedy or self.seed is not None
 
+    @property
+    def can_reuse_cached_prediction(self) -> bool:
+        """Whether a prompt-only cache entry fully determines the next-token result.
+
+        Exact-prefix entries store the model's first-token decision, not the logits.  A
+        sampled request must execute sampling so its RNG advances, penalties can change
+        the argmax, and requested logprobs cannot be reconstructed from a token id.
+        """
+        return self.greedy and not self.has_penalties and self.logprobs is None
+
 
 GREEDY = SamplingParams()

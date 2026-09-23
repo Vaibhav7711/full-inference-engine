@@ -1,0 +1,519 @@
+{
+  "setting": "flash_prefill",
+  "repeats": 2,
+  "model": "Qwen/Qwen3-0.6B",
+  "dtype": "torch.float16",
+  "config": {
+    "duration_s": 4.0,
+    "arrival_rate_per_s": 20.0,
+    "concurrency": 4,
+    "shared_prefixes": 3,
+    "prefix_tokens": [
+      1024,
+      2048
+    ],
+    "suffix_tokens": [
+      64,
+      512
+    ],
+    "max_new_tokens": [
+      1,
+      64
+    ],
+    "cancel_probability": 0.02,
+    "seed": 100,
+    "max_steps": 500000,
+    "sample_every_steps": 25,
+    "instrument": true,
+    "num_blocks": 64,
+    "block_size": 256,
+    "max_active": 8,
+    "max_waiting_requests": 64,
+    "prefix_cache_blocks": 64
+  },
+  "arm_settings": {
+    "sdpa_prefill": {
+      "num_blocks": 64,
+      "block_size": 256,
+      "max_active": 8,
+      "max_waiting_requests": 64,
+      "prefix_cache_blocks": 64,
+      "decode_attention": "per_head",
+      "prefill_attention": "sdpa"
+    },
+    "flash_prefill": {
+      "num_blocks": 64,
+      "block_size": 256,
+      "max_active": 8,
+      "max_waiting_requests": 64,
+      "prefix_cache_blocks": 64,
+      "decode_attention": "per_head",
+      "prefill_attention": "flash"
+    }
+  },
+  "prompt_profile": "long",
+  "mean_prompt_tokens": 1824.0,
+  "environment": {
+    "timestamp_utc": "2026-09-23T21:29:09.288509+00:00",
+    "hardware": {
+      "gpu": "NVIDIA GeForce RTX 4060",
+      "compute_capability": "8.9",
+      "multiprocessor_count": 24,
+      "total_memory_bytes": 8183349248,
+      "framework_bf16_supported": true,
+      "native_bf16_tensor_cores": true
+    },
+    "software": {
+      "python": "3.14.4",
+      "torch": "2.14.0+cu130",
+      "cuda": "13.0",
+      "transformers": "5.17.0",
+      "triton": "3.8.0"
+    }
+  },
+  "git": {
+    "commit": "04b0d2f30d3dff9eec26d16266c7d7e4ddbb2b55",
+    "short": "04b0d2f",
+    "branch": "main",
+    "dirty": true
+  },
+  "clocks_before": {
+    "clocks.sm": 2745.0,
+    "clocks.mem": 8251.0,
+    "clocks.max.sm": 3105.0,
+    "power.draw": "[N/A]",
+    "power.limit": 115.0,
+    "temperature.gpu": 49.0,
+    "clocks_throttle_reasons.active": "0x0000000000000000"
+  },
+  "clocks_after": {
+    "clocks.sm": 2730.0,
+    "clocks.mem": 8251.0,
+    "clocks.max.sm": 3105.0,
+    "power.draw": "[N/A]",
+    "power.limit": 115.0,
+    "temperature.gpu": 54.0,
+    "clocks_throttle_reasons.active": "0x0000000000000000"
+  },
+  "token_identity": {
+    "identical": true,
+    "drifted_arms": [],
+    "first_divergence_vs_stock": {
+      "sdpa_prefill": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "flash_prefill": [
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "ties_vs_stock": {
+      "sdpa_prefill": [
+        "prompt 0 @ 4 (margin 0.0000)"
+      ],
+      "flash_prefill": [
+        "prompt 0 @ 4 (margin 0.0000)"
+      ]
+    },
+    "tie_margin": 0.02,
+    "early_divergence_arms": [],
+    "gate_overridden": false
+  },
+  "order": "interleaved",
+  "arms": {
+    "sdpa_prefill": {
+      "label": "sdpa_prefill",
+      "runs": 2,
+      "ok": true,
+      "summary": {
+        "latency.itl_p50": {
+          "n": 2,
+          "median": 11.969559,
+          "min": 11.969559,
+          "max": 12.054315,
+          "spread": 0.007080962631956658
+        },
+        "latency.itl_p99": {
+          "n": 2,
+          "median": 24.860779,
+          "min": 24.860779,
+          "max": 29.401992,
+          "spread": 0.1826657563707074
+        },
+        "latency.itl_samples": {
+          "n": 2,
+          "median": 774.0,
+          "min": 774.0,
+          "max": 814.0,
+          "spread": 0.05167958656330749
+        },
+        "latency.ttft_p50": {
+          "n": 2,
+          "median": 88.453902,
+          "min": 88.453902,
+          "max": 106.091422,
+          "spread": 0.1993978739343799
+        },
+        "latency.total_queue_p50": {
+          "n": 2,
+          "median": 0.074271,
+          "min": 0.074271,
+          "max": 0.077717,
+          "spread": 0.04639765184257638
+        },
+        "waste_ratio": {
+          "n": 2,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "delivered_tokens": {
+          "n": 2,
+          "median": 831.0,
+          "min": 831.0,
+          "max": 849.0,
+          "spread": 0.021660649819494584
+        },
+        "peak_kv_utilization": {
+          "n": 2,
+          "median": 0.96875,
+          "min": 0.96875,
+          "max": 1.0,
+          "spread": 0.03225806451612903
+        },
+        "mean_decode_batch": {
+          "n": 2,
+          "median": 3.0,
+          "min": 3.0,
+          "max": 3.0,
+          "spread": 0.0
+        },
+        "mean_context_tokens": {
+          "n": 2,
+          "median": 1731.6416666666669,
+          "min": 1731.6416666666669,
+          "max": 1923.3666666666668,
+          "spread": 0.11071863405150212
+        },
+        "step_timing.decode_step_p50_ms": {
+          "n": 2,
+          "median": 11.694636999891372,
+          "min": 11.694636999891372,
+          "max": 11.726046999683604,
+          "spread": 0.002685846494638782
+        },
+        "step_timing.prefill_step_p50_ms": {
+          "n": 2,
+          "median": 19.3018989994016,
+          "min": 19.3018989994016,
+          "max": 19.56403799704276,
+          "spread": 0.013580995198932813
+        },
+        "step_timing.prefill_step_fraction": {
+          "n": 2,
+          "median": 0.43243243243243246,
+          "min": 0.43243243243243246,
+          "max": 0.5146579804560261,
+          "spread": 0.1901465798045602
+        },
+        "step_timing.prefill_penalty_p50_ms": {
+          "n": 2,
+          "median": 7.607261999510229,
+          "min": 7.607261999510229,
+          "max": 7.837990997359157,
+          "spread": 0.030330097460003716
+        },
+        "step_timing.expected_gap_ms": {
+          "n": 2,
+          "median": 14.98426381049039,
+          "min": 14.98426381049039,
+          "max": 15.759931617216981,
+          "spread": 0.05176549322253332
+        },
+        "step_timing.prefill_share_of_gap": {
+          "n": 2,
+          "median": 0.21953876761672939,
+          "min": 0.21953876761672939,
+          "max": 0.2559582563877719,
+          "spread": 0.1658909228944186
+        },
+        "step_timing.host_stage_ms_p50": {
+          "n": 2,
+          "median": 0.11026699939975515,
+          "min": 0.11026699939975515,
+          "max": 0.11079199975938536,
+          "spread": 0.004761173900514953
+        },
+        "step_timing.decode_gpu_ms_p50": {
+          "n": 2,
+          "median": 11.494912147521973,
+          "min": 11.494912147521973,
+          "max": 11.499168395996094,
+          "spread": 0.0003702723795969714
+        },
+        "step_timing.prefill_gpu_ms_p50": {
+          "n": 2,
+          "median": 14.56281566619873,
+          "min": 14.56281566619873,
+          "max": 14.985568046569824,
+          "spread": 0.029029577113465106
+        },
+        "step_timing.fused_gpu_ms_p50": {
+          "n": 2,
+          "median": 19.53875160217285,
+          "min": 19.53875160217285,
+          "max": 19.85161590576172,
+          "spread": 0.01601250222936835
+        },
+        "step_timing.sync_ms_p50": {
+          "n": 2,
+          "median": 1.2360709988570306,
+          "min": 1.2360709988570306,
+          "max": 1.2622550020751078,
+          "spread": 0.021183251805348503
+        },
+        "step_timing.lazy_graph_captures": {
+          "n": 2,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "latency.itl_p999": {
+          "n": 2,
+          "median": 30.868066,
+          "min": 30.868066,
+          "max": 30.925727,
+          "spread": 0.001867982270091023
+        }
+      },
+      "violations": [],
+      "coverage_gaps": [
+        "no admission rejection occurred",
+        "no preemption occurred: pool was not under pressure",
+        "states reached but never cancelled from: ['WAITING']"
+      ]
+    },
+    "flash_prefill": {
+      "label": "flash_prefill",
+      "runs": 2,
+      "ok": true,
+      "summary": {
+        "latency.itl_p50": {
+          "n": 2,
+          "median": 11.705204,
+          "min": 11.705204,
+          "max": 11.708656,
+          "spread": 0.00029491156241269646
+        },
+        "latency.itl_p99": {
+          "n": 2,
+          "median": 26.231322,
+          "min": 26.231322,
+          "max": 26.735469,
+          "spread": 0.019219275338086265
+        },
+        "latency.itl_samples": {
+          "n": 2,
+          "median": 671.0,
+          "min": 671.0,
+          "max": 814.0,
+          "spread": 0.21311475409836064
+        },
+        "latency.ttft_p50": {
+          "n": 2,
+          "median": 92.010263,
+          "min": 92.010263,
+          "max": 107.065147,
+          "spread": 0.16362179075610295
+        },
+        "latency.total_queue_p50": {
+          "n": 2,
+          "median": 0.06739,
+          "min": 0.06739,
+          "max": 0.072288,
+          "spread": 0.07268140673690457
+        },
+        "waste_ratio": {
+          "n": 2,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "delivered_tokens": {
+          "n": 2,
+          "median": 693.0,
+          "min": 693.0,
+          "max": 849.0,
+          "spread": 0.22510822510822512
+        },
+        "peak_kv_utilization": {
+          "n": 2,
+          "median": 0.96875,
+          "min": 0.96875,
+          "max": 1.0,
+          "spread": 0.03225806451612903
+        },
+        "mean_decode_batch": {
+          "n": 2,
+          "median": 3.0,
+          "min": 3.0,
+          "max": 3.125,
+          "spread": 0.041666666666666664
+        },
+        "mean_context_tokens": {
+          "n": 2,
+          "median": 1731.6416666666669,
+          "min": 1731.6416666666669,
+          "max": 1904.625,
+          "spread": 0.09989557115839003
+        },
+        "step_timing.decode_step_p50_ms": {
+          "n": 2,
+          "median": 11.356745002558455,
+          "min": 11.356745002558455,
+          "max": 11.555813001905335,
+          "spread": 0.01752861399124785
+        },
+        "step_timing.prefill_step_p50_ms": {
+          "n": 2,
+          "median": 21.495150998816825,
+          "min": 21.495150998816825,
+          "max": 21.50701999926241,
+          "spread": 0.000552171066220424
+        },
+        "step_timing.prefill_step_fraction": {
+          "n": 2,
+          "median": 0.43243243243243246,
+          "min": 0.43243243243243246,
+          "max": 0.5601503759398496,
+          "spread": 0.29534774436090216
+        },
+        "step_timing.prefill_penalty_p50_ms": {
+          "n": 2,
+          "median": 9.93933799691149,
+          "min": 9.93933799691149,
+          "max": 10.150274996703956,
+          "spread": 0.021222439548590828
+        },
+        "step_timing.expected_gap_ms": {
+          "n": 2,
+          "median": 15.853905108677871,
+          "min": 15.853905108677871,
+          "max": 17.04242535785503,
+          "spread": 0.07496703436975947
+        },
+        "step_timing.prefill_share_of_gap": {
+          "n": 2,
+          "median": 0.27110620867914187,
+          "min": 0.27110620867914187,
+          "max": 0.33361920242625487,
+          "spread": 0.230584884247701
+        },
+        "step_timing.host_stage_ms_p50": {
+          "n": 2,
+          "median": 0.10449500041431747,
+          "min": 0.10449500041431747,
+          "max": 0.10504699821467511,
+          "spread": 0.005282528333116379
+        },
+        "step_timing.decode_gpu_ms_p50": {
+          "n": 2,
+          "median": 11.150688171386719,
+          "min": 11.150688171386719,
+          "max": 11.360480308532715,
+          "spread": 0.01881427710303426
+        },
+        "step_timing.prefill_gpu_ms_p50": {
+          "n": 2,
+          "median": 17.08742332458496,
+          "min": 17.08742332458496,
+          "max": 17.645248413085938,
+          "spread": 0.0326453601520126
+        },
+        "step_timing.fused_gpu_ms_p50": {
+          "n": 2,
+          "median": 21.51968002319336,
+          "min": 21.51968002319336,
+          "max": 21.92540740966797,
+          "spread": 0.018853783422305852
+        },
+        "step_timing.sync_ms_p50": {
+          "n": 2,
+          "median": 1.2408740003593266,
+          "min": 1.2408740003593266,
+          "max": 1.2556010005937424,
+          "spread": 0.011868247888303872
+        },
+        "step_timing.lazy_graph_captures": {
+          "n": 2,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "latency.itl_p999": {
+          "n": 2,
+          "median": 27.628152,
+          "min": 27.628152,
+          "max": 27.808726,
+          "spread": 0.006535869644846315
+        }
+      },
+      "violations": [],
+      "coverage_gaps": [
+        "no admission rejection occurred",
+        "no preemption occurred: pool was not under pressure",
+        "states reached but never cancelled from: ['WAITING', 'DECODING']",
+        "states reached but never cancelled from: ['WAITING']"
+      ]
+    }
+  },
+  "comparison": {
+    "step_timing.expected_gap_ms": "unresolved: +5.8% median change is within 7.5% run-to-run spread",
+    "step_timing.prefill_share_of_gap": "+23.5% (spread 23.1%)",
+    "latency.itl_p50": "-2.2% (spread 0.7%)",
+    "latency.itl_p99": "unresolved: +5.5% median change is within 18.3% run-to-run spread",
+    "latency.itl_p999": "-10.5% (spread 0.7%)",
+    "latency.ttft_p50": "unresolved: +4.0% median change is within 19.9% run-to-run spread",
+    "step_timing.decode_step_p50_ms": "-2.9% (spread 1.8%)",
+    "step_timing.prefill_step_p50_ms": "+11.4% (spread 1.4%)",
+    "step_timing.prefill_step_fraction": "unresolved: +0.0% median change is within 29.5% run-to-run spread",
+    "step_timing.prefill_penalty_p50_ms": "+30.7% (spread 3.0%)",
+    "waste_ratio": "baseline is zero",
+    "step_timing.host_stage_ms_p50": "-5.2% (spread 0.5%)",
+    "step_timing.decode_gpu_ms_p50": "-3.0% (spread 1.9%)",
+    "step_timing.prefill_gpu_ms_p50": "+17.3% (spread 3.3%)",
+    "step_timing.fused_gpu_ms_p50": "+10.1% (spread 1.9%)",
+    "step_timing.sync_ms_p50": "unresolved: +0.4% median change is within 2.1% run-to-run spread",
+    "step_timing.lazy_graph_captures": "baseline is zero"
+  },
+  "comparisons": {
+    "flash_prefill": {
+      "step_timing.expected_gap_ms": "unresolved: +5.8% median change is within 7.5% run-to-run spread",
+      "step_timing.prefill_share_of_gap": "+23.5% (spread 23.1%)",
+      "latency.itl_p50": "-2.2% (spread 0.7%)",
+      "latency.itl_p99": "unresolved: +5.5% median change is within 18.3% run-to-run spread",
+      "latency.itl_p999": "-10.5% (spread 0.7%)",
+      "latency.ttft_p50": "unresolved: +4.0% median change is within 19.9% run-to-run spread",
+      "step_timing.decode_step_p50_ms": "-2.9% (spread 1.8%)",
+      "step_timing.prefill_step_p50_ms": "+11.4% (spread 1.4%)",
+      "step_timing.prefill_step_fraction": "unresolved: +0.0% median change is within 29.5% run-to-run spread",
+      "step_timing.prefill_penalty_p50_ms": "+30.7% (spread 3.0%)",
+      "waste_ratio": "baseline is zero",
+      "step_timing.host_stage_ms_p50": "-5.2% (spread 0.5%)",
+      "step_timing.decode_gpu_ms_p50": "-3.0% (spread 1.9%)",
+      "step_timing.prefill_gpu_ms_p50": "+17.3% (spread 3.3%)",
+      "step_timing.fused_gpu_ms_p50": "+10.1% (spread 1.9%)",
+      "step_timing.sync_ms_p50": "unresolved: +0.4% median change is within 2.1% run-to-run spread",
+      "step_timing.lazy_graph_captures": "baseline is zero"
+    }
+  }
+}

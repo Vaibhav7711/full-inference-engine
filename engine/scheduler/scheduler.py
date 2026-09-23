@@ -109,7 +109,10 @@ class FCFSScheduler:
                 break
             prefill_ids = request.prefill_token_ids
             match = (
-                self.prefix_cache.lookup(prefill_ids)
+                self.prefix_cache.lookup(
+                    prefill_ids,
+                    allow_exact=request.sampling.can_reuse_cached_prediction,
+                )
                 if self.prefix_cache is not None and prefill_ids
                 else None
             )

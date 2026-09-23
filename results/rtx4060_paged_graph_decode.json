@@ -1,0 +1,30 @@
+{
+  "workload": {
+    "batch_size": 16,
+    "prompt_tokens": [
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128
+    ],
+    "block_n": 128,
+    "warps": 4
+  },
+  "ordinary_median_ms": 13.088255882263184,
+  "graph_median_ms": 6.881103992462158,
+  "speedup": 1.9020575617808702,
+  "logits_close": true,
+  "note": "Fixed-width replay only; request state is intentionally not advanced during this capture experiment."
+}

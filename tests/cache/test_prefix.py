@@ -67,6 +67,21 @@ def test_exact_prompt_hit_reuses_partial_tail_and_first_token() -> None:
     assert manager.allocator.refcount(old_tail) >= 1
 
 
+def test_exact_prompt_hit_can_be_bypassed_while_reusing_complete_blocks() -> None:
+    manager = KVBlockManager(num_blocks=8, block_size_tokens=4)
+    cache = PrefixCache(manager, max_blocks=4)
+    source = manager.reserve("source", 6, sequence_length=6)
+    assert source is not None
+    cache.publish(list(range(6)), source, next_token_id=42)
+
+    match = cache.lookup(list(range(6)), allow_exact=False)
+
+    assert not match.exact
+    assert match.next_token_id is None
+    assert match.token_count == 4
+    assert match.physical_block_ids == (source.physical_block_ids[0],)
+
+
 def test_pressure_eviction_skips_entries_pinned_by_active_requests() -> None:
     from engine.cache import KVBlockManager, PrefixCache
     from engine.runtime import GenerationRequest

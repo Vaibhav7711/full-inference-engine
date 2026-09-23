@@ -5,7 +5,7 @@ needing the full mental model again - what every file does, what every flow look
 what the kernels actually compute, and which libraries carry which part. Read it top to
 bottom once; afterwards the "Repository map" and "Flows" sections are the lookup tables.
 
-Everything here describes the code at `main` as of 2026-09-21. Where a component is a
+Everything here describes the code at `main` as of 2026-09-24. Where a component is a
 baseline, parked, or historical, it says so.
 
 ---
@@ -82,8 +82,8 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `batching/static.py` | baseline | Stage-9 fixed-membership batching (prefill all, then decode all, no admission mid-run). The "no continuous batching" comparison. |
 | `batching/batched_speculative.py` | parked | N sequences speculating together in a padded batch; not wired to the scheduler. |
 | `scheduler/scheduler.py` | live | `FCFSScheduler`: `waiting` deque, `active` dict, `submit`, `admit_available` (capacity check incl. prefix-cache hits), `plan_prefill` (round-robin chunks under a token budget), `preempt` (LIFO victim, requeue in arrival order), `cancel`, `finish/fail`, progress epoch. |
-| `runtime/sampling.py` | live | `SamplingParams`: temperature, top-p/top-k/min-p, repetition/presence/frequency penalties, per-request seed, stop token ids, `ignore_eos`, logprobs. Defaults are exactly greedy decoding. |
-| `batching/sampler.py` | live | `BatchedSampler`: applies per-row parameters to one step's `[N, vocab]` logits as whole-batch tensor ops; an all-greedy batch short-circuits to the argmax the engine always used. Seeded rows draw from their own generator so a row's output never depends on its neighbours. |
+| `runtime/sampling.py` | live | `SamplingParams`: temperature, top-p/top-k/min-p, repetition/presence/frequency penalties, per-request seed, stop token ids, `ignore_eos`, logprobs. Defaults are exactly greedy decoding; only parameter-free greedy predictions may be replayed by an exact-prefix entry. |
+| `batching/sampler.py` | live | `BatchedSampler`: applies per-row parameters to one step's `[N, vocab]` logits as whole-batch tensor ops; an all-greedy batch short-circuits to the argmax the engine always used. Seeded rows draw from a request-owned generator so output never depends on neighbours and repeated request ids start a fresh stream after terminal cleanup. |
 | `runtime/request.py` | live | `GenerationRequest` and `RequestState` (WAITING → PREFILLING → DECODING → FINISHED / CANCELLED / FAILED / REJECTED; PREFILLING/DECODING → WAITING is preemption). Holds prompt ids, `prefilled_token_count`, `allocation`, `next_token_id`, output ids, timing (`latency_report()`), recompute accounting. Transitions are validated. |
 | `cache/paging.py` | live | `KVBlockManager` + `KVBlockAllocation`: block ownership per request (`reserve`, `ensure_capacity`, `append_tokens`, `release`, `attach_prefix`, `copy_on_write_tail`). The allocator underneath is refcounted so prefix-cache blocks can be shared. |
 | `cache/prefix.py` | live (off by default) | `PrefixCache`: block-aligned radix tree + exact-match entries over the shared allocator; `lookup` returns reusable blocks, `publish` after prefill, LRU eviction with refcount awareness. |
@@ -97,7 +97,7 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `kernels/paged_decode_gqa.py` | baseline (negative result) | Same, one program per (row, KV head) sharing tiles across the GQA pair. Measured 0.95-1.06x; L2 already serves the second read. |
 | `kernels/paged_decode_config.py` | live | Tile/warp regime by context length (64x4 below 128 tokens, 128x4 above) and `choose_splits` for the split-K backend. No Triton import, so the policy is readable and testable anywhere. |
 | `kernels/paged_decode_split_k.py` | live (opt-in) | FlashDecoding structure: the key range cut into slices, one program each, partial `(m, l, acc)` merged by a second kernel. For small batches and long contexts, where the per-head grid is too narrow to fill the GPU. |
-| `kernels/flash_paged.py` | live (sm_80+) | `flash_attn_with_kvcache` over this engine's pages for both decode and chunked prefill - no gather, no mask, GQA native, splits internally. Import-guarded: absence is a backend *reason*, not an error. |
+| `kernels/flash_paged.py` | measured / geometry-gated | Direct `flash_attn_with_kvcache` over 256-token pages plus an experimental dense-gather path for 16-token pages. RTX 4060 policy accepts direct Flash for long-context FP16 prefill only; decode and dense-gather Flash remain negative results. |
 | `backends/registry.py`, `backends/builtin.py`, `backends/policy.py` | live | The kernel hook. See section 9. |
 | `model/adapters.py` | live | The model hook. See section 9. |
 | `kernels/kv_write.py` | live | Two kernels: write one decode token's K/V per row into its page slot; write a padded prefill chunk per row starting at its position. |
@@ -114,7 +114,7 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `server/continuous.py` | live | `ContinuousBatchingService`: one worker **thread** owns the engine; async handlers `submit()` into a bounded queue and get a `RequestHandle` with `on_accept` / `on_complete` callbacks; cancellations go through the worker; drain/stop semantics. |
 | `server/openai.py` | live | `/v1/models`, `/v1/completions`, `/v1/chat/completions` with streaming, `usage`, logprobs, stop strings, chat template. Translation only: request fields become `SamplingParams`, unsupported ones (`n>1`, `echo`, `best_of`, `logit_bias`) are refused rather than ignored. |
 | `metrics/prometheus.py` | live | `ServerMetrics`: counters, gauges and histograms in Prometheus text format (TTFT, ITL, e2e, queue time, prompt/generation tokens, KV utilization, running/waiting, in-service graph captures). No client dependency. |
-| `server/api.py` | live | FastAPI app: `POST /generate`, `POST /generate/stream` (SSE), `GET /health`, `GET /ready`; status-code mapping for every terminal state; `default_engine_factory` builds the engine and runs `warmup()` before readiness. |
+| `server/api.py` | live | FastAPI app: `POST /generate`, `POST /generate/stream` (SSE), `GET /health`, `GET /ready`; status-code mapping for every terminal state; configurable `default_engine_factory` builds and warms the engine. `create_rtx4060_flash_app` is the measured FP16/page-256/Flash-prefill deployment. |
 | `quantization/int8.py`, `quantization/kv_int8.py` | parked / live-off | Reference weight-only INT8 (`Int8Linear`), KV INT8 helpers. |
 | `speculative/vanilla.py`, `speculative/optimized.py` | parked | Single-sequence draft-model speculative decoding with greedy acceptance. Not integrated with batching (roadmap Tier 2 rebuilds it inside the batched step). |
 | `metrics/` | live | `cuda_timed` context manager, `percentile`, latency summaries used by benchmarks. |

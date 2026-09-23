@@ -9,6 +9,7 @@ an architecture from what is merely available on it.
 from __future__ import annotations
 
 import pytest
+import torch
 
 from engine.backends import (
     Backend, Geometry, defaults_for, describe, names, register, report, resolve, unregister,
@@ -104,6 +105,40 @@ def test_head_dim_above_the_kernel_limit_is_reported_not_crashed() -> None:
     assert "128" in rows["per_head"]["reason"]
 
 
+def test_flash_paged_geometry_matches_the_upstream_kvcache_contract() -> None:
+    # This is a pure geometry check; it must reject the engine's ordinary 16-token page
+    # before a selected Flash backend reaches the upstream CUDA launch and fails there.
+    from engine.kernels.flash_paged import supports
+
+    assert "divisible by 256" in supports(16, 128, torch.bfloat16)
+    assert supports(256, 128, torch.bfloat16) is None
+
+
+def test_flash_prefill_does_not_submit_padded_tokens(monkeypatch) -> None:
+    import engine.kernels.flash_paged as flash_paged
+
+    calls = []
+
+    def fake_kvcache(query, _key, _value, **kwargs):
+        calls.append((query.shape, kwargs["cache_seqlens"].tolist()))
+        return query + 1
+
+    monkeypatch.setattr(flash_paged, "flash_kvcache", lambda: fake_kvcache)
+    query = torch.zeros((2, 1, 4, 8), dtype=torch.float16)
+    pages = torch.zeros((1, 256, 1, 8), dtype=torch.float16)
+    tables = torch.zeros((2, 1), dtype=torch.int32)
+    out = flash_paged.flash_paged_prefill(
+        query, pages, pages, tables,
+        torch.tensor([3, 5], dtype=torch.int32),
+        torch.tensor([2, 4], dtype=torch.int32),
+    )
+
+    assert {shape[1] for shape, _ in calls} == {2, 4}
+    assert {tuple(lengths) for _, lengths in calls} == {(5,), (9,)}
+    assert torch.all(out[0, :, :2] == 1) and torch.all(out[0, :, 2:] == 0)
+    assert torch.all(out[1] == 1)
+
+
 def test_measured_defaults_are_used_for_a_measured_architecture() -> None:
     assert 75 in MEASURED, "the T4 results are the engine's reference architecture"
     defaults = defaults_for(_profile(75), QWEN)
@@ -113,11 +148,11 @@ def test_measured_defaults_are_used_for_a_measured_architecture() -> None:
     assert "T4 A/B" in defaults.reasons["prefill_attention"]
 
 
-def test_unmeasured_architecture_says_so_and_prefers_bf16() -> None:
+def test_rtx4060_uses_the_measured_fp16_policy() -> None:
     defaults = defaults_for(_profile(89), QWEN)
-    assert defaults.dtype == "bfloat16"
-    assert "unmeasured" in defaults.reasons["decode_attention"]
-    assert "ab.py" in defaults.reasons["measure"]
+    assert defaults.dtype == "float16"
+    assert defaults.decode_attention == "per_head"
+    assert "RTX 4060" in defaults.reasons["decode_attention"]
 
 
 def test_measured_default_that_cannot_run_here_falls_back_and_says_so() -> None:

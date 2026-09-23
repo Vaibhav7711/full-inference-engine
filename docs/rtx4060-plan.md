@@ -1,7 +1,7 @@
 # RTX 4060 plan: what changes when the GPU is Ada and it is yours
 
-Target machine: RTX 4060, 6 GB VRAM, 16 GB host RAM, local. Replaces the Kaggle T4 as
-the measurement platform from 2026-09-22.
+Target machine: RTX 4060, 8 GB VRAM (8188 MiB reported by the driver), 16 GB host RAM,
+local. Replaces the Kaggle T4 as the measurement platform from 2026-09-22.
 
 ## What is different, and what it enables
 
@@ -11,9 +11,9 @@ the measurement platform from 2026-09-22.
 | fp16 tensor throughput | ~65 TFLOPs | ~120+ TFLOPs dense, plus bf16 and FP8 (e4m3) | prefill and the fused step get cheaper; the compute half of a prefill-carrying step shrinks |
 | L2 cache | 4 MB | 24 MB | KV tiles for a whole batch fit; the GQA double-read question is even more settled; attention becomes latency-bound sooner |
 | `tl.dot` in Triton | lowers to FMA (no `mma.sync`) | lowers to `mma.sync` | **the tiled prefill kernel is finally a candidate**; the PTX gate decides |
-| FlashAttention | not supported | FlashAttention-2 supported, incl. `flash_attn_with_kvcache` over **paged** KV with block tables (decode and chunked prefill in one API) | a production attention backend for both phases, split-K built in |
+| FlashAttention | not supported | FlashAttention-2 imports and executes on sm_89, but its paged-KV API requires 256-token pages | a measured candidate, not a serving default: this engine normally uses 16-token pages |
 | torch SDPA backends | memory-efficient, math | flash (no custom mask), memory-efficient, math | our chunk mask still forces memory-efficient; flash only via `flash_attn` directly |
-| VRAM | 16 GB | **6 GB** | Qwen3-0.6B fp16 (1.2 GB) + KV is comfortable; Qwen3-1.7B fp16 (3.4 GB) fits with ~1-1.5 GB of KV; 4B needs INT4 weights; graph pools count |
+| VRAM | 16 GB | **8 GB** | Qwen3-0.6B fp16 (1.2 GB) + KV is comfortable; Qwen3-1.7B fp16 (3.4 GB) fits with a ~3 GB KV pool; 4B needs INT4 weights; graph pools count |
 | session | 12 h, remote, no profiler | unlimited, local, **Nsight Systems / Nsight Compute** | kernel-level truth (achieved bandwidth, occupancy, stall reasons) instead of inference from timings |
 
 Two things to check on day one before believing anything: the card's actual bandwidth
@@ -29,10 +29,10 @@ Add **Qwen3-1.7B** as the primary serving target once the re-baseline is in: sam
 architecture family (the fusion installers and kernels need no change; 28 layers, 8 KV
 heads, head_dim 128 → identical per-token KV size), 2.8x the weights so the decode step
 is ~3x longer and per-step overheads stop dominating - closer to real serving. Memory
-budget on 6 GB: 3.4 GB weights + ~0.3 GB activations/graph pools + KV. At 114 KB/token,
-1.5 GB of KV is ~13k tokens: `num_blocks=800`, `max_active=8` with ~1.6k-token
-contexts. Tight but workable; the soak's KV-pressure tests become realistic rather than
-synthetic.
+budget on this 8 GB card: 3.4 GB weights + ~0.3 GB activations/graph pools + KV. At
+114 KB/token, a ~3 GB KV pool is ~25.6k tokens: start at `num_blocks=1600`,
+`max_active=8` with ~3.2k-token contexts. This leaves room for fragmentation but still
+requires the soak's KV-pressure tests to set the final value.
 
 **Qwen3-4B** only as the quantization target (Tier 2 item 6): fp16 does not fit; W4A16
 (2.5 GB) does. Do not start there.
@@ -43,7 +43,7 @@ synthetic.
 - Linux/WSL2, CUDA 12.x driver, `torch` cu12 wheel, `triton`, `flash-attn` wheel for
   sm_89, `nsight-systems`/`nsight-compute`.
 - `python -m pytest -q` (CPU) and `python -m pytest -q -m cuda` (all suites; the speculative
-  suite too - memory is the only reason it was excluded on Kaggle and 6 GB may exclude it
+  suite too - memory is the only reason it was excluded on Kaggle and 8 GB may still exclude it
   again).
 - `python scripts/check_hooks.py --out results/rtx4060/check_hooks.json` - warmup, graphs,
   phases, zero lazy captures.
@@ -52,6 +52,37 @@ synthetic.
 - `benchmarks/kernels/prefill_attention_ab.py --ptx-only` - **expect `mma_sync > 0`**,
   no spills. If not, the tiled kernel's tile defaults (`engine/kernels/device.py`) need
   re-deriving before anything else.
+
+#### R0 result — 2026-09-23
+
+- Observed hardware: RTX 4060 (sm_89), 8188 MiB reported by the driver; PyTorch reports
+  24 SMs and 25 MB L2. Linux, CUDA toolkit 13.1, PyTorch 2.14.0+cu130 and Triton 3.8.0
+  are working together. Nsight Systems and Nsight Compute are installed.
+- Test gates: the non-CUDA suite passes (290); CUDA passes 192 tests with one expected
+  8 GB skip (the two-model FP32 speculative parity test) and one strict expected failure.
+  The expected failure is INT8 paged-KV recompute/preemption changing a greedy token on
+  sm_89; keep INT8 KV disabled until its Ada correctness repair and A/B are complete.
+- Hook gate passes: six decode, 28 prefill and 126 fused-step graphs were captured during
+  warm-up, with zero lazy captures and no reported problems. The unmeasured safe defaults
+  are `per_head` decode and SDPA prefill; tiled prefill is deliberately opt-in until R1.
+- Roofline: decode-like FP16 GEMV reached **257.4 GB/s**, yielding a Qwen3-0.6B
+  weight-only floor of **4.63 ms/token**. See `results/rtx4060/roofline.json`.
+- PTX gate: tiled prefill emits 32 `mma.sync` instructions with zero spills. Its K/V loads
+  are still scalar, so it is structurally viable but must be tuned and measured in R1.
+- FlashAttention probe completed. The PyPI 2.8.3 source build is incompatible with PyTorch
+  2.14 because it forces C++17; current upstream 2.8.4 source compiled as an sm_89-only,
+  Qwen head-dimension-128 inference build after a private CUDA 13.1/glibc compatibility
+  overlay. It imports and `flash_attn_with_kvcache` executes. This installation is a local
+  measurement artifact, not a project dependency lock.
+- Crucially, the installed API rejects the engine's 16-token KV pages: page size must be
+  divisible by **256**. The backend geometry gate now reports that reason and retains the
+  safe `per_head`/SDPA defaults for ordinary 16-token serving. Under a 256-token-page test
+  layout, both Flash phases are deliberately eager-only because their variable-length
+  grouping / split-KV workspace setup are not CUDA-graph safe on this build. See
+  `results/rtx4060/check_hooks_flash_block256_full.json`.
+- The original combined short-profile A/B changed decode and prefill together and was
+  rejected: median ITL was **+11.5%**. Phase isolation below explains why and identifies
+  the long-context prefill-only configuration that does win.
 
 ### Phase R1 - re-baseline, 0.6B, same settings as T4 (evening 1-2)
 Run the notebook's Phase 1/1c/2b/2c A/Bs as plain shell commands (no two-GPU runner
@@ -62,28 +93,51 @@ transfer, which do not. Expected: graphs and fused step transfer; SDPA-vs-per_to
 margin narrows (compute is cheaper); tiled kernel becomes competitive or wins; GQA kernel
 still neutral.
 
-### Phase R2 - FlashAttention-2 over paged KV (the big one)
+### Phase R2 - FlashAttention-2 over paged KV — completed, prefill-only win
 
-*Built since this plan was written*: `engine/kernels/flash_paged.py` maps both phases onto
-`flash_attn_with_kvcache`, registered as the `flash` backend for decode and prefill and
-selected automatically once the wheel imports (priority 80). R2 is now a measurement, not
-an implementation: install the wheel, run `check_hooks.py --backends-only` to confirm the
-table says `ok`, then `ab.py --setting flash_attention` on both profiles. Same for
-split-K decode (`--setting decode_split_k`), which is the D19 candidate.
-`flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=..., block_table=...,
-causal=True)` accepts our pool layout `[num_blocks, block_size, kv_heads, head_dim]`
-directly (FA2's paged KV requires the page size to be a multiple of 16 tokens - ours is
-16; verify against the installed version's docstring on day one), handles GQA natively, does split-K for decode,
-and takes q of length 1 (decode) or `chunk` (prefill, with `cache_seqlens` = start and
-causal within the chunk). One kernel for both phases, no gather, no mask tensor.
-- Add `decode_attention="flash"` and `prefill_attention="flash"` dispatch in the three
-  attention functions (`_decode_attention`, `_prefill_attention`); the K/V write kernels
-  stay ours (FA2 can also write K/V via `k=`/`v=` args - try both).
-- Graph-capture safety: FA2 kernels are capture-safe; `cache_seqlens` must be a device
-  tensor (it is: `_device_seq_lens`).
-- A/B: `decode_kernel` (per_head vs flash) and `prefill_kernel` (sdpa vs tiled vs flash),
-  chat and long. Decision rule as always: outside the spread, tokens gated.
-- This is also the answer to D19 (split-K): FA2's decode path already splits.
+`engine/kernels/flash_paged.py` maps both phases onto
+`flash_attn_with_kvcache`. The implementation is now geometry-gated: its paged-KV API
+requires `block_size % 256 == 0`, so normal 16-token pages never select it and do not crash.
+For valid 256-token pages it runs direct over `[num_blocks, page_size, kv_heads, head_dim]`,
+with `cache_seqlens = start + chunk` for prefill. Padded staged chunks are grouped by their
+actual query length before the FA call; otherwise the API regards padding as real tokens and
+misaligns the causal mask.
+
+The follow-up isolated phases, exposed FA's `num_splits`, swept attention kernels over batch
+1/4/8/16 and context 128/512/2048/4096, and removed a host synchronization that had run once
+per transformer layer. Row groups now come from the engine's pinned host staging once per
+step; equal-length chunks take a direct zero-gather adapter path.
+
+Results:
+
+- Decode remains rejected. FA is only 15% faster at the attention-kernel level for the narrow
+  batch-1/context-4096 cell, but its kvcache entry point is not CUDA-graph safe on this build.
+  Against graphed `per_head`, short-profile ITL regressed **114%**. Forced split counts did not
+  improve the useful cells; upstream auto was retained. See
+  `flash_paged_decode_sweep.json` and `ab_flash_decode_block256_short.json`.
+- Optimized prefill is accepted for long-context, 256-page FP16 configurations. On Qwen3-0.6B,
+  prefill steps improved **7.8%**, prefill penalty **13.4%**, and ITL p99 **22.6%**. On
+  Qwen3-1.7B, median TTFT improved **13.7%**, expected gap **5.3%**, fused GPU time **11.8%**,
+  and ITL p99 **9.9%**. Both passed the leading-token stock gate in FP16. See
+  `ab_flash_prefill_block256_long_graphs_fp16.json` and
+  `ab_flash_prefill_qwen3_1.7b_long_graphs_fp16.json`.
+- A gathered dense-FA variant permits normal 16-token pages, but lost badly end to end
+  (**+38.5%** prefill step, **+52.6%** TTFT); it remains an explicit experimental backend.
+
+Therefore the measured Ada policy is:
+
+- always retain graphed `per_head` decode;
+- use SDPA prefill with normal 16-token pages;
+- for long-context FP16 deployments that deliberately select 256-token pages, use optimized
+  Flash prefill only; do not use BF16 for this path because it failed the early token gate;
+- keep dense-gather Flash and Flash decode opt-in until a newer backend changes their results.
+
+The production-shaped configuration is exposed as `create_rtx4060_flash_app`: FP16,
+256-token pages, graphed `per_head` decode and eager optimized Flash prefill. External HTTP
+verification passes completion, streaming chat, stop/seed determinism, input refusal,
+eight-way concurrency and Prometheus metrics (`live_smoke_optimized_flash.json`: 6/6). The
+verification also caught and fixed an exact-prefix-cache edge case: sampled requests now
+reuse prompt KV without replaying a cached sampled token or skipping an RNG draw.
 
 ### Phase R3 - Nsight on the decode step
 `nsys profile` one graphed decode step at (batch 8, 1024) and `ncu` on the attention

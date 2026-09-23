@@ -15,7 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+server = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "requests>=2.31"]
 
 [tool.pytest.ini_options]
 markers = ["cuda: requires a CUDA GPU and model checkpoint"]

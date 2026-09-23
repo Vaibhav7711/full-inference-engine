@@ -29,6 +29,12 @@ def test_auto_uses_bfloat16_when_supported(monkeypatch: pytest.MonkeyPatch) -> N
     assert resolve_dtype("auto", torch.device("cuda")) is torch.bfloat16
 
 
+def test_auto_honors_measured_rtx4060_fp16_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 9))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    assert resolve_dtype("auto", torch.device("cuda")) is torch.float16
+
+
 def test_unknown_dtype_is_rejected() -> None:
     with pytest.raises(ValueError, match="unsupported dtype"):
         resolve_dtype("float8", torch.device("cpu"))

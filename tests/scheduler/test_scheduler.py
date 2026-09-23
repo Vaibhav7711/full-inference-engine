@@ -1,5 +1,5 @@
 from engine.cache import KVBlockManager, PrefixCache
-from engine.runtime import GenerationRequest, RequestState
+from engine.runtime import GenerationRequest, RequestState, SamplingParams
 from engine.scheduler import FCFSScheduler
 
 
@@ -105,3 +105,26 @@ def test_admission_attaches_longest_cached_prefix() -> None:
     assert request.block_table == source_blocks
     scheduler.cancel(request.request_id)
     assert manager.snapshot()["used_blocks"] == cache.snapshot()["cached_blocks"]
+
+
+def test_sampled_admission_bypasses_cached_token_but_reuses_kv_blocks() -> None:
+    manager = KVBlockManager(num_blocks=12, block_size_tokens=4)
+    cache = PrefixCache(manager, max_blocks=8)
+    source = manager.reserve("source", 6, sequence_length=6)
+    assert source is not None
+    cache.publish(list(range(6)), source, next_token_id=42)
+    source_block = source.physical_block_ids[0]
+    manager.release("source")
+    scheduler = FCFSScheduler(manager, prefix_cache=cache)
+    request = GenerationRequest(
+        "sampled", 6, 2, prompt_token_ids=list(range(6)),
+        sampling=SamplingParams(temperature=0.8, seed=7),
+    )
+
+    scheduler.submit(request)
+    assert scheduler.admit_available() == [request]
+
+    assert request.cached_next_token_id is None
+    assert request.prefilled_token_count == 4
+    assert request.cached_prefix_tokens == 4
+    assert request.block_table == [source_block]

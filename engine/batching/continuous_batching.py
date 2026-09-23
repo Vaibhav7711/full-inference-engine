@@ -77,6 +77,7 @@ class _BatchContext:
     block_size: int
     decode_block_n: int
     decode_num_warps: int
+    decode_num_splits: int = 0
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
     # "per_head": one program per (row, query head). "gqa": one per (row, KV head), the
@@ -184,6 +185,7 @@ def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, sca
             query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
             scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
             length_offset=1, max_sequence_length=ctx.decode_max_len,
+            num_splits=ctx.decode_num_splits,
         )
     from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
     write_decode_int8_kv(
@@ -335,6 +337,7 @@ class ContinuousBatchingEngine:
                  tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
                  prefill_block_n: int | None = None,
+                 decode_num_splits: int = 0,
                  max_prefill_tokens_per_iteration: int = 128,
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,
@@ -355,6 +358,8 @@ class ContinuousBatchingEngine:
             raise ValueError("prefix_cache_blocks must be non-negative")
         if kv_cache_dtype not in {"fp16", "int8"}:
             raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
+        if decode_num_splits < 0:
+            raise ValueError("decode_num_splits must be non-negative")
         if cuda_graph_batch_size is not None and cuda_graph_batch_sizes is not None:
             raise ValueError("use cuda_graph_batch_size or cuda_graph_batch_sizes, not both")
         if cuda_graph_batch_sizes is None and cuda_graph_batch_size is not None:
@@ -369,6 +374,7 @@ class ContinuousBatchingEngine:
         self.block_size = block_size
         self.max_active = max_active
         self.prefill_chunk_size = prefill_chunk_size
+        cfg = model.config
         # Attention backends are resolved against this device and this geometry rather
         # than hard-coded: "auto" (the default) takes the measured default for the
         # architecture, or the highest-priority runnable backend on one nobody has
@@ -405,15 +411,38 @@ class ContinuousBatchingEngine:
         self.tiled_prefill = self.prefill_attention == "tiled"
         self.prefill_block_m = prefill_block_m
         self.prefill_block_n = prefill_block_n
+        self.decode_num_splits = decode_num_splits
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
         self.max_waiting_requests = max_waiting_requests
         self.prefix_cache_blocks = prefix_cache_blocks
         self.kv_cache_dtype = kv_cache_dtype
         self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or ()
+        self.decode_cuda_graphs = self.decode_backend.graph_safe
+        self.decode_graph_eager_reason: str | None = None
+        if not self.decode_cuda_graphs:
+            # The FA2 kvcache entry point synchronizes while preparing its split-KV
+            # workspace, including with an explicit split count, and invalidates stream
+            # capture on the tested 2.8.4 build. Keep other phase graphs enabled.
+            self.decode_graph_eager_reason = (
+                "flash_attn kvcache decode is eager-only on this build: its split-KV "
+                "workspace setup is not CUDA-graph safe"
+            )
         # Chunked prefill forwards are captured per (row bucket, kind, context bucket)
         # when graph buckets are configured. Off keeps decode graphs and runs prefill
         # eagerly on the same staged buffers, which is the A/B for the capture itself.
         self.prefill_cuda_graphs = prefill_cuda_graphs
+        self.prefill_graph_eager_reason: str | None = None
+        if not self.prefill_backend.graph_safe:
+            # FA2 kvcache has no query-length vector. Correct variable-size chunks are
+            # grouped by their active length in `flash_paged_prefill`, which requires a
+            # host-side grouping step; its internal workspace allocation is also not
+            # capture-safe on the tested build. Do not capture an all-padding warmup
+            # graph and replay it for real rows: Flash prefill is deliberately eager.
+            self.prefill_cuda_graphs = False
+            self.prefill_graph_eager_reason = (
+                f"{self.prefill_attention} prefill backend is eager-only: variable "
+                "chunk groups and/or backend workspace are not CUDA-graph safe"
+            )
         # A step that carries both decode rows and prefill chunks runs them as one packed
         # forward (decode tokens first, chunk batch after) instead of two. The weights
         # are read once for both, and the prefill's launch cost rides on the decode
@@ -425,7 +454,6 @@ class ContinuousBatchingEngine:
         self.triton_swiglu = triton_swiglu
         self._decode_graphs = {}
 
-        cfg = model.config
         # Refuse a checkpoint whose geometry the paged kernels cannot serve, at load,
         # with the reason - rather than a wrong answer or a launch failure later.
         from engine.model.adapters import ensure_supported
@@ -764,7 +792,7 @@ class ContinuousBatchingEngine:
         if self._acquire_capacity(request, target_length):
             return True
         if request.state is not RequestState.WAITING:
-            self.scheduler.fail(request.request_id, "KV_POOL_EXHAUSTED")
+            self._fail_request(request, "KV_POOL_EXHAUSTED")
         return False
 
     def _gpu_timer(self):
@@ -866,7 +894,24 @@ class ContinuousBatchingEngine:
     ) -> None:
         sequence = request.prompt_token_ids if token_ids is None else token_ids
         if request.allocation is not None and sequence:
-            self.prefix_cache.publish(sequence, request.allocation, next_token_id)
+            # An exact entry caches a token decision, not the logits which produced it.
+            # Only parameter-free greedy requests may publish that decision.  Sampled
+            # requests still publish reusable KV blocks, but must rerun the final prompt
+            # position so their private RNG stream advances exactly once per token.
+            cached_prediction = (
+                next_token_id
+                if request.sampling.can_reuse_cached_prediction
+                else None
+            )
+            self.prefix_cache.publish(sequence, request.allocation, cached_prediction)
+
+    def _finish_request(self, request: GenerationRequest, reason: str) -> None:
+        self.scheduler.finish(request.request_id, reason=reason)
+        self.sampler.forget([request.request_id])
+
+    def _fail_request(self, request: GenerationRequest, reason: str) -> None:
+        self.scheduler.fail(request.request_id, reason)
+        self.sampler.forget([request.request_id])
 
     def _complete_prefill(self, request: GenerationRequest, predicted_token: int | None) -> None:
         """Move a fully prefilled request into decode, handling resumption after preemption."""
@@ -881,7 +926,7 @@ class ContinuousBatchingEngine:
             request.complete_resumption()
             return
         if predicted_token is None:
-            self.scheduler.fail(request.request_id, "INVALID_PREFIX_ENTRY")
+            self._fail_request(request, "INVALID_PREFIX_ENTRY")
             return
         request.next_token_id = int(predicted_token)
         self._publish_prefix(request, request.next_token_id)
@@ -889,7 +934,7 @@ class ContinuousBatchingEngine:
         request.append_token(request.next_token_id)
         reason = self._finish_reason(request, request.next_token_id)
         if reason is not None:
-            self.scheduler.finish(request.request_id, reason=reason)
+            self._finish_request(request, reason)
 
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
@@ -1137,6 +1182,39 @@ class ContinuousBatchingEngine:
             self._prefill_host_block_tables[:row_count], non_blocking=True)
 
     def _set_prefill_context(self, row_count: int, total_len: int) -> None:
+        attention_cache: dict = {}
+        if self.prefill_attention in {"flash", "flash_dense"}:
+            # These lengths already exist in pinned host staging. Group them once per
+            # engine step, not once per transformer layer; reading the CUDA tensor in
+            # `flash_paged_prefill` caused 28 device synchronizations on Qwen3.
+            lengths = self._prefill_host_chunk_lens[:row_count].tolist()
+            grouped: dict[int, list[int]] = {}
+            for row, length in enumerate(lengths):
+                if length > 0:
+                    grouped.setdefault(int(length), []).append(row)
+            if self.prefill_attention == "flash_dense":
+                starts = self._prefill_host_starts[:row_count].tolist()
+                dense_grouped: dict[tuple[int, int], list[int]] = {}
+                for row, length in enumerate(lengths):
+                    if length > 0:
+                        dense_grouped.setdefault((int(length), int(starts[row] + length)), []).append(row)
+                if (len(dense_grouped) == 1
+                        and next(iter(dense_grouped.values())) == list(range(row_count))):
+                    length, total = next(iter(dense_grouped))
+                    attention_cache["flash_dense_row_groups"] = ((length, total, None),)
+                else:
+                    attention_cache["flash_dense_row_groups"] = tuple(
+                        (length, total, torch.tensor(rows, device=self.device, dtype=torch.long))
+                        for (length, total), rows in dense_grouped.items()
+                    )
+            elif len(grouped) == 1 and next(iter(grouped.values())) == list(range(row_count)):
+                length = next(iter(grouped))
+                attention_cache["flash_row_groups"] = ((length, None),)
+            else:
+                attention_cache["flash_row_groups"] = tuple(
+                    (length, torch.tensor(rows, device=self.device, dtype=torch.long))
+                    for length, rows in grouped.items()
+                )
         _set_prefill_ctx(_PrefillContext(
             self.key_pool, self.value_pool,
             self._prefill_device_block_tables[:row_count],
@@ -1148,6 +1226,7 @@ class ContinuousBatchingEngine:
             total_len=total_len,
             prefill_block_m=self.prefill_block_m,
             prefill_block_n=self.prefill_block_n,
+            sdpa_cache=attention_cache,
         ))
 
     def _prefill_forward(self, row_count: int, width: int) -> torch.Tensor:
@@ -1233,7 +1312,9 @@ class ContinuousBatchingEngine:
 
     def cancel(self, request_id: str, reason: str = "CANCELLED_BY_CLIENT") -> GenerationRequest:
         """Cancel queued, partially-prefilled, or decoding work and release its KV."""
-        return self.scheduler.cancel(request_id, reason=reason)
+        request = self.scheduler.cancel(request_id, reason=reason)
+        self.sampler.forget([request.request_id])
+        return request
 
     def submit(self, request: GenerationRequest) -> bool:
         """Submit an externally-created request to the bounded online scheduler."""
@@ -1352,7 +1433,9 @@ class ContinuousBatchingEngine:
                 if request.sampling.penalize_prompt else request.output_token_ids
                 for request in requests
             ]
-        result = self.sampler.sample(logits, params, contexts)
+        result = self.sampler.sample(
+            logits, params, contexts, [request.request_id for request in requests],
+        )
         for row, entries in result.logprobs.items():
             requests[row].output_logprobs.append(entries)
         return result.token_ids
@@ -1396,7 +1479,7 @@ class ContinuousBatchingEngine:
             s.append_token(tok)
             reason = self._finish_reason(s, tok)
             if reason is not None:
-                self.scheduler.finish(s.request_id, reason=reason)
+                self._finish_request(s, reason)
 
     def _set_fused_contexts(
         self, *, decode_rows: int, block_tables, seq_lens, block_n: int, num_warps: int,
@@ -1406,6 +1489,7 @@ class ContinuousBatchingEngine:
             key_pool=self.key_pool, value_pool=self.value_pool,
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
             decode_block_n=block_n, decode_num_warps=num_warps,
+            decode_num_splits=self.decode_num_splits,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
             decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
@@ -1502,7 +1586,8 @@ class ContinuousBatchingEngine:
         prefill_bucket = self._prefill_row_bucket(prefill_count, self.FUSED_PREFILL_ROW_LIMIT)
         total_len = max(request.prefilled_token_count + n for request, n in plans)
         use_graph = (
-            self.prefill_cuda_graphs and decode_bucket is not None and prefill_bucket is not None
+            self.decode_cuda_graphs and self.prefill_cuda_graphs
+            and decode_bucket is not None and prefill_bucket is not None
             and f"fused:{self.prefill_attention}" not in self._prefill_graph_unsupported
         )
         graph = None
@@ -1597,7 +1682,7 @@ class ContinuousBatchingEngine:
                 if len(active) <= size <= self.max_active
             ),
             None,
-        )
+        ) if self.decode_cuda_graphs else None
         input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata(
             active, graph_bucket_size=graph_bucket_size,
         )
@@ -1609,6 +1694,7 @@ class ContinuousBatchingEngine:
             key_pool=self.key_pool, value_pool=self.value_pool,
             block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
             decode_block_n=decode_block_n, decode_num_warps=decode_num_warps,
+            decode_num_splits=self.decode_num_splits,
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
             decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
@@ -1751,7 +1837,7 @@ class ContinuousBatchingEngine:
             # (2048-token contexts) then captured a dozen graphs inside the timed window:
             # ITL p99 doubled (64.7 -> 126.9 ms) while p50 fell 17%. A capture is two
             # eager forwards plus syncs in a live step; it belongs in warmup or nowhere.
-            if self.fused_step:
+            if self.fused_step and self.decode_cuda_graphs:
                 regimes = sorted({
                     select_paged_decode_config(length, 1, self.decode_attention)
                     for length in (64, 128)
@@ -1775,6 +1861,8 @@ class ContinuousBatchingEngine:
             "prefill_graphs": len(self._prefill_graphs),
             "fused_graphs": len(self._fused_graphs),
             "prefill_graph_unsupported": dict(self._prefill_graph_unsupported),
+            "prefill_graph_eager_reason": self.prefill_graph_eager_reason,
+            "decode_graph_eager_reason": self.decode_graph_eager_reason,
             "prefill_sdpa_calls": self.prefill_sdpa_calls,
             "prefill_chunked_calls": self.prefill_chunked_calls,
         }

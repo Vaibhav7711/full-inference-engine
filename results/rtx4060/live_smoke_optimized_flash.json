@@ -1,0 +1,87 @@
+{
+  "base_url": "http://127.0.0.1:8000",
+  "results": {
+    "service": {
+      "ready": {
+        "status": "ready",
+        "active_handles": 0,
+        "pending_submissions": 0,
+        "completed_requests": 0,
+        "cancelled_requests": 0,
+        "failed_requests": 0,
+        "worker_failed": false,
+        "draining": false,
+        "waiting_requests": 0,
+        "active_requests": 0,
+        "decode_batch": 0,
+        "decode_context_tokens": 0,
+        "decode_mean_context": 0.0,
+        "admitted_total": 0,
+        "rejected_total": 0,
+        "preemptions_total": 0,
+        "progress_epoch": 0,
+        "kv_blocks_total": 64,
+        "kv_blocks_reserved": 7,
+        "kv_blocks_used": 7,
+        "kv_utilization": 0.0,
+        "prefix_cache_blocks": 0,
+        "prefix_cache_hits": 0,
+        "prefix_cache_misses": 0,
+        "prefill_steps": 0,
+        "decode_only_steps": 0,
+        "fused_steps": 0,
+        "lazy_graph_captures": 0,
+        "prefill_sdpa_calls": 0,
+        "prefill_chunked_calls": 0,
+        "prefill_sdpa_tokens": 0,
+        "prefill_chunked_tokens": 0,
+        "recomputed_tokens_total": 0,
+        "recompute_ms_total": 0.0
+      },
+      "model": "Qwen/Qwen3-0.6B"
+    },
+    "completion": {
+      "seconds": 0.3125481589959236,
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 48,
+        "total_tokens": 58
+      },
+      "finish_reason": "length",
+      "text": " What is its purpose?\nAnswer:\nA **KV cache** is a type of memory cache used in computer systems to store frequently accessed data. Its purpose is to improve the speed of data retrieval by storing freq"
+    },
+    "chat_stream": {
+      "chunks": 64,
+      "ttft_s": 0.03669071700278437,
+      "span_s": 0.36158295899804216,
+      "finish_reason": "length",
+      "text": "<think>\nOkay, the user wants me to count from one to twenty in words. Let me think about how to approach this.\n\nFirst, I need to make sure I understand the task correctly. They want the numbers conver"
+    },
+    "stop_and_seed": {
+      "stopped_text": " i j k l m n o p q r s t u v w x y z\n\nSo, the alphabet is a list o",
+      "seeded_text": " Cache will come, to be part of every heart. = each heart will remember the path. Hope to share the lesson. Finally, the"
+    },
+    "refusals": {
+      "n_gt_1": 400,
+      "echo": 400,
+      "bad_temperature": 422
+    },
+    "concurrency": {
+      "single_s": 0.3808399709960213,
+      "concurrent_wall_s": 0.45047978900402086,
+      "concurrency": 8,
+      "speedup_vs_serial": 6.763277381887106,
+      "latency_p50_s": 0.44151517899808823,
+      "latency_max_s": 0.44786464200296905,
+      "tokens_per_second": 1136.5659736522164
+    },
+    "metrics": {
+      "generation_tokens_total": 780.0,
+      "requests_total": 14.0,
+      "graph_captures_in_service": 0.0,
+      "kv_cache_utilization": 0.19298245614035087,
+      "decode_batch_size": 0.0
+    }
+  },
+  "failures": []
+}

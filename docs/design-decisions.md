@@ -568,6 +568,62 @@ record before it is considered complete.
   counters are two integer assignments and are always on.
 
 
+### DD-040 — On sm_89, deploy FlashAttention for compatible prefill only
+
+- **Decision:** the measured RTX 4060 policy keeps Triton `per_head` decode and selects
+  direct paged Flash prefill only for FP16 with a page size divisible by 256. Compact
+  16-token pages retain SDPA prefill.
+- **Why:** direct paged Flash prefill improved long-profile phase and tail metrics on both
+  Qwen3-0.6B and Qwen3-1.7B. Flash decode cannot be captured by CUDA graphs in the tested
+  FA2 build, and the loss of graph replay dominates its isolated long-context kernel win.
+- **Rejected:** Flash decode (+113.9% ITL p50 versus graphed Triton), dense-gather Flash
+  on 16-token pages (+38.5% prefill step, +52.6% TTFT), and BF16 after an early non-tie
+  token divergence.
+- **Code:** `engine/kernels/flash_paged.py`, `engine/backends/builtin.py`,
+  `engine/backends/policy.py`, `engine/batching/continuous_batching.py`.
+- **Evidence:** `docs/rtx4060-final-evaluation.md` and its indexed result JSONs.
+
+
+### DD-041 — Graph safety is a backend property, not an engine-wide switch
+
+- **Decision:** each attention backend declares whether it is capture-safe. An unsafe
+  phase runs eagerly while eligible decode, prefill and fused shapes retain their graphs.
+- **Why:** FA2's kvcache entry point synchronizes while preparing split-KV workspace on
+  this build, even with an explicit split count. Treating this as a global graph failure
+  would discard proven graph wins from unrelated phases.
+- **Code:** `engine/backends/registry.py`, `engine/backends/builtin.py`,
+  `engine/batching/continuous_batching.py`, `scripts/check_hooks.py`.
+- **Tradeoff:** the mixed configuration is less uniform, so hook output must report which
+  phase is intentionally eager and why.
+
+
+### DD-042 — Cache KV across sampling policies, never an under-specified token decision
+
+- **Decision:** exact-prefix next-token replay is allowed only for parameter-free greedy
+  requests without requested logprobs. Sampled and penalized requests may attach complete
+  cached KV blocks but must evaluate the residual prompt token and perform their own draw.
+- **Why:** an exact entry is keyed by prompt tokens, not sampling parameters. Replaying a
+  sampled decision can leak it into a later policy; skipping that draw also offsets every
+  later token in a seeded RNG stream.
+- **Code:** `engine/runtime/sampling.py`, `engine/cache/prefix.py`,
+  `engine/scheduler/scheduler.py`, `engine/batching/continuous_batching.py`.
+- **Evidence:** repeated same-engine seeded generation and external HTTP seed checks pass
+  with a real prefix hit.
+
+
+### DD-043 — Publish model-family capability separately from measured performance
+
+- **Decision:** Qwen3-0.6B/1.7B are the performance-validated Ada targets. Structural
+  adapters may enable Qwen/Llama/Mistral-like dense GQA models, but a family is advertised
+  as performance-validated only after stock-token, hook, soak and end-to-end A/B gates.
+- **Why:** matching module structure and geometry is necessary, not sufficient. RoPE
+  variants, sliding windows and checkpoint-specific numerical behavior can invalidate a
+  plausible output without raising an exception.
+- **Code:** `engine/model/adapters.py`, `scripts/check_hooks.py`.
+- **Tradeoff:** the public support matrix grows more slowly, but every claimed family has
+  reproducible evidence rather than inference from class names.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

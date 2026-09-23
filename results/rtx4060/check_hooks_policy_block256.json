@@ -1,0 +1,155 @@
+{
+  "model": {
+    "model_type": "qwen3",
+    "class": "Qwen3ForCausalLM",
+    "geometry": {
+      "num_layers": 28,
+      "hidden_size": 1024,
+      "num_q_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "vocab_size": 151936,
+      "max_position_embeddings": 40960,
+      "gqa_group": 2
+    },
+    "kv_bytes_per_token": 114688,
+    "mlp_modules": 28,
+    "norm_modules": 113,
+    "rope_module": "transformers.models.qwen3.modeling_qwen3",
+    "unsupported_reason": null
+  },
+  "backends": {
+    "device": "NVIDIA GeForce RTX 4060 (sm_89, 8.2 GB, 24 SMs, 25 MB L2)",
+    "measured": true,
+    "defaults": {
+      "decode_attention": "per_head",
+      "prefill_attention": "flash",
+      "dtype": "float16"
+    },
+    "reasons": {
+      "decode_attention": "RTX 4060 A/B: FA2 decode is eager-only and +114% ITL against graphed per_head at the short serving point",
+      "prefill_attention": "RTX 4060 long-context A/B: optimized FA2 prefill reduced prefill step 7.8% (0.6B) and TTFT 13.7% (1.7B); requires 256-token pages",
+      "dtype": "FP16 passed the early stock-token gate; BF16 Flash diverged at token 2"
+    },
+    "decode_backends": [
+      {
+        "name": "flash",
+        "available": true,
+        "reason": null,
+        "priority": 80,
+        "graph_safe": false,
+        "summary": "flash_attn_with_kvcache over the pages; splits internally, GQA native.",
+        "tags": [
+          "flash-attn",
+          "paged",
+          "sm80+"
+        ]
+      },
+      {
+        "name": "gqa",
+        "available": true,
+        "reason": null,
+        "priority": 10,
+        "graph_safe": true,
+        "summary": "Triton, one program per (row, KV head), K/V tile shared by the group. Measured 0.95-1.06x on the T4: L2 already serves the second read.",
+        "tags": [
+          "triton",
+          "paged",
+          "negative-result"
+        ]
+      },
+      {
+        "name": "per_head",
+        "available": true,
+        "reason": null,
+        "priority": 50,
+        "graph_safe": true,
+        "summary": "Triton, one program per (row, query head); the measured baseline.",
+        "tags": [
+          "triton",
+          "paged",
+          "int8-capable"
+        ]
+      },
+      {
+        "name": "split_k",
+        "available": true,
+        "reason": null,
+        "priority": 20,
+        "graph_safe": true,
+        "summary": "Triton FlashDecoding: the key range split across programs, then merged. For small batches and long contexts, where the per-head grid is too narrow.",
+        "tags": [
+          "triton",
+          "paged",
+          "unmeasured"
+        ]
+      }
+    ],
+    "prefill_backends": [
+      {
+        "name": "flash",
+        "available": true,
+        "reason": null,
+        "priority": 80,
+        "graph_safe": false,
+        "summary": "flash_attn_with_kvcache with causal=True over the pages: no gather, no mask.",
+        "tags": [
+          "flash-attn",
+          "paged",
+          "sm80+"
+        ]
+      },
+      {
+        "name": "flash_dense",
+        "available": true,
+        "reason": null,
+        "priority": 45,
+        "graph_safe": false,
+        "summary": "Gather 16-token pages, then run dense flash_attn_func with native GQA.",
+        "tags": [
+          "flash-attn",
+          "gather",
+          "sm80+"
+        ]
+      },
+      {
+        "name": "per_token",
+        "available": true,
+        "reason": null,
+        "priority": 30,
+        "graph_safe": true,
+        "summary": "Triton, one program per (row, head, query token), reads pages in place. The only chunked path that works with an INT8 pool.",
+        "tags": [
+          "triton",
+          "paged",
+          "int8-capable"
+        ]
+      },
+      {
+        "name": "sdpa",
+        "available": true,
+        "reason": null,
+        "priority": 50,
+        "graph_safe": true,
+        "summary": "Gather the prefix pages, then torch SDPA (memory-efficient backend). The T4 default: -40%/-66% step vs per_token, token-identical to stock.",
+        "tags": [
+          "torch",
+          "gather"
+        ]
+      },
+      {
+        "name": "tiled",
+        "available": true,
+        "reason": null,
+        "priority": 40,
+        "graph_safe": true,
+        "summary": "Triton FlashAttention structure with tl.dot over paged K/V. Needs sm_80+ to reach the tensor cores; an explicit candidate gated by prefill_attention_ab.py --ptx-only and the RTX A/B.",
+        "tags": [
+          "triton",
+          "paged",
+          "sm80+"
+        ]
+      }
+    ]
+  }
+}

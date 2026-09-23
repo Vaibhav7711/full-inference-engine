@@ -3023,3 +3023,37 @@ that enumerate the built-ins.
 
 Nothing here changes a measured number: the T4's defaults are what `MEASURED[75]`
 returns, and the CPU suite (288 tests) plus the CUDA gates cover the new paths.
+
+## RTX 4060 FlashAttention closure (2026-09-24)
+
+The sm_89 measurement changed the provisional hook conclusion. FlashAttention-2 2.8.4
+was built from source for the local CUDA/PyTorch combination and its kvcache API executed,
+but required pages divisible by 256. That geometry constraint made “Flash versus baseline”
+several distinct experiments rather than one switch.
+
+The first combined page-256 arm lost: ITL p50 +11.5%, prefill step +16.1%. Phase isolation
+found two independent causes. Flash decode could not enter a CUDA graph because its
+kvcache workspace path synchronizes during capture; against graphed `per_head` it produced
++113.9% ITL p50 and was rejected. Flash prefill performed a CUDA-to-CPU length conversion
+inside the attention adapter once per transformer layer. Moving grouping to pinned host
+staging once per engine step and adding an equal-length direct path changed the end-to-end
+result.
+
+For Qwen3-0.6B FP16 long prompts, optimized direct Flash prefill reduced prefill step p50
+7.8%, prefill penalty 13.4%, fused GPU p50 8.8%, and ITL p99 22.6%. Qwen3-1.7B confirmed
+the serving result: expected gap -5.3%, TTFT p50 -13.7%, ITL p99 -9.9%, prefill GPU p50
+-5.3%, and fused GPU p50 -11.8%. The stock leading-token gate passed in FP16.
+
+The compatibility experiment was negative. Gathering normal 16-token pages into dense K/V
+before calling Flash made prefill step 38.5% slower and TTFT 52.6% worse. It remains an
+explicit low-priority backend only to keep the result reproducible. Forced decode split
+counts also lost to FA2 automatic planning.
+
+The accepted Ada deployment is consequently asymmetric: graphed Triton `per_head` decode
+plus eager direct Flash prefill on page 256, FP16. Compact pages use SDPA. The external
+OpenAI-compatible smoke passed 6/6 after it exposed one final correctness defect: exact
+prefix reuse had skipped the first seeded RNG draw. Exact cached token decisions are now
+restricted to parameter-free greedy requests; sampled traffic still reuses complete KV.
+
+Full evidence, commands, negative results and publication boundaries are consolidated in
+`docs/rtx4060-final-evaluation.md`.

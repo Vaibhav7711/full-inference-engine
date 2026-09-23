@@ -89,6 +89,35 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("triton_paged", {"decode_attention": "per_head", "prefill_attention": "sdpa"}),
         ("flash_paged", {"decode_attention": "flash", "prefill_attention": "flash"}),
     ],
+    # Isolate the two phases. The combined arm cannot reveal whether decode or prefill
+    # caused a regression, and Flash prefill has different graph/variable-length costs.
+    "flash_decode": [
+        ("triton_decode", {"decode_attention": "per_head", "prefill_attention": "sdpa"}),
+        ("flash_decode", {"decode_attention": "flash", "prefill_attention": "sdpa"}),
+    ],
+    "flash_prefill": [
+        ("sdpa_prefill", {"decode_attention": "per_head", "prefill_attention": "sdpa"}),
+        ("flash_prefill", {"decode_attention": "per_head", "prefill_attention": "flash"}),
+    ],
+    "flash_dense_prefill": [
+        ("sdpa_prefill", {"decode_attention": "per_head", "prefill_attention": "sdpa"}),
+        ("flash_dense_prefill", {"decode_attention": "per_head",
+                                  "prefill_attention": "flash_dense"}),
+    ],
+    # Upstream's automatic split heuristic is tuned across server GPUs. Ada's 24-SM
+    # 4060 has a different occupancy point, so expose and measure the supported choices.
+    "flash_decode_splits": [
+        ("flash_auto", {"decode_attention": "flash", "prefill_attention": "sdpa",
+                        "decode_num_splits": 0}),
+        ("flash_split1", {"decode_attention": "flash", "prefill_attention": "sdpa",
+                          "decode_num_splits": 1}),
+        ("flash_split2", {"decode_attention": "flash", "prefill_attention": "sdpa",
+                          "decode_num_splits": 2}),
+        ("flash_split4", {"decode_attention": "flash", "prefill_attention": "sdpa",
+                          "decode_num_splits": 4}),
+        ("flash_split8", {"decode_attention": "flash", "prefill_attention": "sdpa",
+                          "decode_num_splits": 8}),
+    ],
     # One forward per prefill-carrying step (decode rows and chunk rows packed into one
     # token row) against the decode forward followed by the prefill forward. Same kernels
     # either way; only the GEMM shapes differ, so late greedy drift is possible and the
@@ -198,7 +227,9 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
 # wrong kernel fails immediately and a rounding difference does not.
 TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rmsnorm",
                         "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step",
-                        "decode_kernel", "decode_split_k", "flash_attention"}
+                        "decode_kernel", "decode_split_k", "flash_attention",
+                        "flash_decode", "flash_prefill", "flash_dense_prefill",
+                        "flash_decode_splits"}
 
 
 def drift_expected(setting: str) -> bool:
@@ -378,11 +409,16 @@ def _verdict(baseline: dict, variant: dict) -> str:  # noqa: D401
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--dtype", default="auto", choices=("auto", "float16", "bfloat16"),
+                        help="model/KV activation dtype; explicit values make numerical "
+                             "and performance comparisons reproducible")
     parser.add_argument("--setting", default="cuda_graphs", choices=sorted(SETTINGS))
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--duration", type=float, default=8.0)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--num-blocks", type=int, default=256)
+    parser.add_argument("--block-size", type=int, default=16,
+                        help="tokens per KV page (FlashAttention paged-KV requires 256)")
     parser.add_argument("--max-active", type=int, default=8)
     parser.add_argument("--max-waiting", type=int, default=64)
     parser.add_argument("--seed", type=int, default=100)
@@ -409,9 +445,9 @@ def main() -> int:
 
     # One model, many engines: reloading weights per arm would add minutes and change
     # nothing the comparison is about.
-    loaded = load_model(args.model)
+    loaded = load_model(args.model, dtype=args.dtype)
     shared = dict(
-        num_blocks=args.num_blocks, block_size=16, max_active=args.max_active,
+        num_blocks=args.num_blocks, block_size=args.block_size, max_active=args.max_active,
         max_waiting_requests=args.max_waiting, prefix_cache_blocks=64,
     )
     if args.cuda_graphs:
@@ -483,7 +519,11 @@ def main() -> int:
     drift = [label for label in labels[1:] if identity[label] != identity[labels[0]]]
     if drift:
         message = f"greedy tokens differ across arms: {drift} vs {labels[0]}"
-        if drift_expected(args.setting):
+        if broken:
+            print(f"WARNING {message}; the stock-token gate was overridden by "
+                  f"--allow-token-drift (early divergences: "
+                  f"{ {label: divergence[label] for label in broken} }).")
+        elif drift_expected(args.setting):
             print(f"NOTE {message} (expected for {args.setting}: arms use different kernels; "
                   f"all arms match stock for the first {args.min_identical_tokens} tokens)")
         elif args.allow_token_drift:
@@ -571,6 +611,7 @@ def main() -> int:
 
     payload = {
         "setting": args.setting, "repeats": args.repeats,
+        "model": args.model, "dtype": str(loaded.dtype),
         "config": {**config.__dict__, **shared},
         "arm_settings": arm_settings,
         "prompt_profile": args.prompt_profile,
@@ -580,7 +621,9 @@ def main() -> int:
         "clocks_before": clocks_before, "clocks_after": clocks_after,
         "token_identity": {"identical": not drift, "drifted_arms": drift,
                            "first_divergence_vs_stock": divergence,
-                           "ties_vs_stock": ties, "tie_margin": TIE_MARGIN},
+                           "ties_vs_stock": ties, "tie_margin": TIE_MARGIN,
+                           "early_divergence_arms": broken,
+                           "gate_overridden": bool(broken and args.allow_token_drift)},
         "order": "interleaved",
         "arms": {label: arm.to_dict() for label, arm in arms.items()},
         "comparison": comparison,

@@ -67,7 +67,11 @@ def _attention_kernel(
         k = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)
 
         # scores = Q @ K^T * scale  -> [BLOCK_M, BLOCK_N]
-        scores = tl.dot(q, tl.trans(k)) * scale
+        # Keep the FP32 correctness path genuinely IEEE FP32.  On Ada, Triton otherwise
+        # selects TF32 input precision for float32 dot products, which is fast but exceeds
+        # this kernel's tight FP32 error contract.  FP16/BF16 inputs still select tensor
+        # core MMA as before.
+        scores = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
         scores = tl.where(n_mask[None, :], scores, float("-inf"))
         if CAUSAL:
             causal_mask = offs_m[:, None] >= cur_n[None, :]
@@ -83,7 +87,9 @@ def _attention_kernel(
         v_ptrs = v_base + cur_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
         v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * alpha[:, None] + tl.dot(
+            p.to(v.dtype), v, input_precision="ieee",
+        )
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 

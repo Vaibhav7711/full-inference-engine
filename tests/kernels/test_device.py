@@ -24,7 +24,8 @@ def test_pipeline_depth_follows_the_architecture() -> None:
     assert ADA_4060.prefill_tile_defaults()["num_stages"] == 3
 
 
-def test_defaults_are_turing_safe_when_no_device_is_present() -> None:
+def test_defaults_are_turing_safe_when_no_device_is_present(monkeypatch) -> None:
+    monkeypatch.setattr(device, "current_device", lambda: None)
     defaults = prefill_tile_defaults()
     assert defaults["num_stages"] == 2, "must not assume cp.async off-GPU"
     assert defaults["block_m"] >= 16 and defaults["block_n"] >= 16

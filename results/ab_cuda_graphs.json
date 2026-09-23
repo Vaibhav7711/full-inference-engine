@@ -1,0 +1,305 @@
+{
+  "setting": "cuda_graphs",
+  "repeats": 5,
+  "config": {
+    "duration_s": 8.0,
+    "arrival_rate_per_s": 20.0,
+    "concurrency": 8,
+    "shared_prefixes": 3,
+    "prefix_tokens": [
+      16,
+      128
+    ],
+    "suffix_tokens": [
+      4,
+      96
+    ],
+    "max_new_tokens": [
+      1,
+      64
+    ],
+    "cancel_probability": 0.02,
+    "seed": 100,
+    "max_steps": 500000,
+    "sample_every_steps": 25,
+    "num_blocks": 256,
+    "block_size": 16,
+    "max_active": 8,
+    "max_waiting_requests": 64,
+    "prefix_cache_blocks": 64,
+    "cuda_graph_batch_sizes": [
+      1,
+      2,
+      4,
+      8
+    ]
+  },
+  "prompt_profile": "short",
+  "mean_prompt_tokens": 122.0,
+  "arms": {
+    "graphs_off": {
+      "label": "graphs_off",
+      "runs": 5,
+      "ok": true,
+      "summary": {
+        "latency.itl_p50": {
+          "n": 5,
+          "median": 11.065535,
+          "min": 10.697494,
+          "max": 11.272635,
+          "spread": 0.05197588729329387
+        },
+        "latency.itl_p99": {
+          "n": 5,
+          "median": 25.383681,
+          "min": 24.851583,
+          "max": 25.985796,
+          "spread": 0.044682762913700304
+        },
+        "latency.itl_samples": {
+          "n": 5,
+          "median": 4566.0,
+          "min": 4293.0,
+          "max": 4632.0,
+          "spread": 0.07424441524310119
+        },
+        "latency.ttft_p50": {
+          "n": 5,
+          "median": 23.073168,
+          "min": 22.362638,
+          "max": 23.103258,
+          "spread": 0.03209875644298173
+        },
+        "latency.total_queue_p50": {
+          "n": 5,
+          "median": 10.788734,
+          "min": 10.570226,
+          "max": 10.873678,
+          "spread": 0.028126747772259476
+        },
+        "waste_ratio": {
+          "n": 5,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "delivered_tokens": {
+          "n": 5,
+          "median": 4735.0,
+          "min": 4451.0,
+          "max": 4802.0,
+          "spread": 0.07412882787750792
+        },
+        "peak_kv_utilization": {
+          "n": 5,
+          "median": 0.3671875,
+          "min": 0.33984375,
+          "max": 0.390625,
+          "spread": 0.13829787234042554
+        },
+        "mean_decode_batch": {
+          "n": 5,
+          "median": 7.36,
+          "min": 7.173913043478261,
+          "max": 7.5,
+          "spread": 0.04430529300567109
+        },
+        "mean_context_tokens": {
+          "n": 5,
+          "median": 128.48714285714286,
+          "min": 121.28674948240166,
+          "max": 165.41617063492063,
+          "spread": 0.3434539843537795
+        },
+        "step_timing.decode_step_p50_ms": {
+          "n": 5,
+          "median": 10.847158000615309,
+          "min": 10.601018999295775,
+          "max": 10.921401999439695,
+          "spread": 0.02953612366720815
+        },
+        "step_timing.prefill_step_p50_ms": {
+          "n": 5,
+          "median": 22.79095599988068,
+          "min": 22.271784000622574,
+          "max": 23.06864100137318,
+          "spread": 0.03496373740332691
+        },
+        "step_timing.prefill_step_fraction": {
+          "n": 5,
+          "median": 0.2202572347266881,
+          "min": 0.21280276816608998,
+          "max": 0.24121405750798722,
+          "spread": 0.12899140124569403
+        },
+        "step_timing.prefill_penalty_p50_ms": {
+          "n": 5,
+          "median": 11.900258999958169,
+          "min": 11.586349999561207,
+          "max": 12.219456002640072,
+          "spread": 0.05320102722815447
+        },
+        "step_timing.expected_gap_ms": {
+          "n": 5,
+          "median": 13.449519061578659,
+          "min": 13.210087684205481,
+          "max": 13.579898982847226,
+          "spread": 0.02749624703668306
+        },
+        "step_timing.prefill_share_of_gap": {
+          "n": 5,
+          "median": 0.19354729495697034,
+          "min": 0.19008001643453545,
+          "max": 0.20983278005301695,
+          "spread": 0.10205652123876467
+        }
+      },
+      "violations": [],
+      "coverage_gaps": [
+        "no admission rejection occurred",
+        "no preemption occurred: pool was not under pressure",
+        "states reached but never cancelled from: ['PREFILLING']",
+        "states reached but never cancelled from: ['WAITING', 'PREFILLING']"
+      ]
+    },
+    "graphs_on": {
+      "label": "graphs_on",
+      "runs": 5,
+      "ok": true,
+      "summary": {
+        "latency.itl_p50": {
+          "n": 5,
+          "median": 6.095872,
+          "min": 6.047989,
+          "max": 6.164912,
+          "spread": 0.01918068489627077
+        },
+        "latency.itl_p99": {
+          "n": 5,
+          "median": 20.323548,
+          "min": 19.720256,
+          "max": 20.667994,
+          "spread": 0.046632507276780664
+        },
+        "latency.itl_samples": {
+          "n": 5,
+          "median": 6876.0,
+          "min": 6722.0,
+          "max": 6996.0,
+          "spread": 0.039848749272833044
+        },
+        "latency.ttft_p50": {
+          "n": 5,
+          "median": 18.044266,
+          "min": 17.849843,
+          "max": 18.158677,
+          "spread": 0.017115353985581953
+        },
+        "latency.total_queue_p50": {
+          "n": 5,
+          "median": 6.058617,
+          "min": 6.011577,
+          "max": 6.114845,
+          "spread": 0.017044814022738178
+        },
+        "waste_ratio": {
+          "n": 5,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "delivered_tokens": {
+          "n": 5,
+          "median": 7110.0,
+          "min": 6943.0,
+          "max": 7235.0,
+          "spread": 0.04106891701828411
+        },
+        "peak_kv_utilization": {
+          "n": 5,
+          "median": 0.37751004016064255,
+          "min": 0.3614457831325301,
+          "max": 0.40160642570281124,
+          "spread": 0.10638297872340426
+        },
+        "mean_decode_batch": {
+          "n": 5,
+          "median": 7.583333333333333,
+          "min": 7.351351351351352,
+          "max": 7.714285714285714,
+          "spread": 0.04785947643090497
+        },
+        "mean_context_tokens": {
+          "n": 5,
+          "median": 132.18979591836734,
+          "min": 117.11579794079795,
+          "max": 160.0978835978836,
+          "spread": 0.32515433856656273
+        },
+        "step_timing.decode_step_p50_ms": {
+          "n": 5,
+          "median": 6.085303000872955,
+          "min": 6.037547998857917,
+          "max": 6.151993999083061,
+          "spread": 0.01880695179988998
+        },
+        "step_timing.prefill_step_p50_ms": {
+          "n": 5,
+          "median": 17.946476998986327,
+          "min": 17.802120999476756,
+          "max": 18.073143999572494,
+          "spread": 0.015101738358511608
+        },
+        "step_timing.prefill_step_fraction": {
+          "n": 5,
+          "median": 0.22633297062023938,
+          "min": 0.21367521367521367,
+          "max": 0.23873873873873874,
+          "spread": 0.11073740160278628
+        },
+        "step_timing.prefill_penalty_p50_ms": {
+          "n": 5,
+          "median": 11.823061999166384,
+          "min": 11.735104999388568,
+          "max": 11.98784099869954,
+          "spread": 0.02137652659935227
+        },
+        "step_timing.expected_gap_ms": {
+          "n": 5,
+          "median": 8.831398169051436,
+          "min": 8.559583682887396,
+          "max": 8.947265041103025,
+          "spread": 0.043898072626168155
+        },
+        "step_timing.prefill_share_of_gap": {
+          "n": 5,
+          "median": 0.30339524033216186,
+          "min": 0.29464466701477743,
+          "max": 0.3198700415246943,
+          "spread": 0.08314360661129594
+        }
+      },
+      "violations": [],
+      "coverage_gaps": [
+        "no admission rejection occurred",
+        "no preemption occurred: pool was not under pressure",
+        "states reached but never cancelled from: ['PREFILLING']"
+      ]
+    }
+  },
+  "comparison": {
+    "step_timing.expected_gap_ms": "-34.3% (spread 4.4%)",
+    "step_timing.prefill_share_of_gap": "+56.8% (spread 10.2%)",
+    "latency.itl_p50": "-44.9% (spread 5.2%)",
+    "latency.itl_p99": "-19.9% (spread 4.7%)",
+    "latency.itl_p999": "unresolved: +9.4% median change is within 72.5% run-to-run spread",
+    "latency.ttft_p50": "-21.8% (spread 3.2%)",
+    "step_timing.decode_step_p50_ms": "-43.9% (spread 3.0%)",
+    "step_timing.prefill_step_p50_ms": "-21.3% (spread 3.5%)",
+    "step_timing.prefill_step_fraction": "unresolved: +2.8% median change is within 12.9% run-to-run spread",
+    "step_timing.prefill_penalty_p50_ms": "unresolved: -0.6% median change is within 5.3% run-to-run spread",
+    "waste_ratio": "baseline is zero"
+  }
+}

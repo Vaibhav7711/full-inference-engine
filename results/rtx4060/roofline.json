@@ -1,0 +1,146 @@
+{
+  "device": "NVIDIA GeForce RTX 4060",
+  "device_profile": {
+    "name": "NVIDIA GeForce RTX 4060",
+    "capability": [
+      8,
+      9
+    ],
+    "total_memory_gb": 8.183349248,
+    "multiprocessors": 24,
+    "l2_cache_mb": 25.165824,
+    "sm": 89,
+    "supports_async_copy": true
+  },
+  "probes": [
+    {
+      "name": "copy",
+      "description": "read + write a large buffer (STREAM-style copy)",
+      "bytes_moved": 1073741824,
+      "ms": 4.27839994430542,
+      "gb_per_s": 250.96808105309506
+    },
+    {
+      "name": "reduction",
+      "description": "read-only sweep of a large buffer",
+      "bytes_moved": 536870912,
+      "ms": 2.087519884109497,
+      "gb_per_s": 257.1812206852442
+    },
+    {
+      "name": "gemv",
+      "description": "fp16 matrix-vector product - the decode weight-read pattern",
+      "bytes_moved": 536870912,
+      "ms": 2.085887908935547,
+      "gb_per_s": 257.38243637165124
+    }
+  ],
+  "achieved_gb_per_s": 257.38243637165124,
+  "weight_bytes": {
+    "layers": 880932864,
+    "lm_head": 311164928,
+    "other": 2048,
+    "embedding_table": 311164928,
+    "lm_head_is_tied": true
+  },
+  "weight_bytes_read_per_step": 1192099840,
+  "weight_only_floor_ms": 4.631628547795116,
+  "grid": [
+    {
+      "batch": 1,
+      "context": 128,
+      "kv_mb": 14.680064,
+      "floor_step_ms": 4.688664545305072,
+      "floor_itl_ms": 4.688664545305072,
+      "floor_ms_per_token_aggregate": 4.688664545305072
+    },
+    {
+      "batch": 1,
+      "context": 512,
+      "kv_mb": 58.720256,
+      "floor_step_ms": 4.8597725378349415,
+      "floor_itl_ms": 4.8597725378349415,
+      "floor_ms_per_token_aggregate": 4.8597725378349415
+    },
+    {
+      "batch": 1,
+      "context": 2048,
+      "kv_mb": 234.881024,
+      "floor_step_ms": 5.544204507954418,
+      "floor_itl_ms": 5.544204507954418,
+      "floor_ms_per_token_aggregate": 5.544204507954418
+    },
+    {
+      "batch": 4,
+      "context": 128,
+      "kv_mb": 58.720256,
+      "floor_step_ms": 4.8597725378349415,
+      "floor_itl_ms": 4.8597725378349415,
+      "floor_ms_per_token_aggregate": 1.2149431344587354
+    },
+    {
+      "batch": 4,
+      "context": 512,
+      "kv_mb": 234.881024,
+      "floor_step_ms": 5.544204507954418,
+      "floor_itl_ms": 5.544204507954418,
+      "floor_ms_per_token_aggregate": 1.3860511269886044
+    },
+    {
+      "batch": 4,
+      "context": 2048,
+      "kv_mb": 939.524096,
+      "floor_step_ms": 8.281932388432324,
+      "floor_itl_ms": 8.281932388432324,
+      "floor_ms_per_token_aggregate": 2.070483097108081
+    },
+    {
+      "batch": 8,
+      "context": 128,
+      "kv_mb": 117.440512,
+      "floor_step_ms": 5.087916527874767,
+      "floor_itl_ms": 5.087916527874767,
+      "floor_ms_per_token_aggregate": 0.6359895659843459
+    },
+    {
+      "batch": 8,
+      "context": 512,
+      "kv_mb": 469.762048,
+      "floor_step_ms": 6.4567804681137195,
+      "floor_itl_ms": 6.4567804681137195,
+      "floor_ms_per_token_aggregate": 0.8070975585142149
+    },
+    {
+      "batch": 8,
+      "context": 2048,
+      "kv_mb": 1879.048192,
+      "floor_step_ms": 11.93223622906953,
+      "floor_itl_ms": 11.93223622906953,
+      "floor_ms_per_token_aggregate": 1.4915295286336911
+    },
+    {
+      "batch": 16,
+      "context": 128,
+      "kv_mb": 234.881024,
+      "floor_step_ms": 5.544204507954418,
+      "floor_itl_ms": 5.544204507954418,
+      "floor_ms_per_token_aggregate": 0.3465127817471511
+    },
+    {
+      "batch": 16,
+      "context": 512,
+      "kv_mb": 939.524096,
+      "floor_step_ms": 8.281932388432324,
+      "floor_itl_ms": 8.281932388432324,
+      "floor_ms_per_token_aggregate": 0.5176207742770202
+    },
+    {
+      "batch": 16,
+      "context": 2048,
+      "kv_mb": 3758.096384,
+      "floor_step_ms": 19.23284391034394,
+      "floor_itl_ms": 19.23284391034394,
+      "floor_ms_per_token_aggregate": 1.2020527443964963
+    }
+  ]
+}

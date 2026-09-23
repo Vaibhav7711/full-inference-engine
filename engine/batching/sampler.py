@@ -55,29 +55,27 @@ class BatchedSampler:
         if generator_seed is not None:
             self._generator = torch.Generator(device=self.device)
             self._generator.manual_seed(generator_seed)
-        # Seed -> generator, least recently used first. A generator must survive for the
-        # whole request that uses it (recreating one mid-request would replay its first
-        # draws), so eviction is LRU and only ever reaches seeds no live request has
-        # used for `max_generators` distinct seeds.
-        self._seeded: OrderedDict[int, torch.Generator] = OrderedDict()
+        # Request id -> generator. Two requests with the same seed must not share RNG
+        # state or the second request will continue the first one's random stream.
+        self._seeded: OrderedDict[object, torch.Generator] = OrderedDict()
         self._max_generators = max_generators
 
-    def _row_generator(self, seed: int) -> torch.Generator:
-        generator = self._seeded.get(seed)
+    def _row_generator(self, request_id: object, seed: int) -> torch.Generator:
+        generator = self._seeded.get(request_id)
         if generator is None:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(seed)
-            self._seeded[seed] = generator
+            self._seeded[request_id] = generator
             while len(self._seeded) > self._max_generators:
                 self._seeded.popitem(last=False)
         else:
-            self._seeded.move_to_end(seed)
+            self._seeded.move_to_end(request_id)
         return generator
 
-    def forget(self, seeds: list[int]) -> None:
+    def forget(self, request_ids: list[object]) -> None:
         """Drop generators for finished requests, so the map cannot grow without bound."""
-        for seed in seeds:
-            self._seeded.pop(seed, None)
+        for request_id in request_ids:
+            self._seeded.pop(request_id, None)
 
     # ------------------------------------------------------------------ the step
     def sample(
@@ -85,6 +83,7 @@ class BatchedSampler:
         logits: torch.Tensor,                       # [N, vocab], any float dtype
         params: list[SamplingParams],
         context_tokens: list[list[int]] | None = None,
+        request_ids: list[object] | None = None,
     ) -> SampleResult:
         """Choose one token per row. `context_tokens[i]` is row i's penalty context."""
         if logits.ndim != 2:
@@ -94,6 +93,8 @@ class BatchedSampler:
             raise ValueError("one SamplingParams per logits row is required")
         if context_tokens is not None and len(context_tokens) != rows:
             raise ValueError("one context per logits row is required")
+        if request_ids is not None and len(request_ids) != rows:
+            raise ValueError("one request id per logits row is required")
 
         wants_logprobs = any(p.logprobs is not None for p in params)
         # Greedy is not the same as "nothing to do": penalties change which token the
@@ -111,7 +112,7 @@ class BatchedSampler:
 
         logprob_source = working if wants_logprobs else None
         filtered = self._filter(working, params)
-        tokens = self._draw(filtered, params)
+        tokens = self._draw(filtered, params, request_ids)
         chosen = tokens.tolist()
         return SampleResult(chosen, self._logprobs(logprob_source, params, chosen))
 
@@ -227,7 +228,8 @@ class BatchedSampler:
             logits = torch.empty_like(logits).scatter_(1, order, ordered)
         return logits
 
-    def _draw(self, logits: torch.Tensor, params: list[SamplingParams]) -> torch.Tensor:
+    def _draw(self, logits: torch.Tensor, params: list[SamplingParams],
+              request_ids: list[object] | None = None) -> torch.Tensor:
         greedy_rows = [row for row, p in enumerate(params) if p.greedy]
         sampled_rows = [row for row, p in enumerate(params) if not p.greedy]
         tokens = torch.empty(len(params), dtype=torch.long, device=logits.device)
@@ -250,7 +252,8 @@ class BatchedSampler:
                 continue
             # A seeded row draws from its own generator so its output does not depend on
             # how many other rows shared the step. One extra launch per seeded row.
-            generator = self._row_generator(seed)
+            request_id = request_ids[row] if request_ids is not None else row
+            generator = self._row_generator(request_id, seed)
             tokens[row] = torch.multinomial(
                 probabilities[row], 1, generator=generator,
             ).squeeze(0)

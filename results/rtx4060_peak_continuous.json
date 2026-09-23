@@ -1,0 +1,58 @@
+{
+  "device_info": {
+    "timestamp": "2026-09-18T11:29:37.616941+00:00",
+    "torch_version": "2.14.0+cu130",
+    "cuda_available": true,
+    "gpu_name": "NVIDIA GeForce RTX 4060",
+    "gpu_memory_gb": 8.18,
+    "cuda_version": "13.0"
+  },
+  "config": {
+    "model": "Qwen/Qwen3-0.6B",
+    "num_requests": 32,
+    "max_new_tokens": 32,
+    "concurrencies": "1,2,4,8,16",
+    "num_blocks": 1024,
+    "block_size": 16,
+    "cuda_graph_batch_size": 16,
+    "enable_mlp_gate_up_fusion": true,
+    "warmup": true,
+    "output": "results/rtx4060_peak_continuous.json"
+  },
+  "sweep": [
+    {
+      "concurrency": 2,
+      "elapsed_s": 5.8,
+      "total_tokens": 1024,
+      "throughput_tok_s": 176.5,
+      "speedup_vs_sequential": 1.931
+    },
+    {
+      "concurrency": 4,
+      "elapsed_s": 2.896,
+      "total_tokens": 1024,
+      "throughput_tok_s": 353.6,
+      "speedup_vs_sequential": 3.867
+    },
+    {
+      "concurrency": 8,
+      "elapsed_s": 1.476,
+      "total_tokens": 1024,
+      "throughput_tok_s": 693.8,
+      "speedup_vs_sequential": 7.589
+    },
+    {
+      "concurrency": 16,
+      "elapsed_s": 0.485,
+      "total_tokens": 1024,
+      "throughput_tok_s": 2112.3,
+      "speedup_vs_sequential": 23.106
+    }
+  ],
+  "sequential": {
+    "max_active": 1,
+    "elapsed_s": 11.202,
+    "total_tokens": 1024,
+    "throughput_tok_s": 91.4
+  }
+}

@@ -13,9 +13,10 @@ chunked-prefill attention (SDPA over gathered pages, per-token, tiled `tl.dot`),
 FlashAttention-2 over the same pages where a wheel exists. Fusions find their modules
 structurally, so Llama-style checkpoints work without new code.
 
-Every optimization here was either measured to win on a Tesla T4 with interleaved A/B
-runs and a stock-Transformers token-identity gate, or is recorded as a negative result
-with the numbers. `docs/optimization-journal.md` has all of them.
+Every optimization here was either measured to win on a Tesla T4 or RTX 4060 with
+interleaved A/B runs and a stock-Transformers token-identity gate, or is recorded as a
+negative result with the numbers. The RTX 4060 release evidence is in
+`docs/rtx4060-final-evaluation.md`.
 
 ## Status (2026-09-21, Tesla T4, Qwen3-0.6B fp16, chat workload ~656-token prompts)
 
@@ -37,9 +38,11 @@ top-k, min-p, penalties, seeds, stop tokens), Prometheus `/metrics`, health/read
 graceful drain. Not yet: speculative decoding in the batched path, quantized weights,
 multi-GPU, structured output. See "Roadmap".
 
-The sm_80+ backends (`flash`, `tiled`) and `split_k` are implemented and registered but
-**not yet measured** - the T4 cannot run the first two. They become defaults only after an
-A/B on a card that can, which is what `MEASURED` in `engine/backends/policy.py` records.
+On the measured RTX 4060, direct FlashAttention prefill wins for long-context FP16 with
+256-token pages; Flash decode and dense-gather Flash over 16-token pages lose end to end.
+The Ada policy therefore keeps graphed Triton `per_head` decode and selects Flash prefill
+only when compatible page geometry is explicitly chosen. See the final evaluation for the
+0.6B/1.7B numbers and every rejected arm.
 
 ## Portability
 
@@ -73,6 +76,8 @@ python -m pytest -q                # CPU tests
 python -m pytest -q -m cuda        # GPU correctness gates (downloads Qwen/Qwen3-0.6B)
 python scripts/check_hooks.py      # warmup captures every graph; step phases report
 uvicorn engine.server.api:create_app --factory --port 8000
+# Measured RTX 4060 long-context configuration:
+uvicorn engine.server.api:create_rtx4060_flash_app --factory --port 8000
 curl -N localhost:8000/generate/stream -d '{"prompt":"Explain KV caching.","max_new_tokens":64}'
 
 # or the OpenAI-compatible surface, with any OpenAI client pointed at /v1
@@ -148,7 +153,8 @@ engine/      batching (the engine, sampler), backends (kernel registry + per-dev
 benchmarks/  reliability (soak, A/B, sweep), kernels, batching, server, quantization, understanding
 tests/       CPU tests + `-m cuda` gates mirroring engine/
 docs/        architecture.md · optimization-journal.md · checkpoint.md · t4-reevaluation-plan.md ·
-             design-decisions.md · understanding-journal.md · rtx4060-plan.md
+             design-decisions.md · understanding-journal.md · rtx4060-plan.md ·
+             rtx4060-final-evaluation.md
 results/t4/  transcribed T4 measurements
 scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
 ```
@@ -157,11 +163,11 @@ scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
 
 Tier 1 (serving): **done** - batched sampling, OpenAI-compatible routes, Prometheus metrics.
 Tier 2 (portability): **done** - backend registry, per-device policy, model-family
-discovery, split-K decode and FlashAttention-2 backends. Unmeasured until they run on an
-sm_80+ card (`docs/rtx4060-plan.md`).
-Tier 3 (performance, next GPU is an RTX 4060): measure flash and split-K, re-derive the
-tile regimes, weight-only INT8/INT4, batched speculative decoding, Nsight on the decode
-step.
+discovery, split-K decode and FlashAttention-2 backends. The sm_89 policy is measured;
+unrecognized devices remain explicitly labelled unmeasured (`docs/rtx4060-plan.md`).
+Tier 3 (performance): **Flash prefill measured on RTX 4060**; next, use Nsight on the live
+decode step to re-derive coalescing/tile/block regimes, then integrate weight-only INT8/INT4
+and batched speculative decoding behind the same correctness and A/B gates.
 Tier 4: second model family end to end, CPU/GPU step overlap, structured output.
 
 ## Correctness policy

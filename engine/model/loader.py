@@ -41,7 +41,18 @@ def resolve_dtype(dtype: str | torch.dtype, device: torch.device) -> torch.dtype
             raise ValueError(f"unsupported dtype {dtype!r}; choose one of: {choices}") from error
     if device.type != "cuda":
         return torch.float32
-    major, _ = torch.cuda.get_device_capability(device)
+    major, minor = torch.cuda.get_device_capability(device)
+    # A measured serving policy includes numerical validation, not just tensor-core
+    # capability. On sm_89, BF16 Flash prefill failed the early token gate while FP16
+    # passed and won, so `auto` must honor that result before the generic heuristic.
+    try:
+        from engine.backends.policy import MEASURED
+
+        measured = MEASURED.get(major * 10 + minor, {}).get("dtype")
+        if measured in _DTYPES:
+            return _DTYPES[measured]
+    except ImportError:  # keep the standalone loader usable during minimal installs
+        pass
     if major >= 8 and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float16

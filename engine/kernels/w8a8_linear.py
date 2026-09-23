@@ -18,8 +18,13 @@ def pack_w8a8_weight(qweight: torch.Tensor) -> torch.Tensor:
 
 
 def _int8_gemm_with_minimum_rows(qinputs: torch.Tensor, packed_weight: torch.Tensor) -> torch.Tensor:
-    """Run CUDA INT8 GEMM despite torch._int_mm's strict M > 16 requirement."""
-    minimum_rows = 17
+    """Run CUDA INT8 GEMM on CUDA backends that require an aligned M dimension.
+
+    ``torch._int_mm`` documents M > 16, but the cuBLASLt path used by CUDA 13 on Ada
+    also rejects the minimally valid 17-row launch.  Padding to one 32-row tile works on
+    both that path and the T4 path this kernel was originally written for.
+    """
+    minimum_rows = 32
     if qinputs.shape[0] >= minimum_rows:
         return torch._int_mm(qinputs, packed_weight)
     padded = torch.zeros((minimum_rows, qinputs.shape[1]), device=qinputs.device, dtype=torch.int8)

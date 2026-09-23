@@ -1,10 +1,11 @@
 """The attention backends this engine ships, and what each one needs.
 
-Priorities encode *measured* preference, not novelty. The order for a device the engine
-has never run on is: a production kernel written for that architecture (flash) above a
-Triton kernel that reaches the tensor cores (tiled, sm_80+) above torch's fused SDPA over
-a page gather above the plain per-token kernel. Where a measurement exists it overrides
-this - see `docs/optimization-journal.md`, and `policy.py` for the per-device table.
+Priorities encode *measured* preference, not novelty. An unmeasured device keeps the
+established SDPA gather path as its fallback. A production FlashAttention backend can
+take priority once it imports, but the tiled Triton path is an explicit measurement
+candidate: it must first pass the PTX, A/B, and token gates on that architecture. Where a
+measurement exists it overrides this - see `docs/optimization-journal.md`, and
+`policy.py` for the per-device table.
 
 Every `available` returns the reason a backend cannot run here, so `check_hooks` on a new
 GPU prints the whole table with reasons instead of failing at the first request.
@@ -40,6 +41,15 @@ def _flash_available(profile, geometry: Geometry) -> str | None:
     return supports(geometry.block_size, geometry.head_dim, dtype)
 
 
+def _flash_dense_available(profile, geometry: Geometry) -> str | None:
+    from engine.kernels.flash_paged import supports_dense
+
+    if _int8_pool(geometry):
+        return "the dense gather path has no INT8 dequantizing variant"
+    dtype = torch.float16 if geometry.dtype == "float16" else torch.bfloat16
+    return supports_dense(geometry.head_dim, dtype)
+
+
 def _int8_pool(geometry: Geometry) -> bool:
     return geometry.kv_dtype == "int8"
 
@@ -52,6 +62,7 @@ def _decode_per_head(query, key_pages, value_pages, block_tables, seq_lens, **kw
     from engine.kernels.paged_decode_batched import paged_decode_batched
 
     kwargs.pop("max_sequence_length", None)
+    kwargs.pop("num_splits", None)
     return paged_decode_batched(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
 
 
@@ -59,12 +70,14 @@ def _decode_gqa(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
     from engine.kernels.paged_decode_gqa import paged_decode_gqa
 
     kwargs.pop("max_sequence_length", None)
+    kwargs.pop("num_splits", None)
     return paged_decode_gqa(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
 
 
 def _decode_split_k(query, key_pages, value_pages, block_tables, seq_lens, **kwargs):
     from engine.kernels.paged_decode_split_k import paged_decode_split_k
 
+    kwargs.pop("num_splits", None)
     return paged_decode_split_k(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
 
 
@@ -110,7 +123,7 @@ register(Backend(
 ))
 register(Backend(
     name="flash", phase="decode", run=_decode_flash, available=_flash_available,
-    priority=80,
+    priority=80, graph_safe=False,
     summary="flash_attn_with_kvcache over the pages; splits internally, GQA native.",
     tags=("flash-attn", "paged", "sm80+"),
 ))
@@ -158,6 +171,16 @@ def _prefill_flash(query, key_pages, value_pages, block_tables, start_positions,
     )
 
 
+def _prefill_flash_dense(query, key_pages, value_pages, block_tables, start_positions,
+                         chunk_lens, *, scale=None, total_len=0, cache=None, **_):
+    from engine.kernels.flash_paged import flash_dense_prefill
+
+    return flash_dense_prefill(
+        query, key_pages, value_pages, block_tables, start_positions, chunk_lens,
+        scale=scale, total_len=total_len, cache=cache,
+    )
+
+
 def _sdpa_available(profile, geometry: Geometry) -> str | None:
     if _int8_pool(geometry):
         return "the gather path has no INT8 dequantizing variant; use per_token"
@@ -190,14 +213,21 @@ register(Backend(
 ))
 register(Backend(
     name="tiled", phase="prefill", run=_prefill_tiled, available=_tiled_available,
-    priority=60,
+    priority=40,
     summary="Triton FlashAttention structure with tl.dot over paged K/V. Needs sm_80+ "
-            "to reach the tensor cores; gate with prefill_attention_ab.py --ptx-only.",
+            "to reach the tensor cores; an explicit candidate gated by "
+            "prefill_attention_ab.py --ptx-only and the RTX A/B.",
     tags=("triton", "paged", "sm80+"),
 ))
 register(Backend(
     name="flash", phase="prefill", run=_prefill_flash, available=_flash_available,
-    priority=80,
+    priority=80, graph_safe=False,
     summary="flash_attn_with_kvcache with causal=True over the pages: no gather, no mask.",
     tags=("flash-attn", "paged", "sm80+"),
+))
+register(Backend(
+    name="flash_dense", phase="prefill", run=_prefill_flash_dense,
+    available=_flash_dense_available, priority=45, graph_safe=False,
+    summary="Gather 16-token pages, then run dense flash_attn_func with native GQA.",
+    tags=("flash-attn", "gather", "sm80+"),
 ))

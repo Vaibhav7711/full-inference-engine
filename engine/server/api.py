@@ -69,19 +69,24 @@ def terminal_status(handle: RequestHandle) -> int | None:
 
 def default_engine_factory(
     model_name: str, *, max_active: int, num_blocks: int,
-    graph_buckets: tuple[int, ...], max_pending_requests: int,
+    block_size: int, dtype: str, decode_attention: str | None,
+    prefill_attention: str | None, graph_buckets: tuple[int, ...],
+    max_pending_requests: int,
 ):
     """Load the checkpoint and build the GPU engine. Imported lazily so the API module
     stays importable (and unit-testable) without CUDA, Triton, or a checkpoint."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
     from engine.model import load_model
 
-    loaded = load_model(model_name)
+    loaded = load_model(model_name, dtype=dtype)
     buckets = tuple(size for size in graph_buckets if size <= max_active)
     engine = ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, loaded.device, max_active=max_active,
-        num_blocks=num_blocks, cuda_graph_batch_sizes=buckets or None,
+        num_blocks=num_blocks, block_size=block_size,
+        cuda_graph_batch_sizes=buckets or None,
         max_waiting_requests=max_pending_requests,
+        **({"decode_attention": decode_attention} if decode_attention else {}),
+        **({"prefill_attention": prefill_attention} if prefill_attention else {}),
     )
     # Graph capture and Triton JIT happen at startup, not on the first live requests
     # that reach each bucket. Readiness is reported only after this returns.
@@ -91,13 +96,15 @@ def default_engine_factory(
 
 def create_app(
     model_name: str = "Qwen/Qwen3-0.6B", *, max_active: int = 16,
-    num_blocks: int = 1024, graph_buckets: tuple[int, ...] = (2, 4, 8, 16),
+    num_blocks: int = 1024, block_size: int = 16, dtype: str = "auto",
+    decode_attention: str | None = None, prefill_attention: str | None = None,
+    graph_buckets: tuple[int, ...] = (2, 4, 8, 16),
     max_pending_requests: int = 256, max_prompt_tokens: int = 4096,
     request_timeout_s: float = 120.0, drain_timeout_s: float = 30.0,
     engine_factory: Callable[[], object] | None = None,
     metrics: ServerMetrics | None = None,
 ) -> FastAPI:
-    if min(max_active, num_blocks, max_pending_requests, max_prompt_tokens) <= 0:
+    if min(max_active, num_blocks, block_size, max_pending_requests, max_prompt_tokens) <= 0:
         raise ValueError("server capacity limits must be positive")
     if request_timeout_s <= 0 or drain_timeout_s < 0:
         raise ValueError("request_timeout_s must be positive and drain_timeout_s non-negative")
@@ -109,6 +116,8 @@ def create_app(
             return engine_factory()
         return default_engine_factory(
             model_name, max_active=max_active, num_blocks=num_blocks,
+            block_size=block_size, dtype=dtype,
+            decode_attention=decode_attention, prefill_attention=prefill_attention,
             graph_buckets=graph_buckets, max_pending_requests=max_pending_requests,
         )
 
@@ -331,3 +340,18 @@ def create_app(
         max_prompt_tokens=max_prompt_tokens, request_timeout_s=request_timeout_s,
     )
     return app
+
+
+def create_rtx4060_flash_app() -> FastAPI:
+    """Measured long-context profile for the 8 GB RTX 4060 and Qwen3-0.6B.
+
+    Use with ``uvicorn engine.server.api:create_rtx4060_flash_app --factory``.
+    The 256-token pages are required by FA2 paged KV; decode deliberately stays on the
+    graph-safe Triton backend.
+    """
+    return create_app(
+        model_name="Qwen/Qwen3-0.6B", dtype="float16",
+        max_active=8, num_blocks=64, block_size=256,
+        decode_attention="per_head", prefill_attention="flash",
+        graph_buckets=(1, 2, 4, 8),
+    )

@@ -168,7 +168,17 @@ def test_greedy_default_is_deterministic_and_penalty_free() -> None:
 
 def test_forget_drops_row_generators() -> None:
     sampler = BatchedSampler("cpu")
-    sampler.sample(_logits(1, 16), [SamplingParams(temperature=1.0, seed=42)])
-    assert 42 in sampler._seeded
-    sampler.forget([42])
-    assert 42 not in sampler._seeded
+    sampler.sample(_logits(1, 16), [SamplingParams(temperature=1.0, seed=42)],
+                   request_ids=["request-a"])
+    assert "request-a" in sampler._seeded
+    sampler.forget(["request-a"])
+    assert "request-a" not in sampler._seeded
+
+
+def test_same_seed_is_owned_by_each_request() -> None:
+    sampler = BatchedSampler("cpu")
+    params = [SamplingParams(temperature=1.0, seed=42)] * 2
+    logits = _logits(2, 16)
+    first = sampler.sample(logits, params, request_ids=["a", "b"]).token_ids
+    sampler.forget(["a", "b"])
+    assert sampler.sample(logits, params, request_ids=["a", "b"]).token_ids == first
