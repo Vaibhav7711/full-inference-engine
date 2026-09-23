@@ -71,8 +71,17 @@ def main() -> None:
             raise RuntimeError("insufficient KV capacity for graph seed")
     inputs, positions, tables, lengths = engine._prepare_decode_metadata(active)
     block_n, warps = select_paged_decode_config(max(request.allocation.sequence_length + 1 for request in active), len(active))
-    context = _BatchContext(engine.key_pool, engine.value_pool, tables, lengths, engine.block_size, block_n, warps,
-                            engine.key_scale_pool, engine.value_scale_pool)
+    # Keyword arguments deliberately: the attention context has grown fields (the
+    # resolved backend, the split count, the batch's longest row) and a positional call
+    # silently assigned the scale pools to the wrong ones.
+    context = _BatchContext(
+        key_pool=engine.key_pool, value_pool=engine.value_pool, block_tables=tables,
+        seq_lens=lengths, block_size=engine.block_size, decode_block_n=block_n,
+        decode_num_warps=warps, key_scale_pool=engine.key_scale_pool,
+        value_scale_pool=engine.value_scale_pool, decode_kernel=engine.decode_attention,
+        decode_backend=engine.decode_backend,
+        decode_max_len=max(r.allocation.sequence_length + 1 for r in active),
+    )
     engine.model.config._attn_implementation = engine.ATTN_NAME
     if hasattr(engine.model.config, "_attn_implementation_internal"):
         engine.model.config._attn_implementation_internal = engine.ATTN_NAME

@@ -187,6 +187,18 @@ Run gates and phase-isolated measurements:
   --out results/rtx4060/flash_paged_prefill_sweep.json
 ```
 
+Verify the hooks and the running service (both added to the repository in v0.1.0-beta;
+the service check is an outside process and imports nothing from the engine):
+
+```bash
+.venv/bin/python scripts/verify_hooks.py --dtype float16 --block-size 256 \
+  --out results/rtx4060/verify_hooks_flash.json
+.venv/bin/uvicorn engine.server.api:create_rtx4060_flash_app --factory --port 8000 &
+until curl -sf localhost:8000/ready >/dev/null; do sleep 2; done
+.venv/bin/python scripts/live_smoke.py --base-url http://127.0.0.1:8000 \
+  --concurrency 8 --out results/rtx4060/live_smoke_optimized_flash.json
+```
+
 ## Evidence index
 
 - `results/rtx4060/roofline.json`: measured bandwidth and decode floor.
@@ -202,6 +214,29 @@ Run gates and phase-isolated measurements:
 - `results/rtx4060/check_hooks_final_block16_fp16.json`: compact-page architecture gate.
 - `results/rtx4060/check_hooks_final_flash_prefill_block256_fp16.json`: accepted Flash gate.
 - `results/rtx4060/live_smoke_optimized_flash.json`: external service verification.
+
+## Page size is a serving-wide choice, not an attention flag
+
+The accepted configuration uses 256-token pages because `flash_attn_with_kvcache`
+requires them. That choice reaches past attention and is recorded here so the trade is
+explicit rather than implied:
+
+- **Internal fragmentation.** A request holding 300 tokens occupies two pages, 512
+  slots: 41% waste against 6% at 16-token pages. On an 8 GB card serving Qwen3-1.7B,
+  where the KV pool rather than the weights is the binding constraint, that is real
+  capacity spent to buy the prefill win.
+- **Preemption granularity is 16x coarser.** A preempted request yields and rebuilds
+  whole 256-token pages, so recompute cost per preemption rises even though the measured
+  rebuild time is dominated by the forward rather than by the page count.
+- **Prefix reuse coarsens.** The radix cache matches complete blocks only, so a shared
+  700-token system prompt reuses 512 tokens at page 256 against 688 at page 16. The
+  prefix cache is off by default, so this costs nothing in the published configuration,
+  but it bounds what enabling it could buy.
+
+The compact 16-token configuration remains the default and is gated separately
+(`check_hooks_final_block16_fp16.json`). Neither page size is universally correct; the
+engine selects backends against the geometry it is given and refuses the combinations
+that cannot work.
 
 ## Publication boundary and next work
 

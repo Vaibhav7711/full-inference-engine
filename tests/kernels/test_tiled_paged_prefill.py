@@ -13,10 +13,18 @@ import math
 import pytest
 import torch
 
-from triton.runtime.errors import OutOfResources
-
-from engine.kernels.paged_prefill import paged_prefill
-from engine.kernels.tiled_paged_prefill import tiled_paged_prefill
+# Every test here needs a GPU, but collection must not: `pytest -q` on a machine with
+# neither Triton nor CUDA is the first command a reader runs, and an ImportError at
+# collection time reports as an error rather than as a skip.
+OutOfResources = pytest.importorskip(
+    "triton.runtime.errors", reason="the tiled prefill kernel requires Triton",
+).OutOfResources
+paged_prefill = pytest.importorskip(
+    "engine.kernels.paged_prefill", reason="requires Triton",
+).paged_prefill
+tiled_paged_prefill = pytest.importorskip(
+    "engine.kernels.tiled_paged_prefill", reason="requires Triton",
+).tiled_paged_prefill
 
 cuda = pytest.mark.cuda
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

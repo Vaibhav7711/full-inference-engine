@@ -1,5 +1,8 @@
 # full-inference-engine
 
+**v0.1.0-beta** · Apache-2.0 · CPU test suite runs in CI; GPU results are reproduced by
+hand and recorded in [`docs/`](docs/) and [`results/`](results/).
+
 A single-GPU LLM serving engine built from the model down: continuous batching over a
 paged KV cache, chunked prefill fused with decode into one forward per step, CUDA graphs
 for every forward shape, custom Triton attention/KV kernels, an FCFS scheduler with
@@ -18,31 +21,45 @@ interleaved A/B runs and a stock-Transformers token-identity gate, or is recorde
 negative result with the numbers. The RTX 4060 release evidence is in
 `docs/rtx4060-final-evaluation.md`.
 
-## Status (2026-09-21, Tesla T4, Qwen3-0.6B fp16, chat workload ~656-token prompts)
+## Measured status
 
-| | first T4 measurement (Sep 20) | now |
+**Tesla T4 (sm_75), Qwen3-0.6B fp16, chat profile ~656-token prompts** — the full
+optimization arc, first measurement to now:
+
+| | first measurement | now |
 |---|---|---|
 | prefill-carrying step p50 | 98 ms | **20.5 ms** |
 | decode-only step p50 (batch ~5) | 9.7 ms | 10.2 ms (weight-read floor ~5 ms + attention ~4 ms) |
 | ITL p50 / p99 | ~25 / 295 ms | **19.8 / 33 ms** |
 | TTFT p50 | 2.8 s | ~0.3-0.4 s |
 
-Defaults set by measurement: SDPA-over-pages chunked prefill, graphs on decode and
-prefill, fused step, warmup at startup, per-head paged decode kernel. Retired with
-evidence: tiled Triton prefill on sm_75 (no tensor cores from `tl.dot`), GQA-shared
-decode reads (L2 already dedups), prefix cache and INT8 KV on these workloads.
+**RTX 4060 (sm_89), fp16, long profile** — FlashAttention evaluated phase by phase
+([full evidence](docs/rtx4060-final-evaluation.md)):
 
-Serving surface: OpenAI-compatible `/v1/completions` and `/v1/chat/completions` (with
-streaming, `usage`, logprobs, stop strings), per-request sampling (temperature, top-p,
-top-k, min-p, penalties, seeds, stop tokens), Prometheus `/metrics`, health/readiness,
-graceful drain. Not yet: speculative decoding in the batched path, quantized weights,
-multi-GPU, structured output. See "Roadmap".
+| | change vs the Triton/SDPA default | |
+|---|---|---|
+| Flash **prefill**, 256-token pages, 0.6B | prefill step **−7.8%**, ITL p99 **−22.6%** | accepted |
+| Flash **prefill**, 256-token pages, 1.7B | TTFT **−13.7%**, expected gap **−5.3%** | accepted |
+| Flash **decode** | ITL p50 **+113.9%** | rejected — not stream-capture safe, so it costs graph replay |
+| Dense-gather Flash prefill, 16-token pages | prefill step **+38.5%** | rejected |
 
-On the measured RTX 4060, direct FlashAttention prefill wins for long-context FP16 with
-256-token pages; Flash decode and dense-gather Flash over 16-token pages lose end to end.
-The Ada policy therefore keeps graphed Triton `per_head` decode and selects Flash prefill
-only when compatible page geometry is explicitly chosen. See the final evaluation for the
-0.6B/1.7B numbers and every rejected arm.
+Defaults are set per architecture by measurement, with the evidence recorded next to
+them in `engine/backends/policy.py`. Also retired with numbers: tiled Triton prefill on
+sm_75 (`tl.dot` emits no `mma.sync`), GQA-shared decode reads (L2 already serves the
+second read), INT8 KV, prefix caching on random-prompt workloads.
+
+### What this is, and is not
+
+It is a working single-GPU serving engine with an OpenAI-compatible surface, validated
+end to end on two GPU architectures with one model family, and a measurement record that
+includes everything that failed.
+
+It is **not** a vLLM replacement. No speculative decoding in the batched path, no
+quantized weights, no tensor or pipeline parallelism, no structured output. Performance
+is validated for Qwen3 only — other Llama-style families load through the same
+structural hooks but have not been measured. INT8 KV is disabled (a known Ada
+preemption drift, marked as an expected failure in the CUDA suite). See
+[CHANGELOG.md](CHANGELOG.md) for the full limitation list.
 
 ## Portability
 
@@ -72,7 +89,7 @@ defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype':
 
 ```bash
 pip install -e ".[dev,server]"     # torch, transformers, triton must match your CUDA
-python -m pytest -q                # CPU tests
+python -m pytest -q                # CPU suite: 296 tests, no GPU or Triton needed
 python -m pytest -q -m cuda        # GPU correctness gates (downloads Qwen/Qwen3-0.6B)
 python scripts/check_hooks.py      # warmup captures every graph; step phases report
 uvicorn engine.server.api:create_app --factory --port 8000
@@ -155,7 +172,7 @@ tests/       CPU tests + `-m cuda` gates mirroring engine/
 docs/        architecture.md · optimization-journal.md · checkpoint.md · t4-reevaluation-plan.md ·
              design-decisions.md · understanding-journal.md · rtx4060-plan.md ·
              rtx4060-final-evaluation.md
-results/t4/  transcribed T4 measurements
+results/      t4/ (transcribed) and rtx4060/ (JSON artifacts cited by the evaluation)
 scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
 ```
 

@@ -4,9 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "full-inference-engine"
-version = "0.1.0"
-description = "Explicit single-GPU decoder-only LLM inference runtime"
+version = "0.1.0b1"
+description = "Single-GPU LLM serving engine: continuous batching, paged KV, CUDA graphs, Triton kernels"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
 dependencies = [
   "torch>=2.4",
   "transformers>=4.51",
@@ -16,6 +26,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 server = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "requests>=2.31"]
+
+[project.urls]
+Source = "https://github.com/Vaibhav7711/full-inference-engine"
+Changelog = "https://github.com/Vaibhav7711/full-inference-engine/blob/main/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 markers = ["cuda: requires a CUDA GPU and model checkpoint"]
