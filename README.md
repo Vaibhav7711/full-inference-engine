@@ -3,11 +3,18 @@
 A single-GPU LLM serving engine built from the model down: continuous batching over a
 paged KV cache, chunked prefill fused with decode into one forward per step, CUDA graphs
 for every forward shape, custom Triton attention/KV kernels, an FCFS scheduler with
-preemption, and an HTTP/SSE server. Hugging Face `transformers` supplies the model
-definition and weights; everything that runs a request is here.
+preemption, per-request sampling, and an OpenAI-compatible server. Hugging Face
+`transformers` supplies the model definition and weights; everything that runs a request
+is here.
 
-Every optimization in the repo was either measured to win on a Tesla T4 with interleaved
-A/B runs and a stock-Transformers token-identity gate, or is recorded as a negative result
+Attention kernels are **pluggable backends** chosen per GPU and per checkpoint, not
+constants: the engine ships Triton paged decode (per-head, GQA-shared, split-K),
+chunked-prefill attention (SDPA over gathered pages, per-token, tiled `tl.dot`), and
+FlashAttention-2 over the same pages where a wheel exists. Fusions find their modules
+structurally, so Llama-style checkpoints work without new code.
+
+Every optimization here was either measured to win on a Tesla T4 with interleaved A/B
+runs and a stock-Transformers token-identity gate, or is recorded as a negative result
 with the numbers. `docs/optimization-journal.md` has all of them.
 
 ## Status (2026-09-21, Tesla T4, Qwen3-0.6B fp16, chat workload ~656-token prompts)
@@ -29,6 +36,34 @@ streaming, `usage`, logprobs, stop strings), per-request sampling (temperature, 
 top-k, min-p, penalties, seeds, stop tokens), Prometheus `/metrics`, health/readiness,
 graceful drain. Not yet: speculative decoding in the batched path, quantized weights,
 multi-GPU, structured output. See "Roadmap".
+
+The sm_80+ backends (`flash`, `tiled`) and `split_k` are implemented and registered but
+**not yet measured** - the T4 cannot run the first two. They become defaults only after an
+A/B on a card that can, which is what `MEASURED` in `engine/backends/policy.py` records.
+
+## Portability
+
+Three seams instead of three hard-coded assumptions (`docs/architecture.md` §9):
+
+| | hook | what happens |
+|---|---|---|
+| **another model** | `engine/model/adapters.py` | Fused SwiGLU/RMSNorm/RoPE find their targets structurally and patch the model's own modeling module, so Llama, Mistral and Qwen need no per-family code. Geometry the paged kernels cannot serve (head_dim > 128, non-divisible GQA, sliding-window, MoE, MLA) is **refused at load with the reason**. |
+| **another GPU** | `engine/backends/policy.py` | `MEASURED` maps an architecture to the settings an A/B *on that architecture* chose, with the journal entry that chose them. Anything else gets capability-led defaults (bf16 from sm_80, highest-priority runnable backend) labelled `unmeasured`, plus the command that would settle it. |
+| **another kernel** | `engine/backends/registry.py` | `register(Backend(name=..., phase=..., run=..., available=...))`. `"auto"` picks by priority; a *named* backend that cannot run raises **with the reason** rather than falling back silently. |
+
+```bash
+python scripts/check_hooks.py --backends-only   # seconds, no warmup
+```
+
+prints the checkpoint's geometry and what got fused, then every backend with `ok`/`no`
+and why, then the defaults this device will serve with:
+
+```
+  ok decode   per_head   p50
+  no decode   flash      p80  <- flash_attn wheels require sm_80+; this device is sm_75x
+  no prefill  tiled      p60  <- tl.dot does not reach the tensor cores on sm_75
+defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
+```
 
 ## Quick start
 
@@ -78,12 +113,22 @@ HTTP/SSE (FastAPI) → ContinuousBatchingService (one worker thread owns the eng
 
 KV lives in per-layer pools `[num_blocks, 16, kv_heads, head_dim]`; each request owns a
 block table. Triton kernels write K/V into pages and attend over them; RMSNorm, RoPE and
-SwiGLU are fused Triton kernels installed onto the Qwen3 modules.
+SwiGLU are fused Triton kernels installed onto the model's own modules.
+
+Attention backends, selected per device (`decode_attention=` / `prefill_attention=`,
+default `"auto"`):
+
+| phase | backends |
+|---|---|
+| decode | `per_head` (Triton, the measured baseline) · `split_k` (FlashDecoding structure, for narrow grids) · `gqa` (shared group read; measured neutral on T4) · `flash` (sm_80+) |
+| prefill | `sdpa` (gathered pages + torch SDPA, T4 default) · `per_token` (Triton, INT8-capable) · `tiled` (`tl.dot`, sm_80+) · `flash` (sm_80+) |
 
 ## Measuring
 
 ```bash
 python -m benchmarks.reliability.ab --setting fused_step --prompt-profile chat --cuda-graphs --repeats 5 --duration 30
+python -m benchmarks.reliability.ab --setting flash_attention --cuda-graphs   # sm_80+
+python -m benchmarks.reliability.ab --setting decode_split_k --cuda-graphs
 python -m benchmarks.kernels.paged_decode_regime_sweep --kernel both
 python -m benchmarks.kernels.prefill_attention_ab --ptx-only      # does tl.dot reach the tensor cores on this GPU?
 ```
@@ -96,8 +141,10 @@ the two-GPU Kaggle runner used for every recorded result.
 ## Repository
 
 ```
-engine/      batching (the engine), scheduler, runtime (request state machine), cache (paging,
-             prefix cache), graphs (capture), kernels (Triton), server (FastAPI), model (loader)
+engine/      batching (the engine, sampler), backends (kernel registry + per-device policy),
+             scheduler, runtime (request state, sampling params), cache (paging, prefix cache),
+             graphs (capture), kernels (Triton, flash adapter), server (FastAPI + OpenAI),
+             model (loader, family adapters), metrics (Prometheus)
 benchmarks/  reliability (soak, A/B, sweep), kernels, batching, server, quantization, understanding
 tests/       CPU tests + `-m cuda` gates mirroring engine/
 docs/        architecture.md · optimization-journal.md · checkpoint.md · t4-reevaluation-plan.md ·
@@ -109,10 +156,13 @@ scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
 ## Roadmap
 
 Tier 1 (serving): **done** - batched sampling, OpenAI-compatible routes, Prometheus metrics.
-Tier 2 (performance, next GPU is an RTX 4060 - `docs/rtx4060-plan.md`): tiled prefill
-behind the PTX gate, FlashAttention-2, split-K decode attention, weight-only INT8/INT4,
-batched speculative decoding.
-Tier 3: second model family, CPU/GPU step overlap, structured output.
+Tier 2 (portability): **done** - backend registry, per-device policy, model-family
+discovery, split-K decode and FlashAttention-2 backends. Unmeasured until they run on an
+sm_80+ card (`docs/rtx4060-plan.md`).
+Tier 3 (performance, next GPU is an RTX 4060): measure flash and split-K, re-derive the
+tile regimes, weight-only INT8/INT4, batched speculative decoding, Nsight on the decode
+step.
+Tier 4: second model family end to end, CPU/GPU step overlap, structured output.
 
 ## Correctness policy
 
