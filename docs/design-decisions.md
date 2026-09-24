@@ -624,6 +624,25 @@ record before it is considered complete.
   reproducible evidence rather than inference from class names.
 
 
+### DD-044 — Speculation is transactional, greedy-only, and default-off
+
+- **Decision:** speculative verification is integrated into the live paged-KV target
+  engine behind an opt-in proposer. It reserves physical space before verification but
+  advances logical KV only through the accepted prefix. Sampling, penalties, and
+  logprobs fall back to ordinary decode. Kaggle uses Qwen3-4B on GPU 0 and screens
+  Qwen3-0.6B versus 1.7B on GPU 1; no pair is enabled by default before measured gates.
+- **Why:** rejected K/V may safely remain as unreachable bytes, but advancing the logical
+  sequence through it corrupts every later token. A small drafter can also lose when its
+  serial proposal cost exceeds the target passes saved, so acceptance alone is not a
+  deployment decision.
+- **Code:** `engine/speculative/acceptance.py`, `engine/speculative/draft_model.py`,
+  `engine/batching/continuous_batching.py`, `benchmarks/speculative/pair_screen.py`,
+  `benchmarks/speculative/engine_ab.py`.
+- **Status/tradeoff:** experimental. Target verification uses the production eager paged
+  path, while the first GPU-1 drafter retains a per-request HF cache. Verification graphs,
+  a paged draft runtime, and a default-on policy require the recorded Kaggle gates.
+
+
 ## Recording rule
 
 When a future change affects a kernel, cache layout, scheduler policy, service contract,

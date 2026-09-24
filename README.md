@@ -54,8 +54,9 @@ It is a working single-GPU serving engine with an OpenAI-compatible surface, val
 end to end on two GPU architectures with one model family, and a measurement record that
 includes everything that failed.
 
-It is **not** a vLLM replacement. No speculative decoding in the batched path, no
-quantized weights, no tensor or pipeline parallelism, no structured output. Performance
+It is **not** a vLLM replacement. Greedy speculative decoding now has an experimental,
+default-off paged-engine path awaiting Kaggle T4 x2 validation; there is no speculative
+sampling, quantized weights, tensor or pipeline parallelism, or structured output. Performance
 is validated for Qwen3 only — other Llama-style families load through the same
 structural hooks but have not been measured. INT8 KV is disabled (a known Ada
 preemption drift, marked as an expected failure in the CUDA suite). See
@@ -182,9 +183,9 @@ Tier 1 (serving): **done** - batched sampling, OpenAI-compatible routes, Prometh
 Tier 2 (portability): **done** - backend registry, per-device policy, model-family
 discovery, split-K decode and FlashAttention-2 backends. The sm_89 policy is measured;
 unrecognized devices remain explicitly labelled unmeasured (`docs/rtx4060-plan.md`).
-Tier 3 (performance): **Flash prefill measured on RTX 4060**; next, use Nsight on the live
-decode step to re-derive coalescing/tile/block regimes, then integrate weight-only INT8/INT4
-and batched speculative decoding behind the same correctness and A/B gates.
+Tier 3 (performance): **Flash prefill measured on RTX 4060**; greedy speculative decoding
+is integrated experimentally and has a reproducible Kaggle T4 x2 A/B gate. Next, validate
+that result, use Nsight on the live decode step, and integrate weight-only INT8/INT4.
 Tier 4: second model family end to end, CPU/GPU step overlap, structured output.
 
 ## Correctness policy

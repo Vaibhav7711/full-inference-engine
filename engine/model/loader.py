@@ -27,7 +27,7 @@ _DTYPES = {
 def resolve_dtype(dtype: str | torch.dtype, device: torch.device) -> torch.dtype:
     """Resolve a user dtype request, selecting a Tensor-Core dtype for the GPU.
 
-    Turing GPUs such as the Colab T4 (compute capability 7.5) do not have BF16
+    Turing GPUs such as the Kaggle T4 (compute capability 7.5) do not have BF16
     Tensor Core support, so ``auto`` deliberately selects FP16 there. Ampere and
     newer devices may use BF16 when PyTorch reports it as supported.
     """
@@ -85,6 +85,7 @@ def load_model(
     *,
     dtype: str | torch.dtype = "auto",
     revision: str | None = None,
+    device: str | torch.device | None = None,
 ) -> LoadedModel:
     """Load an actual decoder-only checkpoint for CUDA inference.
 
@@ -93,7 +94,11 @@ def load_model(
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required. Start a GPU runtime before loading a model.")
-    device = torch.device("cuda")
+    device = torch.device("cuda" if device is None else device)
+    if device.type != "cuda":
+        raise RuntimeError("CUDA is required. load_model(device=...) must name a CUDA device.")
+    if device.index is not None and not 0 <= device.index < torch.cuda.device_count():
+        raise ValueError(f"CUDA device index {device.index} is not visible")
     resolved_dtype = resolve_dtype(dtype, device)
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
     if tokenizer.pad_token_id is None:

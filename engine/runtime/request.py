@@ -87,6 +87,12 @@ class GenerationRequest:
     # exit returned memory to the pool. False for a request rejected at admission or
     # cancelled while parked in the queue, which held nothing.
     held_pages_at_exit: bool = False
+    # Per-request engine-native speculative decoding accounting. These count only valid
+    # proposals for this live row; graph padding and already-finished rows never enter.
+    speculative_rounds: int = 0
+    speculative_proposed_tokens: int = 0
+    speculative_accepted_tokens: int = 0
+    speculative_fallbacks: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id:

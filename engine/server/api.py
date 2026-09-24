@@ -71,20 +71,36 @@ def default_engine_factory(
     model_name: str, *, max_active: int, num_blocks: int,
     block_size: int, dtype: str, decode_attention: str | None,
     prefill_attention: str | None, graph_buckets: tuple[int, ...],
-    max_pending_requests: int,
+    max_pending_requests: int, target_device: str,
+    draft_model_name: str | None, draft_device: str,
+    speculative_ngram: bool, speculation_depth: int,
 ):
     """Load the checkpoint and build the GPU engine. Imported lazily so the API module
     stays importable (and unit-testable) without CUDA, Triton, or a checkpoint."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
     from engine.model import load_model
 
-    loaded = load_model(model_name, dtype=dtype)
+    loaded = load_model(model_name, dtype=dtype, device=target_device)
+    proposer = None
+    if draft_model_name is not None:
+        from engine.speculative import DraftModelProposer
+
+        draft = load_model(draft_model_name, dtype=dtype, device=draft_device)
+        if loaded.tokenizer.get_vocab() != draft.tokenizer.get_vocab():
+            raise ValueError("target and draft token maps must be identical")
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            if getattr(loaded.tokenizer, name) != getattr(draft.tokenizer, name):
+                raise ValueError(f"target and draft {name} must be identical")
+        proposer = DraftModelProposer(draft.model, draft.device)
     buckets = tuple(size for size in graph_buckets if size <= max_active)
     engine = ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, loaded.device, max_active=max_active,
         num_blocks=num_blocks, block_size=block_size,
         cuda_graph_batch_sizes=buckets or None,
         max_waiting_requests=max_pending_requests,
+        speculative_ngram=speculative_ngram,
+        speculative_proposer=proposer,
+        speculation_depth=speculation_depth,
         **({"decode_attention": decode_attention} if decode_attention else {}),
         **({"prefill_attention": prefill_attention} if prefill_attention else {}),
     )
@@ -99,13 +115,21 @@ def create_app(
     num_blocks: int = 1024, block_size: int = 16, dtype: str = "auto",
     decode_attention: str | None = None, prefill_attention: str | None = None,
     graph_buckets: tuple[int, ...] = (2, 4, 8, 16),
+    target_device: str = "cuda:0", draft_model_name: str | None = None,
+    draft_device: str = "cuda:1", speculative_ngram: bool = False,
+    speculation_depth: int = 3,
     max_pending_requests: int = 256, max_prompt_tokens: int = 4096,
     request_timeout_s: float = 120.0, drain_timeout_s: float = 30.0,
     engine_factory: Callable[[], object] | None = None,
     metrics: ServerMetrics | None = None,
 ) -> FastAPI:
-    if min(max_active, num_blocks, block_size, max_pending_requests, max_prompt_tokens) <= 0:
+    if min(max_active, num_blocks, block_size, max_pending_requests, max_prompt_tokens,
+           speculation_depth) <= 0:
         raise ValueError("server capacity limits must be positive")
+    if draft_model_name is not None and speculative_ngram:
+        raise ValueError("use a draft model or n-gram speculation, not both")
+    if draft_model_name is not None and target_device == draft_device:
+        raise ValueError("the Kaggle dual-GPU path requires separate target and draft devices")
     if request_timeout_s <= 0 or drain_timeout_s < 0:
         raise ValueError("request_timeout_s must be positive and drain_timeout_s non-negative")
     service: ContinuousBatchingService | None = None
@@ -119,6 +143,9 @@ def create_app(
             block_size=block_size, dtype=dtype,
             decode_attention=decode_attention, prefill_attention=prefill_attention,
             graph_buckets=graph_buckets, max_pending_requests=max_pending_requests,
+            target_device=target_device, draft_model_name=draft_model_name,
+            draft_device=draft_device, speculative_ngram=speculative_ngram,
+            speculation_depth=speculation_depth,
         )
 
     @asynccontextmanager
@@ -354,4 +381,19 @@ def create_rtx4060_flash_app() -> FastAPI:
         max_active=8, num_blocks=64, block_size=256,
         decode_attention="per_head", prefill_attention="flash",
         graph_buckets=(1, 2, 4, 8),
+    )
+
+
+def create_kaggle_t4x2_speculative_app() -> FastAPI:
+    """Qwen3-4B target on T4:0 with a Qwen3-0.6B draft on T4:1.
+
+    Use with ``uvicorn engine.server.api:create_kaggle_t4x2_speculative_app --factory``.
+    This profile is deliberately explicit: it must never place both checkpoints on the
+    same card or silently substitute the 1.7B challenger selected by a different run.
+    """
+    return create_app(
+        model_name="Qwen/Qwen3-4B", dtype="float16", target_device="cuda:0",
+        draft_model_name="Qwen/Qwen3-0.6B", draft_device="cuda:1",
+        speculation_depth=3, max_active=4, num_blocks=512, block_size=16,
+        graph_buckets=(1, 2, 4),
     )

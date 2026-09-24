@@ -116,7 +116,8 @@ Status legend: **live** = on the serving path; **baseline** = kept for compariso
 | `metrics/prometheus.py` | live | `ServerMetrics`: counters, gauges and histograms in Prometheus text format (TTFT, ITL, e2e, queue time, prompt/generation tokens, KV utilization, running/waiting, in-service graph captures). No client dependency. |
 | `server/api.py` | live | FastAPI app: `POST /generate`, `POST /generate/stream` (SSE), `GET /health`, `GET /ready`; status-code mapping for every terminal state; configurable `default_engine_factory` builds and warms the engine. `create_rtx4060_flash_app` is the measured FP16/page-256/Flash-prefill deployment. |
 | `quantization/int8.py`, `quantization/kv_int8.py` | parked / live-off | Reference weight-only INT8 (`Int8Linear`), KV INT8 helpers. |
-| `speculative/vanilla.py`, `speculative/optimized.py` | parked | Single-sequence draft-model speculative decoding with greedy acceptance. Not integrated with batching (roadmap Tier 2 rebuilds it inside the batched step). |
+| `speculative/acceptance.py`, `speculative/ngram.py`, `speculative/draft_model.py` | live (experimental, off by default) | Transactional greedy commit planning plus stateless n-gram and per-request dual-device model proposers. Target verification runs through the live paged engine; Kaggle performance gates are pending. |
+| `speculative/vanilla.py`, `speculative/optimized.py` | parked | Single-sequence HF-cache references retained as an independent algorithmic comparison. |
 | `metrics/` | live | `cuda_timed` context manager, `percentile`, latency summaries used by benchmarks. |
 
 ### `benchmarks/` - measurement

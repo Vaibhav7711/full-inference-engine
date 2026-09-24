@@ -19,7 +19,6 @@ These are starting points, not answers. `benchmarks/kernels/prefill_attention_ab
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -76,14 +75,20 @@ class DeviceProfile:
                 f"{self.multiprocessors} SMs, {self.l2_cache_mb:.0f} MB L2)")
 
 
-@lru_cache(maxsize=1)
-def current_device() -> DeviceProfile | None:
-    """Profile the GPU in use, or None when there is no CUDA device."""
+def current_device(device=None) -> DeviceProfile | None:
+    """Profile a CUDA device, or the current one when ``device`` is omitted."""
     import torch
 
     if not torch.cuda.is_available():
         return None
-    properties = torch.cuda.get_device_properties(0)
+    if device is None:
+        index = torch.cuda.current_device()
+    else:
+        resolved = torch.device(device)
+        if resolved.type != "cuda":
+            return None
+        index = resolved.index if resolved.index is not None else torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(index)
     # l2_cache_size has existed since torch 2.0 but is not guaranteed on every build.
     l2_bytes = getattr(properties, "L2_cache_size", 0) or 0
     return DeviceProfile(

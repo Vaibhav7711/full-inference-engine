@@ -350,7 +350,12 @@ class ContinuousBatchingEngine:
                  triton_rmsnorm: bool = True,
                  triton_rope: bool = True,
                  triton_swiglu: bool = True,
-                 sampling_seed: int | None = None):
+                 sampling_seed: int | None = None,
+                 speculative_ngram: bool = False,
+                 speculative_proposer=None,
+                 speculation_depth: int = 3,
+                 speculative_ngram_min_match: int = 2,
+                 speculative_ngram_max_match: int = 4):
         if min(num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
@@ -360,6 +365,8 @@ class ContinuousBatchingEngine:
             raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
         if decode_num_splits < 0:
             raise ValueError("decode_num_splits must be non-negative")
+        if speculation_depth <= 0 or speculation_depth + 1 > prefill_chunk_size:
+            raise ValueError("speculation_depth must fit with its pending token in a prefill chunk")
         if cuda_graph_batch_size is not None and cuda_graph_batch_sizes is not None:
             raise ValueError("use cuda_graph_batch_size or cuda_graph_batch_sizes, not both")
         if cuda_graph_batch_sizes is None and cuda_graph_batch_size is not None:
@@ -374,6 +381,23 @@ class ContinuousBatchingEngine:
         self.block_size = block_size
         self.max_active = max_active
         self.prefill_chunk_size = prefill_chunk_size
+        if speculative_ngram and speculative_proposer is not None:
+            raise ValueError("use speculative_ngram or speculative_proposer, not both")
+        self.speculative_ngram = speculative_ngram
+        self.speculation_depth = speculation_depth
+        if speculative_ngram:
+            from engine.speculative import NgramProposer
+
+            self.speculative_proposer = NgramProposer(
+                min_match=speculative_ngram_min_match,
+                max_match=speculative_ngram_max_match,
+            )
+        else:
+            self.speculative_proposer = speculative_proposer
+        self.speculative_rounds = 0
+        self.speculative_proposed_tokens = 0
+        self.speculative_accepted_tokens = 0
+        self.speculative_fallbacks = 0
         cfg = model.config
         # Attention backends are resolved against this device and this geometry rather
         # than hard-coded: "auto" (the default) takes the measured default for the
@@ -392,7 +416,7 @@ class ContinuousBatchingEngine:
             dtype=str(next(model.parameters()).dtype).removeprefix("torch."),
             kv_dtype="int8" if kv_cache_dtype == "int8" else "float16",
         )
-        self.device_profile = current_device()
+        self.device_profile = current_device(self.device)
         self.geometry = config_geometry
         device_defaults = defaults_for(self.device_profile, config_geometry)
         self.backend_reasons = dict(device_defaults.reasons)
@@ -720,6 +744,8 @@ class ContinuousBatchingEngine:
             prefix_cache=self.prefix_cache,
             reserved_blocks=len(self._graph_dummy_blocks),
         )
+        if self.speculative_proposer is not None and hasattr(self.speculative_proposer, "reset"):
+            self.speculative_proposer.reset()
 
     def _ensure_writable_tail(self, request: GenerationRequest) -> bool:
         """Copy a shared partial tail before decode writes into its unused slots."""
@@ -838,7 +864,7 @@ class ContinuousBatchingEngine:
             if request.state is RequestState.DECODING and request.allocation is not None
         ]
         context_tokens = sum(r.allocation.sequence_length for r in decoding)
-        return {
+        snapshot = {
             "waiting_requests": len(self.scheduler.waiting),
             "active_requests": len(self.scheduler.active),
             "decode_batch": len(decoding),
@@ -865,7 +891,22 @@ class ContinuousBatchingEngine:
             "prefill_chunked_tokens": self.prefill_chunked_tokens,
             "recomputed_tokens_total": self.scheduler.recomputed_tokens_total,
             "recompute_ms_total": self.scheduler.recompute_ns_total / 1_000_000,
+            "speculative_rounds": self.speculative_rounds,
+            "speculative_proposed_tokens": self.speculative_proposed_tokens,
+            "speculative_accepted_tokens": self.speculative_accepted_tokens,
+            "speculative_acceptance_rate": (
+                self.speculative_accepted_tokens / self.speculative_proposed_tokens
+                if self.speculative_proposed_tokens else 0.0
+            ),
+            "speculative_fallbacks": self.speculative_fallbacks,
         }
+        proposer = self.speculative_proposer
+        if proposer is not None:
+            snapshot["speculative_proposer"] = proposer.name
+            for name in ("proposal_ms", "proposed_tokens", "rollback_tokens"):
+                if hasattr(proposer, name):
+                    snapshot[f"speculative_draft_{name}"] = getattr(proposer, name)
+        return snapshot
 
     def recompute_report(self) -> dict[str, object]:
         """Aggregate recompute cost, including requests still in flight.
@@ -908,10 +949,14 @@ class ContinuousBatchingEngine:
     def _finish_request(self, request: GenerationRequest, reason: str) -> None:
         self.scheduler.finish(request.request_id, reason=reason)
         self.sampler.forget([request.request_id])
+        if self.speculative_proposer is not None:
+            self.speculative_proposer.forget(request.request_id)
 
     def _fail_request(self, request: GenerationRequest, reason: str) -> None:
         self.scheduler.fail(request.request_id, reason)
         self.sampler.forget([request.request_id])
+        if self.speculative_proposer is not None:
+            self.speculative_proposer.forget(request.request_id)
 
     def _complete_prefill(self, request: GenerationRequest, predicted_token: int | None) -> None:
         """Move a fully prefilled request into decode, handling resumption after preemption."""
@@ -1314,6 +1359,8 @@ class ContinuousBatchingEngine:
         """Cancel queued, partially-prefilled, or decoding work and release its KV."""
         request = self.scheduler.cancel(request_id, reason=reason)
         self.sampler.forget([request.request_id])
+        if self.speculative_proposer is not None:
+            self.speculative_proposer.forget(request.request_id)
         return request
 
     def submit(self, request: GenerationRequest) -> bool:
@@ -1338,9 +1385,15 @@ class ContinuousBatchingEngine:
             request for request in self.scheduler.active.values()
             if request.state is RequestState.DECODING
         ]
-        fused = self.fused_step and bool(decoding)
+        speculative = self.speculative_proposer is not None and bool(decoding)
+        # Multi-token verification uses the chunk attention path and cannot share the
+        # existing one-token fused graph. Preserve fused decode/prefill unchanged when
+        # speculation is disabled; a future graph phase may add a verified fused shape.
+        fused = self.fused_step and bool(decoding) and not speculative
         rows: list[GenerationRequest] = []
-        if fused:
+        if speculative:
+            self.speculative_decode_step(decoding)
+        elif fused:
             # Capacity for the decode rows is taken before admission, as the separate
             # decode forward would have; the forward itself waits for the prefill plan so
             # both can share it.
@@ -1364,6 +1417,13 @@ class ContinuousBatchingEngine:
             self.prefill_steps += 1
         elif decoding:
             self.decode_only_steps += 1
+        # Target preemption discards paged KV and forces a rebuild. Mirror that lifecycle
+        # on a stateful draft proposer so parked requests cannot retain unbounded GPU-1
+        # caches while waiting for the target pool's progress epoch.
+        if self.speculative_proposer is not None:
+            for request in decoding:
+                if request.state is RequestState.WAITING:
+                    self.speculative_proposer.forget(request.request_id)
 
     def _set_attention(self, name: str) -> None:
         config = self.model.config
@@ -1480,6 +1540,204 @@ class ContinuousBatchingEngine:
             reason = self._finish_reason(s, tok)
             if reason is not None:
                 self._finish_request(s, reason)
+
+    # ------------------------------------------------------------------
+    # Engine-native greedy speculation
+    # ------------------------------------------------------------------
+    def _speculation_eligible(self, request: GenerationRequest) -> bool:
+        """Whether this request may use the lossless greedy speculative path."""
+        return (
+            self.speculative_proposer is not None
+            and request.state is RequestState.DECODING
+            and request.allocation is not None
+            and request.next_token_id is not None
+            and request.sampling.can_reuse_cached_prediction
+            and request.max_new_tokens - len(request.output_token_ids) >= 2
+        )
+
+    def speculative_decode_step(self, active: list[GenerationRequest]) -> None:
+        """Advance eligible rows speculatively and fall every other row back safely.
+
+        Rows are grouped by actual proposal depth so verification never treats padding as
+        a candidate. This eager implementation is the correctness path; shape-specific
+        verify graphs are added only after its token/cache gates pass on the T4.
+        """
+        groups: dict[int, list[tuple[GenerationRequest, tuple[int, ...]]]] = {}
+        ordinary: list[GenerationRequest] = []
+        for request in active:
+            if not self._speculation_eligible(request):
+                request.speculative_fallbacks += 1
+                self.speculative_fallbacks += 1
+                ordinary.append(request)
+                continue
+            remaining = request.max_new_tokens - len(request.output_token_ids)
+            maximum = min(self.speculation_depth, remaining - 1)
+            history = request.prompt_token_ids + request.output_token_ids
+            proposal = self.speculative_proposer.propose(
+                history, maximum, request_id=request.request_id,
+            )
+            if not proposal.token_ids:
+                request.speculative_fallbacks += 1
+                self.speculative_fallbacks += 1
+                ordinary.append(request)
+                continue
+            groups.setdefault(proposal.depth, []).append((request, proposal.token_ids))
+
+        # Stable depth order keeps runs reproducible. Capacity acquisition inside each
+        # group remains FCFS and may preempt newer rows from a later group.
+        for depth in sorted(groups):
+            rows = [
+                (request, tokens) for request, tokens in groups[depth]
+                if request.state is RequestState.DECODING and request.allocation is not None
+            ]
+            if rows:
+                self._speculative_rows(rows)
+
+        ordinary = [
+            request for request in ordinary
+            if request.state is RequestState.DECODING and request.allocation is not None
+        ]
+        if ordinary:
+            self.decode_step(ordinary)
+
+    def _prepare_verify_metadata(
+        self, rows: list[tuple[GenerationRequest, tuple[int, ...]]], width: int,
+    ) -> None:
+        """Stage ``pending + proposals`` into the chunk buffers for paged verification."""
+        if not rows or width <= 1 or width > self.prefill_chunk_size:
+            raise ValueError("invalid speculative verification shape")
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = next(iter(self.eos_ids), 0)
+        ids_rows, position_rows, starts = [], [], []
+        tables = self._prefill_host_block_tables
+        for row, (request, proposals) in enumerate(rows):
+            allocation = request.allocation
+            if allocation is None or request.next_token_id is None:
+                raise RuntimeError("speculative row lost its pending token or allocation")
+            tokens = [request.next_token_id, *proposals]
+            if len(tokens) != width:
+                raise ValueError("speculative rows in one verification must have equal depth")
+            start = allocation.sequence_length
+            ids_rows.append(tokens + [pad_token_id] * (self.prefill_chunk_size - width))
+            position_rows.append(
+                list(range(start, start + width))
+                + [start] * (self.prefill_chunk_size - width)
+            )
+            starts.append(start)
+            table = request.block_table
+            tables[row, :len(table)] = torch.tensor(table, dtype=torch.int32)
+            tables[row, len(table):] = -1
+
+        count = len(rows)
+        self._prefill_host_input_ids[:count] = torch.tensor(ids_rows, dtype=torch.long)
+        self._prefill_host_position_ids[:count] = torch.tensor(position_rows, dtype=torch.long)
+        self._prefill_host_starts[:count] = torch.tensor(starts, dtype=torch.int32)
+        self._prefill_host_chunk_lens[:count].fill_(width)
+        self._prefill_device_input_ids[:count].copy_(
+            self._prefill_host_input_ids[:count], non_blocking=True)
+        self._prefill_device_position_ids[:count].copy_(
+            self._prefill_host_position_ids[:count], non_blocking=True)
+        self._prefill_device_starts[:count].copy_(
+            self._prefill_host_starts[:count], non_blocking=True)
+        self._prefill_device_chunk_lens[:count].copy_(
+            self._prefill_host_chunk_lens[:count], non_blocking=True)
+        self._prefill_device_block_tables[:count].copy_(
+            self._prefill_host_block_tables[:count], non_blocking=True)
+
+    def _verify_forward(self, row_count: int, width: int) -> torch.Tensor:
+        """Return target logits for every verification input position."""
+        input_ids = self._prefill_device_input_ids[:row_count, :width].contiguous()
+        position_ids = self._prefill_device_position_ids[:row_count, :width].contiguous()
+        hidden = self._decoder()(
+            input_ids=input_ids, position_ids=position_ids, use_cache=False, return_dict=True,
+        ).last_hidden_state
+        return self._lm_head()(hidden)
+
+    def _speculative_rows(
+        self, rows: list[tuple[GenerationRequest, tuple[int, ...]]],
+    ) -> None:
+        """Verify one equal-depth row group and transactionally commit accepted prefixes."""
+        from engine.speculative import plan_greedy_commit
+
+        depth = len(rows[0][1])
+        width = depth + 1  # old pending input + every proposal, yielding a bonus logit
+        viable: list[tuple[GenerationRequest, tuple[int, ...]]] = []
+        for request, proposals in sorted(
+            rows, key=lambda item: (item[0].created_ns, item[0].request_id)
+        ):
+            if request.state is not RequestState.DECODING or request.allocation is None:
+                continue
+            if len(proposals) != depth:
+                raise ValueError("a speculative verification group must have one depth")
+            target_length = request.allocation.sequence_length + width
+            if self._capacity_or_fail(request, target_length):
+                viable.append((request, proposals))
+        rows = [
+            item for item in viable
+            if item[0].state is RequestState.DECODING and item[0].allocation is not None
+        ]
+        if not rows:
+            return
+
+        self._set_attention(self.PREFILL_ATTN_NAME)
+        self._prepare_verify_metadata(rows, width)
+        total_len = max(
+            request.allocation.sequence_length + width
+            for request, _ in rows if request.allocation is not None
+        )
+        self._set_prefill_context(len(rows), total_len)
+        timer = self._gpu_timer()
+        try:
+            logits = self._verify_forward(len(rows), width)
+            predictions = logits.argmax(dim=-1).tolist()
+        finally:
+            _clear_prefill_ctx()
+        self._gpu_elapsed(timer, "speculative_verify_gpu_ms")
+
+        for row_index, (request, proposals) in enumerate(rows):
+            remaining = request.max_new_tokens - len(request.output_token_ids)
+            prediction_row = predictions[row_index]
+            plan = plan_greedy_commit(
+                proposals,
+                prediction_row[:depth],
+                prediction_row[depth],
+                remaining_tokens=remaining,
+                eos_token_ids=self.eos_ids,
+                stop_token_ids=request.sampling.stop_token_ids,
+                ignore_eos=request.sampling.ignore_eos,
+            )
+            if not plan.emitted:
+                raise RuntimeError("a speculative round must emit at least one token")
+            if not self.block_manager.append_tokens(
+                request.request_id, plan.cached_input_count
+            ):
+                raise RuntimeError("speculative capacity was acquired but could not be committed")
+
+            request.speculative_rounds += 1
+            request.speculative_proposed_tokens += depth
+            request.speculative_accepted_tokens += plan.accepted_draft_tokens
+            self.speculative_rounds += 1
+            self.speculative_proposed_tokens += depth
+            self.speculative_accepted_tokens += plan.accepted_draft_tokens
+
+            request.next_token_id = int(plan.emitted[-1])
+            for token in plan.emitted:
+                request.append_token(int(token))
+
+            allocation = request.allocation
+            expected_length = request.prompt_token_count + len(request.output_token_ids) - 1
+            if allocation is None or allocation.sequence_length != expected_length:
+                raise RuntimeError(
+                    f"speculative cache invariant failed for {request.request_id!r}: "
+                    f"{None if allocation is None else allocation.sequence_length} != "
+                    f"{expected_length}"
+                )
+            reason = plan.terminal_reason
+            if reason is None:
+                reason = self._finish_reason(request, request.next_token_id)
+            if reason is not None:
+                self._finish_request(request, reason)
 
     def _set_fused_contexts(
         self, *, decode_rows: int, block_tables, seq_lens, block_n: int, num_warps: int,
