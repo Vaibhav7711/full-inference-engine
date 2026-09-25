@@ -58,6 +58,25 @@ Beta because the evidence covers exactly that: two GPUs, one family, one node.
   counters, KV utilization, decode batch, in-service graph captures.
 - Health, readiness, graceful drain, native `/generate` and SSE endpoints.
 
+### Head-to-head against vLLM (Tesla T4, matched KV budget, pre-tokenized prompts to both)
+
+Batched output throughput at 256-token prompts and 128 generated tokens: **1.67×** vLLM at
+Qwen3-0.6B batch 16, 1.46× at batch 8, 1.25× at batch 4; **1.25×** at Qwen3-1.7B batch 16;
+**1.06×** at Qwen3-4B batch 16; parity at batch 1. vLLM retains lower single-request TTFT
+(19.7 vs 47.8 ms at a 32-token prompt) and lower GPU memory. Full protocol, controls and
+caveats in `docs/engineering-report.md` §5.
+
+### Graph capture memory
+
+Warmup enumerated row buckets and context buckets independently and captured their whole
+product, including shapes the KV pool cannot physically hold (16 rows at a 16,384-token
+context needs 16× the pool). Captures are now skipped when `rows × context` exceeds the
+pool: at the benchmarked configuration the largest single gather falls from 1,024 MiB to
+64 MiB and the graph count from 255 to 215. Padded CUDA-graph rows now share KV pages with
+one slot each rather than reserving a whole page per row — 1,792 tokens to 256 at
+256-token pages. Constructing an unallocatable KV pool now raises with the arithmetic and
+the largest affordable `num_blocks` instead of a CUDA OOM.
+
 ### Measured (see `docs/optimization-journal.md`, `docs/rtx4060-final-evaluation.md`)
 
 Tesla T4, Qwen3-0.6B fp16, chat profile: prefill-carrying step 98 → 20.5 ms; ITL p50
@@ -85,5 +104,12 @@ stream-capture safe on the tested build); dense-gather Flash prefill at 16-token
   pipeline parallelism, no structured output.
 - Qwen3-4B does not fit in fp16 on 8 GB with a useful KV pool; it needs the planned
   W4A16 weight path.
-- CI runs the CPU suite only. GPU results are reproduced by hand and recorded in `docs/`
-  and `results/`.
+- CI runs the CPU suite only (314 tests). GPU results are reproduced by hand and recorded
+  in `docs/` and `results/`.
+- Every kernel microbenchmark in the tree times one synchronised launch per sample and
+  reuses a single KV pool across repeats, so cells below roughly 150 µs of kernel time are
+  dominated by host launch latency and L2 residency. Engine-level A/B results, which
+  measure 30-second closed-loop windows, are unaffected. See `docs/engineering-report.md`
+  §8.
+- The RTX 4060 FlashAttention results used 1–3 repeats of 4–5 s against the T4 protocol's
+  5 × 30 s, which under-reports run-to-run spread; they are labelled preliminary.

@@ -1,197 +1,246 @@
 # full-inference-engine
 
-**v0.1.0-beta** · Apache-2.0 · CPU test suite runs in CI; GPU results are reproduced by
-hand and recorded in [`docs/`](docs/) and [`results/`](results/).
+**v0.1.0-beta** · Apache-2.0 · validated on NVIDIA Tesla T4 (`sm_75`) with Qwen3 FP16
 
-A single-GPU LLM serving engine built from the model down: continuous batching over a
-paged KV cache, chunked prefill fused with decode into one forward per step, CUDA graphs
-for every forward shape, custom Triton attention/KV kernels, an FCFS scheduler with
-preemption, per-request sampling, and an OpenAI-compatible server. Hugging Face
-`transformers` supplies the model definition and weights; everything that runs a request
-is here.
+A single-GPU LLM serving engine built from the model downward: continuous batching over a
+paged KV cache, chunked prefill fused with decode into **one forward per scheduler step**,
+CUDA graphs for every forward shape, custom Triton attention and KV kernels, a preemptive
+FCFS scheduler, per-request sampling, and an OpenAI-compatible HTTP surface. Hugging Face
+`transformers` supplies the model definition and weights; everything that runs a request is
+here.
 
-Attention kernels are **pluggable backends** chosen per GPU and per checkpoint, not
-constants: the engine ships Triton paged decode (per-head, GQA-shared, split-K),
-chunked-prefill attention (SDPA over gathered pages, per-token, tiled `tl.dot`), and
-FlashAttention-2 over the same pages where a wheel exists. Fusions find their modules
-structurally, so Llama-style checkpoints work without new code.
+On a Tesla T4, at matched KV capacity and concurrency limits, it sustains **1.06–1.67×
+vLLM's batched output throughput** for Qwen3-0.6B/1.7B/4B at batch ≥ 4.
 
-Every optimization here was either measured to win on a Tesla T4 or RTX 4060 with
-interleaved A/B runs and a stock-Transformers token-identity gate, or is recorded as a
-negative result with the numbers. The RTX 4060 release evidence is in
-`docs/rtx4060-final-evaluation.md`.
+Every optimization in this repository was either measured to win under a documented
+protocol, or is recorded as a negative result with its numbers. Seven were built, measured,
+and **rejected** — three of them standard practice elsewhere. Two published claims were
+retracted after re-examining their own evidence. That record is the point:
+[**engineering report**](docs/engineering-report.md) · [**user guide**](docs/user-guide.md)
 
-## Measured status
+---
 
-**Tesla T4 (sm_75), Qwen3-0.6B fp16, chat profile ~656-token prompts** — the full
-optimization arc, first measurement to now:
+## Measured results
+
+### Against vLLM — Tesla T4, matched KV budget, pre-tokenized prompts to both
+
+256-token prompts, 128 generated tokens, greedy, `ignore_eos`, 2 warmup + 5 timed runs,
+NVML memory for both engines, CUDA graphs enabled in both.
+
+| model | batch | this engine | vLLM | ratio |
+|---|---:|---:|---:|---:|
+| Qwen3-0.6B | 1 | 131 tok/s | 129 | 0.99 |
+| Qwen3-0.6B | 4 | 453 | 362 | **1.25×** |
+| Qwen3-0.6B | 8 | 750 | 513 | **1.46×** |
+| Qwen3-0.6B | 16 | **1,069** | 639 | **1.67×** |
+| Qwen3-1.7B | 16 | **514** | 412 | **1.25×** |
+| Qwen3-4B | 16 | **222** | 209 | **1.06×** |
+
+The advantage grows with batch and shrinks with model size — the signature of a per-step
+overhead advantage, since larger models spend proportionally more time in GPU work. vLLM
+wins single-request TTFT (19.7 ms vs 47.8 ms at a 32-token prompt) and uses less GPU memory.
+Full protocol and caveats: [engineering report §5](docs/engineering-report.md#5-head-to-head-against-vllm).
+
+### The optimization arc — Tesla T4, Qwen3-0.6B FP16, chat profile
+
+Five interleaved 30-second closed-loop runs per arm at concurrency 8, each arm token-gated
+against stock Transformers.
 
 | | first measurement | now |
-|---|---|---|
+|---|---:|---:|
 | prefill-carrying step p50 | 98 ms | **20.5 ms** |
-| decode-only step p50 (batch ~5) | 9.7 ms | 10.2 ms (weight-read floor ~5 ms + attention ~4 ms) |
-| ITL p50 / p99 | ~25 / 295 ms | **19.8 / 33 ms** |
-| TTFT p50 | 2.8 s | ~0.3-0.4 s |
+| ITL p50 | ~25 ms | **19.8 ms** |
+| ITL p99 | 295 ms | **33.0 ms** |
+| TTFT p50 | 2.8 s | **0.32–0.41 s** |
+| decode-only step p50 (batch ~5) | 9.7 ms | 10.2 ms — at its bandwidth floor |
+| host staging per step | 3.4 ms | **0.26 ms** |
 
-**RTX 4060 (sm_89), fp16, long profile** — FlashAttention evaluated phase by phase
-([full evidence](docs/rtx4060-final-evaluation.md)):
+| what each change bought | effect |
+|---|---|
+| continuous batching vs sequential | **6.5×** throughput (24 → 154 tok/s at concurrency 16) |
+| CUDA graphs on decode | 34.2 → 9.7 ms/step (**−72%**) |
+| SDPA-over-pages chunked prefill | prefill step **−40.6%** chat, **−65.6%** long |
+| CUDA graphs on prefill | prefill step **−56.7%**, ITL p50 **−57.4%** |
+| fused decode+prefill step | prefill step **−17.6%**, ITL p50 **−18%** |
+| warmup before serving | ITL p99 **−71%**, p50 unchanged |
 
-| | change vs the Triton/SDPA default | |
+### Rejected with evidence
+
+| | measured | why |
 |---|---|---|
-| Flash **prefill**, 256-token pages, 0.6B | prefill step **−7.8%**, ITL p99 **−22.6%** | accepted |
-| Flash **prefill**, 256-token pages, 1.7B | TTFT **−13.7%**, expected gap **−5.3%** | accepted |
-| Flash **decode** | ITL p50 **+113.9%** | rejected — not stream-capture safe, so it costs graph replay |
-| Dense-gather Flash prefill, 16-token pages | prefill step **+38.5%** | rejected |
+| Tiled `tl.dot` prefill on Turing | **3× slower** | PTX: `mma_sync = 0`, 2052 FMA, 128 register spills — Triton emits MMA only from sm_80 |
+| GQA-shared K/V decode reads | 0.95–1.06× | L2 already serves the duplicate read |
+| FlashAttention-2 decode (Ada) | **+113.9% ITL** | not stream-capture safe, so it costs graph replay; and ties at the roofline anyway |
+| Dense-gather Flash prefill at 16-token pages | +38.5% | the gather dominates the better kernel |
+| INT8 KV cache | neutral on T4, drifts on Ada | disabled |
+| Prefix caching on random-prompt workloads | unresolved | the workload shares no prefixes |
 
-Defaults are set per architecture by measurement, with the evidence recorded next to
-them in `engine/backends/policy.py`. Also retired with numbers: tiled Triton prefill on
-sm_75 (`tl.dot` emits no `mma.sync`), GQA-shared decode reads (L2 already serves the
-second read), INT8 KV, prefix caching on random-prompt workloads.
+---
 
-### What this is, and is not
-
-It is a working single-GPU serving engine with an OpenAI-compatible surface, validated
-end to end on two GPU architectures with one model family, and a measurement record that
-includes everything that failed.
-
-It is **not** a vLLM replacement. Greedy speculative decoding now has an experimental,
-default-off paged-engine path awaiting Kaggle T4 x2 validation; there is no speculative
-sampling, quantized weights, tensor or pipeline parallelism, or structured output. Performance
-is validated for Qwen3 only — other Llama-style families load through the same
-structural hooks but have not been measured. INT8 KV is disabled (a known Ada
-preemption drift, marked as an expected failure in the CUDA suite). See
-[CHANGELOG.md](CHANGELOG.md) for the full limitation list.
-
-## Portability
-
-Three seams instead of three hard-coded assumptions (`docs/architecture.md` §9):
-
-| | hook | what happens |
-|---|---|---|
-| **another model** | `engine/model/adapters.py` | Fused SwiGLU/RMSNorm/RoPE find their targets structurally and patch the model's own modeling module, so Llama, Mistral and Qwen need no per-family code. Geometry the paged kernels cannot serve (head_dim > 128, non-divisible GQA, sliding-window, MoE, MLA) is **refused at load with the reason**. |
-| **another GPU** | `engine/backends/policy.py` | `MEASURED` maps an architecture to the settings an A/B *on that architecture* chose, with the journal entry that chose them. Anything else gets capability-led defaults (bf16 from sm_80, highest-priority runnable backend) labelled `unmeasured`, plus the command that would settle it. |
-| **another kernel** | `engine/backends/registry.py` | `register(Backend(name=..., phase=..., run=..., available=...))`. `"auto"` picks by priority; a *named* backend that cannot run raises **with the reason** rather than falling back silently. |
+## Install and first run
 
 ```bash
-python scripts/check_hooks.py --backends-only   # seconds, no warmup
+pip install -e ".[dev,server]"     # torch must match your CUDA; don't reinstall it on Colab
+python -m pytest -q                # 314 CPU tests — no GPU or Triton needed
+python -m pytest -q -m cuda        # 193 GPU correctness gates
 ```
 
-prints the checkpoint's geometry and what got fused, then every backend with `ok`/`no`
-and why, then the defaults this device will serve with:
-
-```
-  ok decode   per_head   p50
-  no decode   flash      p80  <- flash_attn wheels require sm_80+; this device is sm_75x
-  no prefill  tiled      p60  <- tl.dot does not reach the tensor cores on sm_75
-defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
-```
-
-## Quick start
-
-```bash
-pip install -e ".[dev,server]"     # torch, transformers, triton must match your CUDA
-python -m pytest -q                # CPU suite: 314 tests, no GPU or Triton needed
-python -m pytest -q -m cuda        # GPU correctness gates (downloads Qwen/Qwen3-0.6B)
-python scripts/check_hooks.py      # warmup captures every graph; step phases report
-uvicorn engine.server.api:create_app --factory --port 8000
-# Measured RTX 4060 long-context configuration:
-uvicorn engine.server.api:create_rtx4060_flash_app --factory --port 8000
-curl -N localhost:8000/generate/stream -d '{"prompt":"Explain KV caching.","max_new_tokens":64}'
-
-# or the OpenAI-compatible surface, with any OpenAI client pointed at /v1
-curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
-  "model": "Qwen/Qwen3-0.6B",
-  "messages": [{"role": "user", "content": "Explain KV caching in one sentence."}],
-  "temperature": 0.7, "top_p": 0.95, "max_tokens": 64, "stream": true}'
-curl localhost:8000/metrics
-```
-
-Engine in a script:
+**As a library:**
 
 ```python
 from engine.batching.continuous_batching import ContinuousBatchingEngine
 from engine.model import load_model
-loaded = load_model("Qwen/Qwen3-0.6B")
-engine = ContinuousBatchingEngine(loaded.model, loaded.tokenizer, loaded.device,
-                                  max_active=8, num_blocks=1024, cuda_graph_batch_sizes=(2, 4, 8))
+
+loaded = load_model("Qwen/Qwen3-0.6B", dtype="float16")
+engine = ContinuousBatchingEngine(
+    loaded.model, loaded.tokenizer, loaded.device,
+    max_active=8, num_blocks=1024, block_size=16,
+    cuda_graph_batch_sizes=(1, 2, 4, 8),
+)
 engine.warmup()
-print(engine.generate(["The capital of France is"], max_new_tokens=16))
+print(engine.generate(["Explain KV caching in one sentence."], max_new_tokens=64))
 ```
+
+**As a server**, with any OpenAI client:
+
+```bash
+uvicorn engine.server.api:create_app --factory --port 8000
+until curl -sf localhost:8000/ready >/dev/null; do sleep 2; done   # warmup runs first
+
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [{"role": "user", "content": "Explain paged attention."}],
+  "temperature": 0.7, "max_tokens": 120, "stream": true}'
+curl localhost:8000/metrics
+```
+
+Worked examples: [`examples/library_usage.py`](examples/library_usage.py) (capacity
+arithmetic, per-request sampling, staggered arrivals) and
+[`scripts/live_smoke.py`](scripts/live_smoke.py) (an outside-process check of the HTTP
+surface, including a concurrency speedup assertion).
+
+**Sizing matters more than any other setting.** The KV pool, not the weights, bounds
+concurrency: a Qwen3-0.6B/1.7B token costs 112 KiB of KV, so `num_blocks × block_size`
+decides how many requests fit. See [user guide §3](docs/user-guide.md#3-sizing-the-kv-pool).
+
+---
 
 ## How it works
 
-`docs/architecture.md` is the full walkthrough: libraries, every file, the request
-lifecycle, one `step()` in detail, graph capture rules, and each Triton kernel explained.
-The short version:
-
 ```
-HTTP/SSE (FastAPI) → ContinuousBatchingService (one worker thread owns the engine)
-  → FCFSScheduler: admit by KV capacity, plan prefill chunks under a token budget
-  → ContinuousBatchingEngine.step():
-        decode rows (1 token each) + prefill chunk rows (≤128 tokens each)
-        → ONE packed forward, replayed from a CUDA graph keyed by shape
-        → custom attention fn cuts the packed row: paged decode kernel / SDPA over gathered pages
-        → argmax, one device→host copy, commit tokens, finish/preempt/admit
+HTTP / SSE (FastAPI) · OpenAI-compatible /v1
+      │
+ContinuousBatchingService — one worker thread owns the engine
+      │
+FCFSScheduler — admission bounded by KV capacity, LIFO preemption, prefill planning
+      │
+engine.step():  decode rows (1 token each) + prefill chunk rows (≤128 tokens each)
+      └── ONE packed forward, replayed from a CUDA graph keyed by shape
+            ├── paged decode attention    (Triton, per row × query head)
+            ├── chunked prefill attention (SDPA over gathered pages · Triton · FA2)
+            ├── fused RMSNorm / RoPE / SwiGLU (Triton, installed onto the model)
+            └── one argmax, one device→host copy for the whole batch
 ```
 
-KV lives in per-layer pools `[num_blocks, 16, kv_heads, head_dim]`; each request owns a
-block table. Triton kernels write K/V into pages and attend over them; RMSNorm, RoPE and
-SwiGLU are fused Triton kernels installed onto the model's own modules.
-
-Attention backends, selected per device (`decode_attention=` / `prefill_attention=`,
-default `"auto"`):
+Attention is a **registry of backends**, not a constant. Each declares why it cannot run on
+a given GPU and geometry; `"auto"` picks the highest-priority available one, and a *named*
+backend that cannot run raises **with the reason** rather than falling back silently.
 
 | phase | backends |
 |---|---|
-| decode | `per_head` (Triton, the measured baseline) · `split_k` (FlashDecoding structure, for narrow grids) · `gqa` (shared group read; measured neutral on T4) · `flash` (sm_80+) |
-| prefill | `sdpa` (gathered pages + torch SDPA, T4 default) · `per_token` (Triton, INT8-capable) · `tiled` (`tl.dot`, sm_80+) · `flash` (sm_80+) |
+| decode | `per_head` (default) · `split_k` · `gqa` · `flash` (sm_80+) |
+| prefill | `sdpa` (default) · `per_token` (INT8-capable) · `tiled` (sm_80+) · `flash` (sm_80+) |
 
-## Measuring
+Per-architecture defaults live in `engine/backends/policy.py` **with the A/B that chose
+them**. On an architecture nobody has measured, every reason string says `unmeasured` and
+names the command that would settle it:
 
 ```bash
-python -m benchmarks.reliability.ab --setting fused_step --prompt-profile chat --cuda-graphs --repeats 5 --duration 30
-python -m benchmarks.reliability.ab --setting flash_attention --cuda-graphs   # sm_80+
-python -m benchmarks.reliability.ab --setting decode_split_k --cuda-graphs
-python -m benchmarks.kernels.paged_decode_regime_sweep --kernel both
-python -m benchmarks.kernels.prefill_attention_ab --ptx-only      # does tl.dot reach the tensor cores on this GPU?
+python scripts/check_hooks.py --backends-only   # seconds; what this GPU can run, and why not
 ```
 
-`benchmarks/reliability/ab.py` runs interleaved arms on warmed engines, checks greedy
-tokens against stock Transformers first (tie-aware), and reports medians with run-to-run
-spread; anything inside the spread is "unresolved". `scripts/t4_phase0_phase1.ipynb` is
-the two-GPU Kaggle runner used for every recorded result.
+Fused kernels find their modules structurally and RoPE is patched in the model's own
+modeling module, so Llama-style checkpoints load with no new code. Geometry the paged
+kernels cannot serve — `head_dim > 128`, non-divisible GQA, sliding-window attention, MoE,
+MLA — is refused **at load, with the reason**.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [engineering-report.md](docs/engineering-report.md) | design, method, results, negative results, roofline analysis, limitations |
+| [user-guide.md](docs/user-guide.md) | install, serving, configuration reference, tuning, troubleshooting |
+| [architecture.md](docs/architecture.md) | every file, all execution flows, each Triton kernel explained |
+| [optimization-journal.md](docs/optimization-journal.md) | every result and retraction, dated, with commits |
+| [checkpoint.md](docs/checkpoint.md) | current validated claims — and retracted ones |
+| [rtx4060-final-evaluation.md](docs/rtx4060-final-evaluation.md) | the Ada FlashAttention campaign in full |
+| [t4-speculative-decoding-plan.md](docs/t4-speculative-decoding-plan.md) | the pending speculative evaluation |
+| [results/](results/) | measurement artifacts behind every number above |
 
 ## Repository
 
 ```
-engine/      batching (the engine, sampler), backends (kernel registry + per-device policy),
-             scheduler, runtime (request state, sampling params), cache (paging, prefix cache),
-             graphs (capture), kernels (Triton, flash adapter), server (FastAPI + OpenAI),
-             model (loader, family adapters), metrics (Prometheus)
-benchmarks/  reliability (soak, A/B, sweep), kernels, batching, server, quantization, understanding
-tests/       CPU tests + `-m cuda` gates mirroring engine/
-docs/        architecture.md · optimization-journal.md · checkpoint.md · t4-reevaluation-plan.md ·
-             design-decisions.md · understanding-journal.md · rtx4060-plan.md ·
-             rtx4060-final-evaluation.md
-results/      t4/ (transcribed) and rtx4060/ (JSON artifacts cited by the evaluation)
-scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
+engine/      batching (engine, sampler) · backends (kernel registry + device policy) ·
+             scheduler · runtime (request state, sampling) · cache (paging, prefix cache) ·
+             graphs (capture) · kernels (Triton, FA2 adapter) · server (FastAPI + OpenAI) ·
+             model (loader, family adapters) · metrics (Prometheus) · speculative (experimental)
+benchmarks/  reliability (soak, interleaved A/B, sweeps) · kernels · batching · server ·
+             quantization · speculative · understanding (trace scripts)
+tests/       314 CPU tests + 193 `-m cuda` gates mirroring engine/
+examples/    library_usage.py — the engine driven as an imported package
+scripts/     check_hooks · verify_hooks · live_smoke · token_margins · notebooks
+results/     t4/ · rtx4060/ — the JSON behind every number in the docs
 ```
+
+## Measuring
+
+```bash
+python -m benchmarks.reliability.ab --setting fused_step --prompt-profile chat \
+    --cuda-graphs --repeats 5 --duration 30
+python -m benchmarks.kernels.roofline                         # measured bandwidth + decode floor
+python -m benchmarks.kernels.prefill_attention_ab --ptx-only   # does tl.dot reach the tensor cores here?
+```
+
+Read every A/B with two rules. A change smaller than its reported `spread` is
+**unresolved** and is not a result. A tail percentile counts only when
+`lazy_graph_captures` is 0 in both arms — an in-window CUDA graph capture is 100–200 ms and
+lands squarely in p99.
 
 ## Roadmap
 
-Tier 1 (serving): **done** - batched sampling, OpenAI-compatible routes, Prometheus metrics.
-Tier 2 (portability): **done** - backend registry, per-device policy, model-family
-discovery, split-K decode and FlashAttention-2 backends. The sm_89 policy is measured;
-unrecognized devices remain explicitly labelled unmeasured (`docs/rtx4060-plan.md`).
-Tier 3 (performance): **Flash prefill measured on RTX 4060**; greedy speculative decoding
-is integrated experimentally and has a reproducible Kaggle T4 x2 A/B gate. Next, validate
-that result, use Nsight on the live decode step, and integrate weight-only INT8/INT4.
-Tier 4: second model family end to end, CPU/GPU step overlap, structured output.
+1. **Weight-only quantization on the serving path** (W8A16 → W4A16). The decode step is at
+   its weight-read floor, so fewer weight *bytes* is the only lever that moves it.
+2. **Rewrite the kernel timing harnesses** and re-derive the decode tile/warp regime per
+   architecture — the current regime is a T4 result reused unchanged elsewhere.
+3. **Re-run the Ada results at the T4 protocol**, and A/B the `tiled` prefill kernel on
+   sm_89, where its PTX gate passes but it has never been measured inside the engine.
+4. **Split-K decode for batch 1–2**, after fixing graph capture to carry a per-graph
+   context bound.
+5. **Finish or remove speculative decoding** — the T4×2 evaluation is written but unrun.
+6. **One non-Qwen checkpoint end to end**, converting a structural claim into evidence.
 
 ## Correctness policy
 
-Every engine path must reproduce stock Transformers' greedy tokens on the identity
-prompts except at logit ties (top-2 margin < 0.02, one fp16 ulp); kernel swaps may
-drift later than the first 8 tokens and are gated on the stock reference. Invariants
-checked by the soak: no leaked KV pages, every request reaches a terminal state,
-cancellation from every state. Negative results are recorded, never deleted.
+Every engine path must reproduce stock Transformers' greedy tokens on fixed prompts, except
+at logit ties — a first difference at a position whose stock top-2 margin is under 0.02 (one
+fp16 ulp) is a tie, not a divergence, and that threshold was set by measuring the margins
+rather than by assumption. Invariants checked by a randomized soak: no leaked KV pages,
+every request reaches a terminal state, cancellation works from every state. Negative
+results are recorded, never deleted.
+
+## What this is not
+
+Not a vLLM replacement. No tensor or pipeline parallelism, no quantized weights on the
+serving path, no structured output, no LoRA, no multimodal input, no `n > 1` sampling. INT8
+KV is implemented but disabled. Speculative decoding has an experimental, **default-off**
+greedy path whose speedup is not yet validated. Performance is validated for **Qwen3 on
+Tesla T4** only; the RTX 4060 FlashAttention results in
+[rtx4060-final-evaluation.md](docs/rtx4060-final-evaluation.md) were produced under a
+weaker protocol (1–3 repeats vs 5 × 30 s) and are labelled preliminary. Other model
+families load through structural hooks but have not been measured.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [CHANGELOG.md](CHANGELOG.md).
