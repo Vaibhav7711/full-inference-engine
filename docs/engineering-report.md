@@ -366,8 +366,27 @@ now share pages with one slot each, reducing that reservation from 1,792 tokens 
 
 ## 6. Negative results
 
-This section exists because the project's credibility rests on it. Every item here was
-built, measured, and rejected or retracted.
+Six optimizations were built, measured and **not shipped**; two published claims were
+retracted after their own evidence was re-examined. The full record — mechanisms, numbers,
+and each implementation's disposition — is in
+[`rejected-optimizations.md`](rejected-optimizations.md). In summary:
+
+| | measured | cause |
+|---|---|---|
+| Tiled `tl.dot` prefill on Turing | 3× slower | PTX: `mma_sync = 0`, 128 register spills — Triton emits MMA only from sm_80 |
+| GQA-shared K/V decode reads | 0.95–1.06× | L2 already serves the duplicate read |
+| FlashAttention-2 decode | +113.9% ITL | not stream-capture safe, so it costs graph replay; ties at the roofline anyway |
+| Dense-gather Flash prefill at 16-token pages | +38.5% | the gather dominates the better kernel |
+| INT8 KV cache | neutral on T4, drifts on Ada | disabled |
+| Prefix caching on random prompts | unresolved | the workload shares no prefixes |
+
+Three of the six — tiled FlashAttention prefill, GQA-shared reads, FlashAttention decode —
+are standard practice in other engines, and were rejected only because they were measured
+here. Adopting them on reputation would have produced a slower engine with a longer feature
+list. Both retractions are recorded in the same document; both were found by auditing our
+own evidence rather than by an external failure, which is the only mechanism that scales.
+
+<!-- Detail moved to rejected-optimizations.md; sections below retained for reference.
 
 ### 6.1 Tiled FlashAttention-structured prefill on Turing — 3× slower, and diagnosable without a benchmark
 
@@ -451,6 +470,8 @@ Seven rejected optimizations is not a sign of poor judgment; three of them (tile
 GQA-shared reads, FA2 decode) are standard practice in other engines and were rejected only
 because they were measured *here*. The alternative — adopting them on reputation — would
 have produced a slower engine with a more impressive feature list.
+
+-->
 
 ---
 
@@ -573,6 +594,7 @@ were later retracted.
 | `README.md` | what it is, install, quick start, measured status |
 | `docs/user-guide.md` | configuration reference, serving, tuning, troubleshooting |
 | `docs/architecture.md` | every file, all execution flows, each kernel explained |
+| `docs/rejected-optimizations.md` | what was measured and not shipped, and two retractions |
 | `docs/optimization-journal.md` | every result and retraction, dated, with commits |
 | `docs/checkpoint.md` | current validated claims, and retracted claims |
 | `docs/rtx4060-final-evaluation.md` | the Ada FlashAttention campaign in full |
