@@ -90,7 +90,7 @@ defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype':
 
 ```bash
 pip install -e ".[dev,server]"     # torch, transformers, triton must match your CUDA
-python -m pytest -q                # CPU suite: 296 tests, no GPU or Triton needed
+python -m pytest -q                # CPU suite: 314 tests, no GPU or Triton needed
 python -m pytest -q -m cuda        # GPU correctness gates (downloads Qwen/Qwen3-0.6B)
 python scripts/check_hooks.py      # warmup captures every graph; step phases report
 uvicorn engine.server.api:create_app --factory --port 8000

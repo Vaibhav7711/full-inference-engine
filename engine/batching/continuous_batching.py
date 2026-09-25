@@ -561,6 +561,30 @@ class ContinuousBatchingEngine:
             self.eos_ids.update(ce)
 
         dtype = torch.int8 if kv_cache_dtype == "int8" else next(model.parameters()).dtype
+        # Refuse a pool that cannot be allocated, with the arithmetic, rather than letting
+        # `torch.zeros` raise a CUDA OOM whose message names neither the cause nor the fix.
+        # The documented default (num_blocks=4096, block_size=16) is 7.5 GB of KV for
+        # Qwen3-0.6B and cannot be built on an 8 GB card at all.
+        pool_bytes = (
+            2 * self.num_layers * num_blocks * block_size
+            * self.num_kv_heads * self.head_dim
+            * (1 if kv_cache_dtype == "int8" else torch.finfo(dtype).bits // 8)
+        )
+        if torch.device(device).type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+            if pool_bytes > free_bytes:
+                affordable = free_bytes // (
+                    2 * self.num_layers * block_size * self.num_kv_heads * self.head_dim
+                    * (1 if kv_cache_dtype == "int8" else torch.finfo(dtype).bits // 8)
+                )
+                raise ValueError(
+                    f"KV pool of {num_blocks} x {block_size} tokens needs "
+                    f"{pool_bytes / 1e9:.2f} GB but only {free_bytes / 1e9:.2f} GB is free "
+                    f"on this device. Pass num_blocks <= {affordable} (leaving nothing for "
+                    f"activations or CUDA graphs), or a smaller block_size, or quantise "
+                    f"the KV cache with kv_cache_dtype='int8'."
+                )
+        self.kv_pool_bytes = pool_bytes
         self.key_pool = [
             torch.zeros((num_blocks, block_size, self.num_kv_heads, self.head_dim),
                         device=device, dtype=dtype)
@@ -652,17 +676,35 @@ class ContinuousBatchingEngine:
         ALL_ATTENTION_FUNCTIONS[self.FUSED_ATTN_NAME] = fused_step_attention_forward
 
     def _reserve_graph_dummy_blocks(self) -> None:
-        """Reserve permanent, non-customer pages for padded CUDA-Graph rows."""
+        """Reserve permanent, non-customer KV *slots* for padded CUDA-Graph rows.
+
+        A padded row writes exactly one K/V vector per step and nobody ever reads it, so
+        it needs one slot - not one page. The original version reserved a whole page per
+        padded row, which was invisible at 16-token pages (7 pages = 112 tokens) and cost
+        10.9% of the pool once FlashAttention forced 256-token pages: 7 x 256 = 1,792
+        tokens reserved to store 7. Rows now share pages and are given distinct slots
+        within them, so the reservation is `ceil(rows / block_size)` pages - normally one.
+        """
         self._graph_dummy_blocks: list[int] = []
+        self._graph_dummy_slots: list[tuple[int, int]] = []
         if not self.cuda_graph_batch_sizes:
             return
         required = max(self.cuda_graph_batch_sizes) - 1
         if required <= 0:
             return
-        allocation = self.block_manager.reserve("__cuda_graph_dummy_rows__", required * self.block_size)
+        pages = -(-required // self.block_size)
+        allocation = self.block_manager.reserve(
+            "__cuda_graph_dummy_rows__", pages * self.block_size,
+        )
         if allocation is None:
             raise ValueError("insufficient KV blocks to reserve CUDA-Graph dummy rows")
         self._graph_dummy_blocks = allocation.physical_block_ids
+        # (physical page, slot) per padded row. Distinct slots mean no two padded rows
+        # write the same address, so nothing depends on the writes being discarded.
+        self._graph_dummy_slots = [
+            (self._graph_dummy_blocks[index // self.block_size], index % self.block_size)
+            for index in range(required)
+        ]
 
     def _prepare_decode_metadata(
         self, active: list[GenerationRequest], *, graph_bucket_size: int | None = None,
@@ -693,14 +735,21 @@ class ContinuousBatchingEngine:
             lengths.append(allocation.sequence_length)
 
         if row_count > count:
-            if not self._graph_dummy_blocks or (
-                    count and len(self._graph_dummy_blocks) < row_count - count):
-                raise RuntimeError("graph dummy blocks were not reserved for this bucket")
+            # One reserved slot per padded row. The reservation is counted in slots, not
+            # pages, since several padded rows share a page.
+            if len(self._graph_dummy_slots) < row_count - count:
+                raise RuntimeError("graph dummy slots were not reserved for this bucket")
             pad_token = self.tokenizer.pad_token_id
             if pad_token is None:
                 pad_token = next(iter(self.eos_ids), 0)
             token_ids.extend([pad_token] * (row_count - count))
-            lengths.extend([0] * (row_count - count))
+            # A padded row's "length" is the slot it writes inside its shared dummy page.
+            # The decode kernel then attends to that many garbage keys, whose output is
+            # discarded; what matters is that no two padded rows target one address.
+            lengths.extend(
+                self._graph_dummy_slots[row - count][1]
+                for row in range(count, row_count)
+            )
 
         self._host_input_ids[:row_count, 0] = torch.tensor(token_ids, dtype=torch.long)
         self._host_position_ids[:row_count, 0] = torch.tensor(lengths, dtype=torch.long)
@@ -711,9 +760,9 @@ class ContinuousBatchingEngine:
         # A live batch has at least one real row, so its inert rows get distinct dummy
         # pages. A capture on no rows at all (the fused step graphs) wraps around: two
         # inert rows then store the same pad token into the same slot, which is benign.
-        dummies = self._graph_dummy_blocks
         for row in range(count, row_count):
-            self._host_block_tables[row, 0] = dummies[(row - count) % len(dummies)]
+            page, _ = self._graph_dummy_slots[row - count]
+            self._host_block_tables[row, 0] = page
 
         input_ids = self._device_input_ids[:row_count]
         position_ids = self._device_position_ids[:row_count]
@@ -1326,6 +1375,23 @@ class ContinuousBatchingEngine:
                 break
             bucket *= 2
         return buckets
+
+    @staticmethod
+    def _shape_is_reachable(rows: int, context_len: int, pool_tokens: int) -> bool:
+        """Whether a chunk batch of `rows`, each with `context_len` of prefix, can exist.
+
+        Every row's prefix occupies real KV slots, so `rows * context_len` tokens have to
+        fit the pool. Warmup used to enumerate rows and context buckets independently and
+        capture their whole product, which at 1024 x 16-token pages meant capturing 16
+        rows at a 16,384-token context - 262,144 tokens of prefix against a 16,384-token
+        pool, sixteen times more KV than exists. That single unreachable shape made the
+        SDPA path gather 537 MB of K and 537 MB of V inside one capture, and the graph
+        memory pool is sized by the largest capture: measured at 2.03 GiB of reserved
+        memory for prefill and fused graphs, against 3.06 GiB with them disabled.
+        """
+        if context_len <= 0:          # the Triton paths read their lengths at replay
+            return True
+        return rows * context_len <= pool_tokens
 
     def _capture_prefill_graph(self, row_count: int, context_len: int):
         """Capture one prefill graph, or record that this attention kind cannot be captured."""
@@ -2082,8 +2148,11 @@ class ContinuousBatchingEngine:
             contexts = [0]
             if self.prefill_attention == "sdpa":
                 contexts = self._warmup_context_buckets()
+            pool_tokens = self.key_pool[0].shape[0] * self.block_size
             for rows in (1,) + self.cuda_graph_batch_sizes:
                 for context_len in contexts:
+                    if not self._shape_is_reachable(rows, context_len, pool_tokens):
+                        continue
                     key = (rows, self.prefill_attention, context_len)
                     if key not in self._prefill_graphs:
                         if self._capture_prefill_graph(rows, context_len) is None:
@@ -2107,6 +2176,8 @@ class ContinuousBatchingEngine:
                 for decode_rows in self.cuda_graph_batch_sizes:
                     for prefill_rows in fused_rows:
                         for context_len in contexts:
+                            if not self._shape_is_reachable(prefill_rows, context_len, pool_tokens):
+                                continue
                             for block_n, num_warps in regimes:
                                 key = (decode_rows, prefill_rows, self.prefill_attention,
                                        context_len, block_n, num_warps)

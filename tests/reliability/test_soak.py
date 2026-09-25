@@ -122,7 +122,10 @@ def test_soak_under_kv_pressure_preempts_and_still_accounts_for_every_page():
 def test_soak_with_cuda_graphs_reserves_pages_without_leaking_them():
     """Graph dummy pages are permanent; they must show up as reserved, never as leaked."""
     engine = _engine(num_blocks=64, max_active=8, cuda_graph_batch_sizes=(2, 4, 8))
-    assert engine.scheduler.reserved_blocks == len(engine._graph_dummy_blocks) == 7
+    # Seven padded rows, one shared 16-token page: the reservation is per slot, not per
+    # row, which is what keeps it negligible when the page size grows for FlashAttention.
+    assert engine.scheduler.reserved_blocks == len(engine._graph_dummy_blocks) == 1
+    assert len(engine._graph_dummy_slots) == 7
     result = run_soak(engine, SoakConfig(duration_s=6.0, arrival_rate_per_s=25.0, seed=3))
     _report("graphs", result)
     assert result.violations == []

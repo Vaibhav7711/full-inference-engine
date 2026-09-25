@@ -441,7 +441,10 @@ def test_padded_cuda_graph_bucket_matches_reference():
     outputs = eng.generate(prompts, max_new_tokens=3)
     assert outputs == refs
     assert any(key[0] == 4 for key in eng._decode_graphs)
-    assert len(eng._graph_dummy_blocks) == 3
+    # Three padded rows need three KV *slots*, which share one 16-token page.
+    assert len(eng._graph_dummy_blocks) == 1
+    assert len(eng._graph_dummy_slots) == 3
+    assert len({slot for slot in eng._graph_dummy_slots}) == 3
 
 
 def _staggered_prompts():
@@ -786,8 +789,8 @@ def test_g1b_preemption_under_cuda_graphs_stays_token_identical():
         model, tok, "cuda", num_blocks=num_blocks, block_size=16, max_active=4,
         prefix_cache_blocks=0, cuda_graph_batch_sizes=(2, 4),
     )
-    assert eng.scheduler.reserved_blocks == len(eng._graph_dummy_blocks) == 3
-    assert eng.scheduler.effective_capacity_tokens == (num_blocks - 3) * 16
+    assert eng.scheduler.reserved_blocks == len(eng._graph_dummy_blocks) == 1
+    assert eng.scheduler.effective_capacity_tokens == (num_blocks - 1) * 16
 
     requests = _run_to_completion(eng, _PRESSURE_PROMPTS, max_new)
     print("\ncuda-graph pressure:", eng.recompute_report())
