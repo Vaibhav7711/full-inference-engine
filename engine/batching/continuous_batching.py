@@ -540,10 +540,22 @@ class ContinuousBatchingEngine:
         # Re-install when the fusion mode changes: the installer is a no-op on an
         # already patched module, so a prior engine's choice would otherwise persist.
         uninstall_triton_swiglu(model)
+        self.swiglu_unavailable_reason: str | None = None
         if triton_swiglu:
-            self.triton_swiglu_modules = install_triton_swiglu(
-                model, fuse_gate_up=fuse_mlp_gate_up,
-            )
+            try:
+                self.triton_swiglu_modules = install_triton_swiglu(
+                    model, fuse_gate_up=fuse_mlp_gate_up,
+                )
+            except RuntimeError as error:
+                # Some families (Phi-3 among them) ship one fused `gate_up_proj` linear
+                # instead of separate gate/up projections, so there is nothing for this
+                # kernel to patch. The fusion is an optimization, not a requirement: the
+                # model still serves through its own MLP. Record why rather than refusing
+                # to construct, since the geometry gate already accepted this checkpoint.
+                if fuse_mlp_gate_up:
+                    raise
+                self.triton_swiglu_modules = 0
+                self.swiglu_unavailable_reason = str(error)
         else:
             self.triton_swiglu_modules = 0
 

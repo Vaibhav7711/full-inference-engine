@@ -338,17 +338,50 @@ Two traps when comparing a new GPU against the recorded T4 numbers:
    backend, which may be one nobody has measured. Pin `decode_attention` and
    `prefill_attention` explicitly for any baseline comparison.
 
-### Other model families
+### Which checkpoints work
 
-Llama, Mistral, Qwen2 and Gemma-style checkpoints load through structural hooks with no new
-code: fused kernels find modules by shape, RoPE is patched in the model's own modeling
-module. Geometry the paged kernels cannot serve is refused **at load with the reason**:
-`head_dim > 128`, non-divisible GQA, sliding-window attention, mixture-of-experts,
-multi-head latent attention.
+The engine is not Qwen-specific; it is **Llama-family-shaped**. A checkpoint is servable
+when all of the following hold:
 
-None of those families is performance-validated. Run
-`python scripts/verify_hooks.py --model <checkpoint>` first; it checks fusion discovery,
-RoPE patching, and token identity against stock Transformers for every available backend.
+- `head_dim ≤ 128` and divisible by 8 — the paged kernels load a whole head per program
+- query heads divisible by KV heads (any GQA ratio, including 1:1)
+- no sliding-window attention — the paged kernels attend to the full prefix
+- dense feed-forward (no mixture-of-experts)
+- standard K/V heads (no multi-head latent attention)
+- RMSNorm-style norms, and ideally separate `gate_proj` / `up_proj` / `down_proj`
+
+Check any checkpoint in seconds, **without a GPU**:
+
+```bash
+python -c "
+from transformers import AutoConfig
+from engine.model.adapters import unsupported_reason, geometry_of
+c = AutoConfig.from_pretrained('meta-llama/Llama-3.2-3B')
+g = geometry_of(c)
+print(f'{g.num_layers} layers, {g.num_q_heads}/{g.num_kv_heads} heads, head_dim {g.head_dim}')
+print(f'{g.kv_bytes_per_token()/1024:.0f} KiB KV per token')
+print(unsupported_reason(c) or 'servable')"
+```
+
+| family | status |
+|---|---|
+| Qwen3 dense, Qwen2.5 (head_dim 128) | **validated** (0.6B / 1.7B / 4B on T4) |
+| Llama 3.x, TinyLlama, SmolLM | servable, **not performance-validated** |
+| Mistral v0.2+ (no sliding window) | servable, not validated |
+| Phi-3 | servable, but its fused `gate_up_proj` means the SwiGLU fusion is skipped — the engine records `swiglu_unavailable_reason` and serves without it |
+| Mistral v0.1 | refused — sliding-window attention |
+| Gemma 2 / 3 | refused — `head_dim 256` |
+| MoE variants (e.g. Qwen3-30B-A3B) | refused — mixture-of-experts |
+| DeepSeek-V2 / V3 | refused — multi-head latent attention |
+
+Refusals happen **at load, with the reason**, not at the first request.
+
+Before trusting an unvalidated family, run the hook matrix — it checks fusion discovery,
+RoPE patching, and token identity against stock Transformers for every available backend:
+
+```bash
+python scripts/verify_hooks.py --model <checkpoint> --dtype float16
+```
 
 ---
 
