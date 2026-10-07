@@ -229,7 +229,12 @@ TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rm
                         "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step",
                         "decode_kernel", "decode_split_k", "flash_attention",
                         "flash_decode", "flash_prefill", "flash_dense_prefill",
-                        "flash_decode_splits"}
+                        "flash_decode_splits",
+                        # Chunk width changes the SDPA call shapes, so a 656-token prompt
+                        # prefilled in six chunks and in two accumulates in a different
+                        # order. Same kernel, different reduction tree: a late near-tie
+                        # can flip, and the stock-reference gate below still decides.
+                        "prefill_chunk_large", "prefill_chunk_small"}
 
 
 def drift_expected(setting: str) -> bool:
