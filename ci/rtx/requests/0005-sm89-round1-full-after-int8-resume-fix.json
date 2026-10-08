@@ -1,0 +1,14 @@
+{
+  "id": "0005-sm89-round1-full-after-int8-resume-fix",
+  "description": "Repeat the full sm_89 round-1 gates and A/B sequence after d4e0f5c: resumed INT8 requests now rebuild the prompt through SDPA and replay generated history through the ordinary paged decode path. The former Ada-only INT8 preemption xfail is now an ordinary CUDA regression test.",
+  "commands": [
+    "bash scripts/sm89_round1.sh"
+  ],
+  "timeout_minutes": 240,
+  "artifacts": [
+    "results/sm89/round1-*"
+  ],
+  "requires_gpu_idle": true,
+  "depends_on": null,
+  "continue_on_error": false
+}
