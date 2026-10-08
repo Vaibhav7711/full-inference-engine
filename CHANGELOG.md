@@ -15,6 +15,10 @@ reference pinned by CPU tests and a CUDA test that runs on first boot; the gate 
   dequantising decode and prefill kernels mirroring the INT8 pair; the contract
   (`fp8_format.py`) is Triton-free so it is tested on CPU. Refused below sm_89 with the
   device named. `ab.py --setting kv_dtype_fp8` / `kv_dtype_all`.
+- **sm_89 prefill default is `tiled`** (first ci/rtx A/B on the 4060, long profile): prefill
+  GPU 12.44 ms vs `sdpa` 14.12 (−12%), prefill step −8.7%, ITL p99 −22%, spreads <1.5%,
+  token-identical to stock. The kernel that lost 3× on Turing wins where `tl.dot` reaches
+  the tensor cores. FA2 prefill is unmeasured against it on that box.
 - **Architecture tiers** (`engine/backends/arch.py`): `sm75` / `sm80plus` by capability
   gate, not product name; `results/sm75/`, `results/sm89/` index the existing runs.
 - The A/B harness skips an arm whose backend the registry refuses on this device and

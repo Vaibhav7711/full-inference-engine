@@ -40,17 +40,24 @@ class BatchedPoolBackedPrefillCache(DynamicCache):
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         if self._layer_lengths[layer_idx] != 0:
             raise RuntimeError("batched prefill cache supports exactly one write per layer")
+        key_pool, value_pool = self.key_pool[layer_idx], self.value_pool[layer_idx]
         if self.key_scale_pool is None:
             from engine.kernels.kv_write import write_prefill_kv_batched
 
             write_prefill_kv_batched(
-                key_states, value_states, self.key_pool[layer_idx], self.value_pool[layer_idx],
-                self.block_tables, self.seq_lens,
+                key_states, value_states, key_pool, value_pool, self.block_tables, self.seq_lens,
             )
         else:
-            from engine.kernels.int8_paged_kv import write_prefill_int8_kv_batched
-            write_prefill_int8_kv_batched(
-                key_states, value_states, self.key_pool[layer_idx], self.value_pool[layer_idx],
+            # A scaled pool is INT8 or FP8; the storage dtype says which writer. This path
+            # used to assume INT8 and handed an FP8 pool to the INT8 writer on the first
+            # Ada A/B run (`kv_dtype_all`), which refused on pool dtype.
+            fp8 = getattr(torch, "float8_e4m3fn", None)
+            if fp8 is not None and key_pool.dtype is fp8:
+                from engine.kernels.fp8_paged_kv import write_prefill_fp8_kv_batched as write
+            else:
+                from engine.kernels.int8_paged_kv import write_prefill_int8_kv_batched as write
+            write(
+                key_states, value_states, key_pool, value_pool,
                 self.key_scale_pool[layer_idx], self.value_scale_pool[layer_idx],
                 self.block_tables, self.seq_lens,
             )

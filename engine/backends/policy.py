@@ -69,16 +69,19 @@ MEASURED: dict[int, dict] = {
             "dtype": "Turing has no bf16 tensor cores",
         },
     },
-    89: {  # RTX 4060, Ada. docs/rtx4060-plan.md, Flash isolation campaign.
+    89: {  # RTX 4060, Ada. docs/rtx4060-plan.md; docs/sm89-round1.md for the tiled result.
         "decode_attention": "per_head",
-        "prefill_attention": "flash",
+        "prefill_attention": "tiled",
         "dtype": "float16",
         "reasons": {
             "decode_attention": "RTX 4060 A/B: FA2 decode is eager-only and +114% ITL "
                                 "against graphed per_head at the short serving point",
-            "prefill_attention": "RTX 4060 long-context A/B: optimized FA2 prefill "
-                                 "reduced prefill step 7.8% (0.6B) and TTFT 13.7% (1.7B); "
-                                 "requires 256-token pages",
+            "prefill_attention": "RTX 4060 long-profile A/B (ci/rtx 0002, main @ 9b9090d): "
+                                 "tiled prefill GPU 12.44 ms vs sdpa 14.12 (-12%), prefill "
+                                 "step 16.2 vs 17.7 (-8.7%), ITL p99 20.9 vs 26.9, spreads "
+                                 "<1.5%, token-identical to stock; 16-token pages. FA2 "
+                                 "prefill (needs 256-token pages) was -7.8% vs sdpa in an "
+                                 "earlier campaign and is unmeasured against tiled",
             "dtype": "FP16 passed the early stock-token gate; BF16 Flash diverged at token 2",
         },
     },

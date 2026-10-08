@@ -73,6 +73,42 @@ Expect, and write down whichever way it goes:
   it does not, the SDPA cache is hiding the gather and the test needs longer prefixes.
 - Every `unresolved` is a result. Every token-gate refusal is a bug, not noise.
 
+## Results so far (ci/rtx, RTX 4060, torch 2.14+cu130, Triton 3.8, Python 3.14)
+
+**Gates** — `0001` failed on four tests (dummy-slot reservation one short for a capture
+with no live rows; two tests leaking 1.88 GB pools; FP8 writer tests demanding bit-exact
+casts). Fixed from the logs in `9b9090d`; `0003` then passed every gate: 361 CPU, 205 CUDA,
+backend table, live token gate with 90 fused graphs captured and `prefill_graph_unsupported`
+empty. FlashAttention is not importable in this venv, so the measured `flash` default fell
+back to `sdpa` with the reason recorded.
+
+**`prefill_kernel`, long profile (~1,824-token prompts), concurrency 8, 3 × 30 s** — all
+three arms token-identical to stock:
+
+| arm | expected gap | prefill step p50 | prefill GPU p50 | ITL p99 |
+|---|---:|---:|---:|---:|
+| `per_token` | 31.22 ms | 33.46 ms | 34.82 ms | 60.2 ms |
+| `sdpa` | 17.28 ms | 17.75 ms | 14.12 ms | 26.9 ms |
+| **`tiled`** | **15.78 ms** | **16.20 ms** | **12.44 ms** | **20.9 ms** |
+
+`tiled` vs `sdpa`: prefill GPU **−12%**, prefill step **−8.7%**, gap **−8.7%**, ITL p99
+**−22%**, spreads 0.4–1.5%. The kernel that ran 3× *slower* on the T4 because `tl.dot`
+lowered to scalar FMA wins on sm_89 — the architecture-scoped conclusion the PTX dump
+predicted, now measured in the engine. `MEASURED[89].prefill_attention` is `tiled`, at
+16-token pages. FA2 prefill remains unmeasured against it on this box.
+
+**`verify_kernel`, chat profile, concurrency 8, n-gram proposer live** — unresolved on
+every end-to-end metric at ~620-token contexts (`per_token` decode step −12.7% at a 12.1%
+spread is the only resolved cell). Two things to carry forward: the gather-vs-in-place cost
+should scale with context, so this needs the long profile to show; and **ITL is not a valid
+metric under speculation** — p50 medians of 0.001 ms with 213% spread, because accepted
+drafts emit several tokens per step and the gap series records zeros. The harness needs
+per-emitted-token accounting before any speculative A/B is quoted.
+
+**`kv_dtype_all`** — crashed 15 min in: `engine/cache/pool_cache.py` dispatched on
+"is there a scale pool" and assumed INT8, handing the FP8 pool to the INT8 writer. Fixed to
+dispatch on storage dtype, pinned by a Triton-free test; re-run queued as `0004`.
+
 ## Memory on an 8 GB card
 
 The T4 attribution configuration (16,384 KV tokens, 7-bucket warm-up) does not fit:
