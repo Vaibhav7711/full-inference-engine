@@ -1088,6 +1088,62 @@ class ContinuousBatchingEngine:
         if reason is not None:
             self._finish_request(request, reason)
 
+    @torch.inference_mode()
+    def _replay_decode_input(self, request: GenerationRequest, token_id: int) -> None:
+        """Rebuild one historical decode input through the ordinary paged path.
+
+        A preempted request cannot restore its old pages.  Refeeding prompt plus all
+        generated tokens as one prefill is tempting, but it changes the attention
+        reduction from the decode kernel to the prefill kernel.  That is especially
+        visible with a quantized KV cache: the reconstructed page can choose a
+        different greedy token than the uninterrupted request.  Replay each already
+        emitted input with the normal decode attention instead; logits are deliberately
+        discarded because the historical token is authoritative.
+        """
+        allocation = request.allocation
+        if allocation is None or request.state is not RequestState.PREFILLING:
+            raise RuntimeError("a resumed request needs an active prefill allocation")
+        request.next_token_id = int(token_id)
+        self._set_attention(self.ATTN_NAME)
+        max_sequence_length = allocation.sequence_length + 1
+        block_n, num_warps = select_paged_decode_config(
+            max_sequence_length, 1, self.decode_attention,
+        )
+        input_ids, position_ids, block_tables, seq_lens = self._prepare_decode_metadata([request])
+        context = _BatchContext(
+            key_pool=self.key_pool, value_pool=self.value_pool,
+            block_tables=block_tables, seq_lens=seq_lens, block_size=self.block_size,
+            decode_block_n=block_n, decode_num_warps=num_warps,
+            decode_num_splits=self.decode_num_splits,
+            key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
+            decode_kernel=self.decode_attention,
+            decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
+            kv_dtype=self.kv_cache_dtype,
+        )
+        _set_batch_ctx(context)
+        try:
+            # Attention writes this input's K/V into the allocation; the logits would
+            # predict the next historical token and are intentionally not sampled.
+            self.model(
+                input_ids=input_ids, position_ids=position_ids,
+                use_cache=False, return_dict=True,
+            )
+        finally:
+            _clear_batch_ctx()
+        if not self.block_manager.append_tokens(request.request_id, 1):
+            raise RuntimeError("resumed decode replay could not commit its reserved KV slot")
+        request.advance_prefill(1)
+
+    def _replay_resumed_history(self, request: GenerationRequest) -> None:
+        """Restore generated-history pages after the prompt portion of a resume."""
+        if not request.resuming:
+            return
+        history = request.output_token_ids[:-1]
+        pending = request.output_token_ids[-1] if request.output_token_ids else None
+        for token_id in history:
+            self._replay_decode_input(request, token_id)
+        request.next_token_id = pending
+
     # ------------------------------------------------------------------
     # D1: prefill a sequence, store its (rotated) K,V into the pool
     # ------------------------------------------------------------------
@@ -1133,7 +1189,14 @@ class ContinuousBatchingEngine:
         if not requests:
             return
 
-        sequences = [request.prefill_token_ids for request in requests]
+        # A resumed request first reconstructs only the original prompt with the stock
+        # SDPA prefill fast path.  Its generated history is replayed immediately below
+        # with paged decode attention so quantized pages follow the exact normal decode
+        # contract rather than a numerically different prefill reduction.
+        sequences = [
+            request.prompt_token_ids if request.resuming else request.prefill_token_ids
+            for request in requests
+        ]
         lengths_list = [len(sequence) for sequence in sequences]
         padded_length = max(lengths_list)
         max_blocks = max(len(request.block_table) for request in requests)
@@ -1173,12 +1236,13 @@ class ContinuousBatchingEngine:
         next_tokens = self._sample(self._lm_head()(hidden[rows, last_positions]), requests)
         self._gpu_elapsed(timer, "prefill_gpu_ms")
 
-        for request, token in zip(requests, next_tokens):
+        for request, token, sequence in zip(requests, next_tokens, sequences):
             if not self.block_manager.append_tokens(
-                request.request_id, request.remaining_prefill_tokens
+                request.request_id, len(sequence)
             ):
                 raise RuntimeError("prefill capacity was acquired but could not be committed")
-            request.advance_prefill(request.remaining_prefill_tokens)
+            request.advance_prefill(len(sequence))
+            self._replay_resumed_history(request)
             self._complete_prefill(request, int(token))
 
     @torch.inference_mode()

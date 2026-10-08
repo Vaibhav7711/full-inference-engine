@@ -23,13 +23,6 @@ from engine.runtime import GenerationRequest
 
 cuda = pytest.mark.cuda
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-ada_int8_preemption_revalidation = pytest.mark.xfail(
-    condition=(torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (8, 9)),
-    strict=True,
-    reason=("RTX R0 finding: INT8 paged-KV recompute/preemption changes a greedy token; "
-            "keep INT8 KV disabled pending its Ada A/B and correctness repair"),
-)
-
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
@@ -808,7 +801,6 @@ def test_g1b_preemption_under_cuda_graphs_stays_token_identical():
 
 @cuda
 @requires_cuda
-@ada_int8_preemption_revalidation
 def test_g1b_int8_kv_preemption_matches_int8_without_preemption():
     """INT8 rebuilds per-block scales on recompute.
 
