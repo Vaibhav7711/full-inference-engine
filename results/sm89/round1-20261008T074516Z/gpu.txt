@@ -1,0 +1,2 @@
+name, driver_version, memory.total [MiB], clocks.max.sm [MHz]
+NVIDIA GeForce RTX 4060, 595.91.07, 8188 MiB, 3105 MHz

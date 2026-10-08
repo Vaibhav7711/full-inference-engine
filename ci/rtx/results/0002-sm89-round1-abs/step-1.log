@@ -1,0 +1,453 @@
+
+==== provenance ====
+name, driver_version, memory.total [MiB], clocks.max.sm [MHz]
+NVIDIA GeForce RTX 4060, 595.91.07, 8188 MiB, 3105 MHz
+torch 2.14.0+cu130 | triton 3.8.0 | cuda 13.0
+
+==== gate 1: static checks and CPU suite ====
+........................................................................ [ 19%]
+........................................................................ [ 39%]
+........................................................................ [ 59%]
+........................................................................ [ 79%]
+........................................................................ [ 99%]
+.                                                                        [100%]
+=============================== warnings summary ===============================
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+361 passed, 207 deselected, 2 warnings in 50.08s
+
+==== gate 2: CUDA suite (kernels against their fp16 shadows; verify path via speculative tests) ====
+..s...........................x......................................... [ 34%]
+........................................................................ [ 69%]
+...............................................................          [100%]
+=============================== warnings summary ===============================
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+205 passed, 1 skipped, 361 deselected, 1 xfailed, 2 warnings in 270.39s (0:04:30)
+
+==== gate 3: backend table on this device ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  95%|█████████▌| 296/311 [00:00<00:00, 2935.81it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 3001.63it/s]
+
+model: qwen3 (Qwen3ForCausalLM), 28 layers, 16/8 heads, head_dim 128, 112 KiB KV per token
+  fusions: 28 MLP, 113 norm, rope in transformers.models.qwen3.modeling_qwen3
+device: NVIDIA GeForce RTX 4060 (sm_89, 8.2 GB, 24 SMs, 25 MB L2) (measured)
+  no decode   flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok decode   gqa        p10 
+  ok decode   per_head   p50 
+  ok decode   split_k    p20 
+  no prefill  flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok prefill  flash_dense p45 
+  ok prefill  per_token  p30 
+  ok prefill  sdpa       p50 
+  ok prefill  tiled      p40 
+defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
+  decode_attention: RTX 4060 A/B: FA2 decode is eager-only and +114% ITL against graphed per_head at the short serving point
+  prefill_attention: measured default 'flash' cannot run here; selected sdpa
+  dtype: FP16 passed the early stock-token gate; BF16 Flash diverged at token 2
+  verify_attention: unmeasured for verification on sm_89: paged multi-query tile (block_m=16) on the tensor cores; A/B with `--setting verify_kernel`
+
+==== gate 4: live token gate at the sm_89 defaults ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  90%|█████████ | 281/311 [00:00<00:00, 2782.17it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2897.57it/s]
+
+model: qwen3 (Qwen3ForCausalLM), 28 layers, 16/8 heads, head_dim 128, 112 KiB KV per token
+  fusions: 28 MLP, 113 norm, rope in transformers.models.qwen3.modeling_qwen3
+device: NVIDIA GeForce RTX 4060 (sm_89, 8.2 GB, 24 SMs, 25 MB L2) (measured)
+  no decode   flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok decode   gqa        p10 
+  ok decode   per_head   p50 
+  ok decode   split_k    p20 
+  no prefill  flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok prefill  flash_dense p45 
+  ok prefill  per_token  p30 
+  ok prefill  sdpa       p50 
+  ok prefill  tiled      p40 
+defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
+  decode_attention: RTX 4060 A/B: FA2 decode is eager-only and +114% ITL against graphed per_head at the short serving point
+  prefill_attention: measured default 'flash' cannot run here; selected sdpa
+  dtype: FP16 passed the early stock-token gate; BF16 Flash diverged at token 2
+  verify_attention: unmeasured for verification on sm_89: paged multi-query tile (block_m=16) on the tensor cores; A/B with `--setting verify_kernel`
+warmup 6.6s -> {'rounds': 6, 'graphs': 6, 'prefill_graphs': 18, 'fused_graphs': 90, 'prefill_graph_unsupported': {}, 'prefill_graph_eager_reason': None, 'decode_graph_eager_reason': None, 'prefill_sdpa_calls': 3, 'prefill_chunked_calls': 21}
+captured: [(2, 64, 4), (2, 128, 4), (4, 64, 4), (4, 128, 4), (8, 64, 4), (8, 128, 4)]
+last step phases (ms): {'host_stage_ms': 0.076, 'sync_ms': 5.438, 'decode_gpu_ms': 5.455}
+{
+  "git": {
+    "commit": "b4ea208fc3c46be49fae8a727827b4debb6835ad",
+    "short": "b4ea208",
+    "branch": "main",
+    "dirty": true
+  },
+  "clocks": {
+    "clocks.sm": 2730.0,
+    "clocks.mem": 8251.0,
+    "clocks.max.sm": 3105.0,
+    "power.draw": "[N/A]",
+    "power.limit": 115.0,
+    "temperature.gpu": 57.0,
+    "clocks_throttle_reasons.active": "0x0000000000000000"
+  },
+  "problems": []
+}
+hook check ok
+problems: []
+
+==== A/B: prefill_kernel (long) ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  95%|█████████▌| 296/311 [00:00<00:00, 2952.24it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 3004.54it/s]
+workload: long profile, mean prompt ~1824 tokens
+vs stock reference, first divergent token per prompt: per_token=[None, None, None, None]  (ties, not counted: ['prompt 0 @ 4 (margin 0.0000)'])
+vs stock reference, first divergent token per prompt: sdpa=[None, None, None, None]  (ties, not counted: ['prompt 0 @ 4 (margin 0.0000)'])
+vs stock reference, first divergent token per prompt: tiled=[None, None, None, None]  (ties, not counted: ['prompt 0 @ 4 (margin 0.0000)'])
+token identity: all arms produce identical greedy output
+clocks before: {'clocks.sm': 2730.0, 'clocks.mem': 8251.0, 'clocks.max.sm': 3105.0, 'power.draw': '[N/A]', 'power.limit': 115.0, 'temperature.gpu': 57.0, 'clocks_throttle_reasons.active': '0x0000000000000000'}
+
+=== interleaved: per_token / sdpa / tiled x 3 ===
+  [per_token run 1/3] gap=31.70ms decode=10.83ms host=0.16ms gpu=10.67ms ttft=2455.9ms
+  [sdpa run 1/3] gap=17.28ms decode=10.94ms host=0.16ms gpu=10.80ms ttft=1280.4ms
+  [tiled run 1/3] gap=15.81ms decode=10.86ms host=0.15ms gpu=10.70ms ttft=1147.9ms
+  [per_token run 2/3] gap=30.93ms decode=10.91ms host=0.15ms gpu=10.76ms ttft=4470.2ms
+  [sdpa run 2/3] gap=17.03ms decode=11.02ms host=0.15ms gpu=10.86ms ttft=1859.9ms
+  [tiled run 2/3] gap=15.70ms decode=10.97ms host=0.15ms gpu=10.81ms ttft=1669.7ms
+  [per_token run 3/3] gap=31.22ms decode=10.94ms host=0.16ms gpu=10.80ms ttft=3896.2ms
+  [sdpa run 3/3] gap=17.28ms decode=11.03ms host=0.16ms gpu=10.87ms ttft=1836.7ms
+  [tiled run 3/3] gap=15.78ms decode=10.92ms host=0.15ms gpu=10.77ms ttft=1619.9ms
+
+=== per_token ===
+  step_timing.expected_gap_ms median=31.222  [30.928, 31.702]  spread=2.5%
+  latency.itl_p50          median=22.824  [20.326, 33.049]  spread=55.7%
+  latency.ttft_p50         median=3896.174  [2455.869, 4470.200]  spread=51.7%
+  waste_ratio              median=40.837  [23.251, 41.976]  spread=45.9%
+  mean_decode_batch        median=2.138  [2.086, 2.367]  spread=13.1%
+  mean_context_tokens      median=1816.096  [1737.993, 1935.014]  spread=10.8%
+  step_timing.decode_step_p50_ms median=10.912  [10.826, 10.945]  spread=1.1%
+  step_timing.prefill_step_p50_ms median=33.463  [33.361, 34.519]  spread=3.5%
+  step_timing.prefill_step_fraction median=0.905  [0.848, 0.922]  spread=8.2%
+  step_timing.host_stage_ms_p50 median=0.156  [0.152, 0.160]  spread=5.1%
+  step_timing.decode_gpu_ms_p50 median=10.760  [10.672, 10.799]  spread=1.2%
+  step_timing.prefill_gpu_ms_p50 median=34.821  [25.251, 35.548]  spread=29.6%
+  step_timing.fused_gpu_ms_p50 median=33.720  [33.076, 35.679]  spread=7.7%
+  step_timing.sync_ms_p50  median=15.146  [11.596, 18.458]  spread=45.3%
+  step_timing.lazy_graph_captures median=0.000  [0.000, 0.000]  spread=0.0%
+  (coverage gaps, not failures: 2)
+
+=== sdpa ===
+  step_timing.expected_gap_ms median=17.277  [17.032, 17.283]  spread=1.5%
+  latency.itl_p50          median=17.756  [17.711, 17.848]  spread=0.8%
+  latency.ttft_p50         median=1836.692  [1280.441, 1859.911]  spread=31.5%
+  waste_ratio              median=39.315  [24.852, 43.820]  spread=48.2%
+  mean_decode_batch        median=2.140  [2.129, 2.218]  spread=4.2%
+  mean_context_tokens      median=1814.016  [1710.074, 1918.662]  spread=11.5%
+  step_timing.decode_step_p50_ms median=11.018  [10.941, 11.032]  spread=0.8%
+  step_timing.prefill_step_p50_ms median=17.747  [17.675, 17.753]  spread=0.4%
+  step_timing.prefill_step_fraction median=0.929  [0.903, 0.932]  spread=3.1%
+  step_timing.host_stage_ms_p50 median=0.155  [0.153, 0.156]  spread=2.0%
+  step_timing.decode_gpu_ms_p50 median=10.862  [10.795, 10.868]  spread=0.7%
+  step_timing.prefill_gpu_ms_p50 median=14.123  [14.035, 14.154]  spread=0.8%
+  step_timing.fused_gpu_ms_p50 median=17.601  [17.593, 17.620]  spread=0.2%
+  step_timing.sync_ms_p50  median=1.258  [1.258, 1.260]  spread=0.2%
+  step_timing.lazy_graph_captures median=0.000  [0.000, 0.000]  spread=0.0%
+  (coverage gaps, not failures: 1)
+
+=== tiled ===
+  step_timing.expected_gap_ms median=15.775  [15.701, 15.808]  spread=0.7%
+  latency.itl_p50          median=16.248  [16.179, 16.256]  spread=0.5%
+  latency.ttft_p50         median=1619.870  [1147.898, 1669.657]  spread=32.2%
+  waste_ratio              median=38.046  [25.499, 45.355]  spread=52.2%
+  mean_decode_batch        median=2.138  [2.118, 2.148]  spread=1.4%
+  mean_context_tokens      median=1811.113  [1703.462, 1918.545]  spread=11.9%
+  step_timing.decode_step_p50_ms median=10.923  [10.857, 10.974]  spread=1.1%
+  step_timing.prefill_step_p50_ms median=16.199  [16.137, 16.228]  spread=0.6%
+  step_timing.prefill_step_fraction median=0.915  [0.905, 0.938]  spread=3.6%
+  step_timing.host_stage_ms_p50 median=0.153  [0.152, 0.154]  spread=1.1%
+  step_timing.decode_gpu_ms_p50 median=10.772  [10.697, 10.813]  spread=1.1%
+  step_timing.prefill_gpu_ms_p50 median=12.441  [12.411, 12.473]  spread=0.5%
+  step_timing.fused_gpu_ms_p50 median=16.061  [15.936, 16.076]  spread=0.9%
+  step_timing.sync_ms_p50  median=1.253  [1.253, 1.254]  spread=0.1%
+  step_timing.lazy_graph_captures median=0.000  [0.000, 0.000]  spread=0.0%
+  (coverage gaps, not failures: 1)
+
+per_token operating point: decode batch ~2.1, context ~1816 tokens
+  compare its ITL against the roofline cell nearest that point:
+  python -m benchmarks.kernels.roofline --measured-itl-ms 22.82 --itl-batch 2 --itl-context 1816
+
+sdpa operating point: decode batch ~2.1, context ~1814 tokens
+  compare its ITL against the roofline cell nearest that point:
+  python -m benchmarks.kernels.roofline --measured-itl-ms 17.76 --itl-batch 2 --itl-context 1814
+
+tiled operating point: decode batch ~2.1, context ~1811 tokens
+  compare its ITL against the roofline cell nearest that point:
+  python -m benchmarks.kernels.roofline --measured-itl-ms 16.25 --itl-batch 2 --itl-context 1811
+
+=== sdpa vs per_token ===
+  step_timing.expected_gap_ms -44.7% (spread 2.5%)
+  step_timing.prefill_share_of_gap -44.3% (spread 3.8%)
+  latency.itl_p50          unresolved: -22.2% median change is within 55.7% run-to-run spread
+  latency.itl_p99          -55.3% (spread 2.7%)
+  latency.itl_p999         -55.2% (spread 3.2%)
+  latency.ttft_p50         -52.9% (spread 51.7%)
+  step_timing.decode_step_p50_ms unresolved: +1.0% median change is within 1.1% run-to-run spread
+  step_timing.prefill_step_p50_ms -47.0% (spread 3.5%)
+  step_timing.prefill_step_fraction unresolved: +2.7% median change is within 8.2% run-to-run spread
+  step_timing.prefill_penalty_p50_ms -70.3% (spread 5.3%)
+  waste_ratio              unresolved: -3.7% median change is within 48.2% run-to-run spread
+  step_timing.host_stage_ms_p50 unresolved: -0.4% median change is within 5.1% run-to-run spread
+  step_timing.decode_gpu_ms_p50 unresolved: +0.9% median change is within 1.2% run-to-run spread
+  step_timing.prefill_gpu_ms_p50 -59.4% (spread 29.6%)
+  step_timing.fused_gpu_ms_p50 -47.8% (spread 7.7%)
+  step_timing.sync_ms_p50  -91.7% (spread 45.3%)
+  step_timing.lazy_graph_captures baseline is zero
+
+=== tiled vs per_token ===
+  step_timing.expected_gap_ms -49.5% (spread 2.5%)
+  step_timing.prefill_share_of_gap -52.6% (spread 4.0%)
+  latency.itl_p50          unresolved: -28.8% median change is within 55.7% run-to-run spread
+  latency.itl_p99          -65.3% (spread 4.9%)
+  latency.itl_p999         -64.1% (spread 14.3%)
+  latency.ttft_p50         -58.4% (spread 51.7%)
+  step_timing.decode_step_p50_ms unresolved: +0.1% median change is within 1.1% run-to-run spread
+  step_timing.prefill_step_p50_ms -51.6% (spread 3.5%)
+  step_timing.prefill_step_fraction unresolved: +1.1% median change is within 8.2% run-to-run spread
+  step_timing.prefill_penalty_p50_ms -76.7% (spread 5.3%)
+  waste_ratio              unresolved: -6.8% median change is within 52.2% run-to-run spread
+  step_timing.host_stage_ms_p50 unresolved: -2.0% median change is within 5.1% run-to-run spread
+  step_timing.decode_gpu_ms_p50 unresolved: +0.1% median change is within 1.2% run-to-run spread
+  step_timing.prefill_gpu_ms_p50 -64.3% (spread 29.6%)
+  step_timing.fused_gpu_ms_p50 -52.4% (spread 7.7%)
+  step_timing.sync_ms_p50  -91.7% (spread 45.3%)
+  step_timing.lazy_graph_captures baseline is zero
+
+Saved -> results/sm89/round1-20261008T074516Z/ab_prefill_kernel_long.json
+
+==== A/B: verify_kernel (chat) ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  79%|███████▉  | 247/311 [00:00<00:00, 2468.41it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2692.99it/s]
+workload: chat profile, mean prompt ~656 tokens
+vs stock reference, first divergent token per prompt: verify_prefill_path=[None, None, None, None]  (ties, not counted: ['prompt 0 @ 4 (margin 0.0000)', 'prompt 1 @ 18 (margin 0.0000)'])
+vs stock reference, first divergent token per prompt: verify_per_token=[None, None, None, None]  (ties, not counted: ['prompt 0 @ 4 (margin 0.0000)', 'prompt 1 @ 18 (margin 0.0000)'])
+vs stock reference, first divergent token per prompt: verify_tiled=[None, None, None, None]  (ties, not counted: ['prompt 0 @ 4 (margin 0.0000)', 'prompt 1 @ 18 (margin 0.0000)'])
+token identity: all arms produce identical greedy output
+clocks before: {'clocks.sm': 2715.0, 'clocks.mem': 8251.0, 'clocks.max.sm': 3105.0, 'power.draw': '[N/A]', 'power.limit': 115.0, 'temperature.gpu': 61.0, 'clocks_throttle_reasons.active': '0x0000000000000000'}
+
+=== interleaved: verify_prefill_path / verify_per_token / verify_tiled x 3 ===
+  [verify_prefill_path run 1/3] gap=37.39ms decode=25.43ms host=0.09ms gpu=10.47ms ttft=504.9ms
+  [verify_per_token run 1/3] gap=34.33ms decode=22.18ms host=0.09ms gpu=10.40ms ttft=505.4ms
+  [verify_tiled run 1/3] gap=35.86ms decode=24.71ms host=0.09ms gpu=10.63ms ttft=483.8ms
+  [verify_prefill_path run 2/3] gap=39.98ms decode=27.84ms host=0.10ms gpu=11.07ms ttft=384.8ms
+  [verify_per_token run 2/3] gap=37.59ms decode=24.35ms host=0.10ms gpu=11.28ms ttft=475.2ms
+  [verify_tiled run 2/3] gap=37.29ms decode=24.60ms host=0.09ms gpu=10.86ms ttft=407.3ms
+  [verify_prefill_path run 3/3] gap=37.70ms decode=24.76ms host=0.09ms gpu=10.45ms ttft=576.5ms
+  [verify_per_token run 3/3] gap=35.13ms decode=22.20ms host=0.09ms gpu=10.46ms ttft=486.9ms
+  [verify_tiled run 3/3] gap=35.77ms decode=23.06ms host=0.09ms gpu=10.50ms ttft=494.2ms
+
+=== verify_prefill_path ===
+  step_timing.expected_gap_ms median=37.698  [37.386, 39.984]  spread=6.9%
+  latency.itl_p50          median=11.362  [0.001, 24.219]  spread=213.1%
+  latency.ttft_p50         median=504.907  [384.753, 576.462]  spread=38.0%
+  waste_ratio              median=0.000  [0.000, 0.000]  spread=0.0%
+  mean_decode_batch        median=4.406  [3.970, 4.500]  spread=12.0%
+  mean_context_tokens      median=618.488  [590.694, 654.395]  spread=10.3%
+  step_timing.decode_step_p50_ms median=25.427  [24.759, 27.842]  spread=12.1%
+  step_timing.prefill_step_p50_ms median=38.558  [38.384, 40.758]  spread=6.2%
+  step_timing.prefill_step_fraction median=0.938  [0.923, 0.940]  spread=1.8%
+  step_timing.host_stage_ms_p50 median=0.086  [0.086, 0.099]  spread=14.9%
+  step_timing.decode_gpu_ms_p50 median=10.468  [10.452, 11.065]  spread=5.9%
+  step_timing.prefill_gpu_ms_p50 median=13.966  [13.856, 14.915]  spread=7.6%
+  step_timing.sync_ms_p50  median=1.227  [1.225, 1.228]  spread=0.3%
+  step_timing.lazy_graph_captures median=0.000  [0.000, 0.000]  spread=0.0%
+  (coverage gaps, not failures: 2)
+
+=== verify_per_token ===
+  step_timing.expected_gap_ms median=35.131  [34.325, 37.588]  spread=9.3%
+  latency.itl_p50          median=12.055  [10.691, 21.634]  spread=90.8%
+  latency.ttft_p50         median=486.941  [475.205, 505.382]  spread=6.2%
+  waste_ratio              median=0.000  [0.000, 0.000]  spread=0.0%
+  mean_decode_batch        median=4.222  [4.091, 4.571]  spread=11.4%
+  mean_context_tokens      median=639.821  [620.373, 649.300]  spread=4.5%
+  step_timing.decode_step_p50_ms median=22.196  [22.185, 24.353]  spread=9.8%
+  step_timing.prefill_step_p50_ms median=35.872  [35.502, 38.053]  spread=7.1%
+  step_timing.prefill_step_fraction median=0.946  [0.912, 0.966]  spread=5.8%
+  step_timing.host_stage_ms_p50 median=0.086  [0.086, 0.100]  spread=16.7%
+  step_timing.decode_gpu_ms_p50 median=10.458  [10.398, 11.277]  spread=8.4%
+  step_timing.prefill_gpu_ms_p50 median=13.918  [13.788, 15.151]  spread=9.8%
+  step_timing.sync_ms_p50  median=1.227  [1.227, 1.227]  spread=0.0%
+  step_timing.lazy_graph_captures median=0.000  [0.000, 0.000]  spread=0.0%
+  (coverage gaps, not failures: 2)
+
+=== verify_tiled ===
+  step_timing.expected_gap_ms median=35.860  [35.772, 37.293]  spread=4.2%
+  latency.itl_p50          median=10.547  [0.001, 22.633]  spread=214.6%
+  latency.ttft_p50         median=483.839  [407.267, 494.173]  spread=18.0%
+  waste_ratio              median=0.000  [0.000, 0.000]  spread=0.0%
+  mean_decode_batch        median=4.469  [4.364, 4.543]  spread=4.0%
+  mean_context_tokens      median=615.221  [597.517, 647.929]  spread=8.2%
+  step_timing.decode_step_p50_ms median=24.595  [23.055, 24.710]  spread=6.7%
+  step_timing.prefill_step_p50_ms median=36.875  [36.773, 37.904]  spread=3.1%
+  step_timing.prefill_step_fraction median=0.927  [0.917, 0.954]  spread=4.0%
+  step_timing.host_stage_ms_p50 median=0.091  [0.085, 0.092]  spread=7.5%
+  step_timing.decode_gpu_ms_p50 median=10.630  [10.498, 10.862]  spread=3.4%
+  step_timing.prefill_gpu_ms_p50 median=14.021  [13.946, 14.509]  spread=4.0%
+  step_timing.sync_ms_p50  median=1.227  [1.226, 1.227]  spread=0.1%
+  step_timing.lazy_graph_captures median=0.000  [0.000, 0.000]  spread=0.0%
+  (coverage gaps, not failures: 2)
+
+verify_prefill_path operating point: decode batch ~4.4, context ~618 tokens
+  compare its ITL against the roofline cell nearest that point:
+  python -m benchmarks.kernels.roofline --measured-itl-ms 11.36 --itl-batch 4 --itl-context 618
+
+verify_per_token operating point: decode batch ~4.2, context ~640 tokens
+  compare its ITL against the roofline cell nearest that point:
+  python -m benchmarks.kernels.roofline --measured-itl-ms 12.05 --itl-batch 4 --itl-context 640
+
+verify_tiled operating point: decode batch ~4.5, context ~615 tokens
+  compare its ITL against the roofline cell nearest that point:
+  python -m benchmarks.kernels.roofline --measured-itl-ms 10.55 --itl-batch 4 --itl-context 615
+
+=== verify_per_token vs verify_prefill_path ===
+  step_timing.expected_gap_ms unresolved: -6.8% median change is within 9.3% run-to-run spread
+  step_timing.prefill_share_of_gap unresolved: +10.6% median change is within 12.4% run-to-run spread
+  latency.itl_p50          unresolved: +6.1% median change is within 213.1% run-to-run spread
+  latency.itl_p99          unresolved: -15.2% median change is within 16.9% run-to-run spread
+  latency.itl_p999         unresolved: -13.9% median change is within 21.0% run-to-run spread
+  latency.ttft_p50         unresolved: -3.6% median change is within 38.0% run-to-run spread
+  step_timing.decode_step_p50_ms -12.7% (spread 12.1%)
+  step_timing.prefill_step_p50_ms unresolved: -7.0% median change is within 7.1% run-to-run spread
+  step_timing.prefill_step_fraction unresolved: +0.9% median change is within 5.8% run-to-run spread
+  step_timing.prefill_penalty_p50_ms unresolved: +5.6% median change is within 6.8% run-to-run spread
+  waste_ratio              baseline is zero
+  step_timing.host_stage_ms_p50 unresolved: -0.1% median change is within 16.7% run-to-run spread
+  step_timing.decode_gpu_ms_p50 unresolved: -0.1% median change is within 8.4% run-to-run spread
+  step_timing.prefill_gpu_ms_p50 unresolved: -0.3% median change is within 9.8% run-to-run spread
+  step_timing.fused_gpu_ms_p50 no data
+  step_timing.sync_ms_p50  unresolved: -0.1% median change is within 0.3% run-to-run spread
+  step_timing.lazy_graph_captures baseline is zero
+
+=== verify_tiled vs verify_prefill_path ===
+  step_timing.expected_gap_ms unresolved: -4.9% median change is within 6.9% run-to-run spread
+  step_timing.prefill_share_of_gap unresolved: +6.4% median change is within 13.1% run-to-run spread
+  latency.itl_p50          unresolved: -7.2% median change is within 214.6% run-to-run spread
+  latency.itl_p99          unresolved: -7.5% median change is within 16.9% run-to-run spread
+  latency.itl_p999         unresolved: -9.0% median change is within 21.0% run-to-run spread
+  latency.ttft_p50         unresolved: -4.2% median change is within 38.0% run-to-run spread
+  step_timing.decode_step_p50_ms unresolved: -3.3% median change is within 12.1% run-to-run spread
+  step_timing.prefill_step_p50_ms unresolved: -4.4% median change is within 6.2% run-to-run spread
+  step_timing.prefill_step_fraction unresolved: -1.1% median change is within 4.0% run-to-run spread
+  step_timing.prefill_penalty_p50_ms unresolved: +2.7% median change is within 11.7% run-to-run spread
+  waste_ratio              baseline is zero
+  step_timing.host_stage_ms_p50 unresolved: +5.2% median change is within 14.9% run-to-run spread
+  step_timing.decode_gpu_ms_p50 unresolved: +1.5% median change is within 5.9% run-to-run spread
+  step_timing.prefill_gpu_ms_p50 unresolved: +0.4% median change is within 7.6% run-to-run spread
+  step_timing.fused_gpu_ms_p50 no data
+  step_timing.sync_ms_p50  unresolved: -0.0% median change is within 0.3% run-to-run spread
+  step_timing.lazy_graph_captures baseline is zero
+
+Saved -> results/sm89/round1-20261008T074516Z/ab_verify_kernel_chat.json
+
+==== A/B: kv_dtype_all (chat) ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  95%|█████████▍| 295/311 [00:00<00:00, 2933.82it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2983.90it/s]
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/rtx-ci-agent/benchmarks/reliability/ab.py", line 694, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/tmp/rtx-ci-agent/benchmarks/reliability/ab.py", line 551, in main
+    engine.warmup()  # the gate checks tokens, not first-use cost; always warm here
+    ~~~~~~~~~~~~~^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/tmp/rtx-ci-agent/engine/batching/continuous_batching.py", line 2221, in warmup
+    self.step()
+    ~~~~~~~~~^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/tmp/rtx-ci-agent/engine/batching/continuous_batching.py", line 1552, in step
+    self.prefill_chunks(plans)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/tmp/rtx-ci-agent/engine/batching/continuous_batching.py", line 1209, in prefill_chunks
+    self.prefill_batch([request for request, _ in plans])
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+  File "/tmp/rtx-ci-agent/engine/batching/continuous_batching.py", line 1163, in prefill_batch
+    hidden = self._decoder()(
+             ~~~~~~~~~~~~~~~^
+        input_ids=ids, attention_mask=attention_mask,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        past_key_values=cache, use_cache=True, return_dict=True,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ).last_hidden_state
+    ^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/transformers/utils/generic.py", line 1068, in wrapper
+    output = func(self, *args, **kwargs)
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/transformers/utils/output_capturing.py", line 286, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/transformers/models/qwen3/modeling_qwen3.py", line 413, in forward
+    hidden_states = decoder_layer(
+        hidden_states,
+    ...<5 lines>...
+        **kwargs,
+    )
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/transformers/modeling_layers.py", line 109, in __call__
+    return super().__call__(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/transformers/models/qwen3/modeling_qwen3.py", line 307, in forward
+    hidden_states, _ = self.self_attn(
+                       ~~~~~~~~~~~~~~^
+        hidden_states=hidden_states,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+        **kwargs,
+        ^^^^^^^^^
+    )
+    ^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/transformers/models/qwen3/modeling_qwen3.py", line 260, in forward
+    key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+                               ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/rtx-ci-agent/engine/cache/pool_cache.py", line 52, in update
+    write_prefill_int8_kv_batched(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        key_states, value_states, self.key_pool[layer_idx], self.value_pool[layer_idx],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        self.key_scale_pool[layer_idx], self.value_scale_pool[layer_idx],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        self.block_tables, self.seq_lens,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/tmp/rtx-ci-agent/engine/kernels/int8_paged_kv.py", line 221, in write_prefill_int8_kv_batched
+    raise ValueError("INT8 K/V pool geometry does not match incoming tensors")
+ValueError: INT8 K/V pool geometry does not match incoming tensors
+workload: chat profile, mean prompt ~656 tokens
