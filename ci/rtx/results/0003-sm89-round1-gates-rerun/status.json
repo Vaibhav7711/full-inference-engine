@@ -1,0 +1,16 @@
+{
+  "id": "0003-sm89-round1-gates-rerun",
+  "state": "running",
+  "ok": false,
+  "request_sha": "9b9090d4c9b2d88859c68a24600284507df8c000",
+  "started": "2026-10-08T07:37:01Z",
+  "finished": null,
+  "seconds": null,
+  "torch": "2.14.0+cu130",
+  "cuda": "13.0",
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "triton": "3.8.0",
+  "driver": "595.91.07",
+  "steps": [],
+  "note": null
+}
