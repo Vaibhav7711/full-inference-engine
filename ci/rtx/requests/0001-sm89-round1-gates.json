@@ -1,0 +1,14 @@
+{
+  "id": "0001-sm89-round1-gates",
+  "description": "First boot of the sm_89 round-1 work: static checks + CPU suite, CUDA kernels against their fp16 shadows, backend table, live token gate. No timing. Everything in this round was written without a GPU; this is the first time any of it runs.",
+  "commands": [
+    "bash scripts/sm89_round1.sh --gates"
+  ],
+  "timeout_minutes": 60,
+  "artifacts": [
+    "results/sm89/round1-*"
+  ],
+  "requires_gpu_idle": true,
+  "depends_on": null,
+  "continue_on_error": false
+}
