@@ -1,0 +1,109 @@
+
+==== provenance ====
+name, driver_version, memory.total [MiB], clocks.max.sm [MHz]
+NVIDIA GeForce RTX 4060, 595.91.07, 8188 MiB, 3105 MHz
+torch 2.14.0+cu130 | triton 3.8.0 | cuda 13.0
+
+==== gate 1: static checks and CPU suite ====
+........................................................................ [ 19%]
+........................................................................ [ 39%]
+........................................................................ [ 59%]
+........................................................................ [ 79%]
+........................................................................ [ 99%]
+.                                                                        [100%]
+=============================== warnings summary ===============================
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+361 passed, 207 deselected, 2 warnings in 49.45s
+
+==== gate 2: CUDA suite (kernels against their fp16 shadows; verify path via speculative tests) ====
+..s...........................x......................................... [ 34%]
+........................................................................ [ 69%]
+...............................................................          [100%]
+=============================== warnings summary ===============================
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+205 passed, 1 skipped, 361 deselected, 1 xfailed, 2 warnings in 287.47s (0:04:47)
+
+==== gate 3: backend table on this device ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  64%|██████▍   | 199/311 [00:00<00:00, 1986.50it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2362.96it/s]
+
+model: qwen3 (Qwen3ForCausalLM), 28 layers, 16/8 heads, head_dim 128, 112 KiB KV per token
+  fusions: 28 MLP, 113 norm, rope in transformers.models.qwen3.modeling_qwen3
+device: NVIDIA GeForce RTX 4060 (sm_89, 8.2 GB, 24 SMs, 25 MB L2) (measured)
+  no decode   flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok decode   gqa        p10 
+  ok decode   per_head   p50 
+  ok decode   split_k    p20 
+  no prefill  flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok prefill  flash_dense p45 
+  ok prefill  per_token  p30 
+  ok prefill  sdpa       p50 
+  ok prefill  tiled      p40 
+defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
+  decode_attention: RTX 4060 A/B: FA2 decode is eager-only and +114% ITL against graphed per_head at the short serving point
+  prefill_attention: measured default 'flash' cannot run here; selected sdpa
+  dtype: FP16 passed the early stock-token gate; BF16 Flash diverged at token 2
+  verify_attention: unmeasured for verification on sm_89: paged multi-query tile (block_m=16) on the tensor cores; A/B with `--setting verify_kernel`
+
+==== gate 4: live token gate at the sm_89 defaults ====
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  70%|███████   | 219/311 [00:00<00:00, 2137.51it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2431.96it/s]
+
+model: qwen3 (Qwen3ForCausalLM), 28 layers, 16/8 heads, head_dim 128, 112 KiB KV per token
+  fusions: 28 MLP, 113 norm, rope in transformers.models.qwen3.modeling_qwen3
+device: NVIDIA GeForce RTX 4060 (sm_89, 8.2 GB, 24 SMs, 25 MB L2) (measured)
+  no decode   flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok decode   gqa        p10 
+  ok decode   per_head   p50 
+  ok decode   split_k    p20 
+  no prefill  flash      p80   <- flash_attn_with_kvcache needs page sizes divisible by 256, not 16
+  ok prefill  flash_dense p45 
+  ok prefill  per_token  p30 
+  ok prefill  sdpa       p50 
+  ok prefill  tiled      p40 
+defaults: {'decode_attention': 'per_head', 'prefill_attention': 'sdpa', 'dtype': 'float16'}
+  decode_attention: RTX 4060 A/B: FA2 decode is eager-only and +114% ITL against graphed per_head at the short serving point
+  prefill_attention: measured default 'flash' cannot run here; selected sdpa
+  dtype: FP16 passed the early stock-token gate; BF16 Flash diverged at token 2
+  verify_attention: unmeasured for verification on sm_89: paged multi-query tile (block_m=16) on the tensor cores; A/B with `--setting verify_kernel`
+warmup 6.9s -> {'rounds': 6, 'graphs': 6, 'prefill_graphs': 18, 'fused_graphs': 90, 'prefill_graph_unsupported': {}, 'prefill_graph_eager_reason': None, 'decode_graph_eager_reason': None, 'prefill_sdpa_calls': 3, 'prefill_chunked_calls': 21}
+captured: [(2, 64, 4), (2, 128, 4), (4, 64, 4), (4, 128, 4), (8, 64, 4), (8, 128, 4)]
+last step phases (ms): {'host_stage_ms': 0.095, 'sync_ms': 5.443, 'decode_gpu_ms': 5.462}
+{
+  "git": {
+    "commit": "157f226bf80facd79b97b07ab1c485dd2caf1cab",
+    "short": "157f226",
+    "branch": "main",
+    "dirty": true
+  },
+  "clocks": {
+    "clocks.sm": 2715.0,
+    "clocks.mem": 8251.0,
+    "clocks.max.sm": 3105.0,
+    "power.draw": "[N/A]",
+    "power.limit": 115.0,
+    "temperature.gpu": 60.0,
+    "clocks_throttle_reasons.active": "0x0000000000000000"
+  },
+  "problems": []
+}
+hook check ok
+problems: []
+
+==== gates green; stopping before timing (--gates) ====
