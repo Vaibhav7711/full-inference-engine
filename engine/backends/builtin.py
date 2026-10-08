@@ -45,13 +45,23 @@ def _flash_dense_available(profile, geometry: Geometry) -> str | None:
     from engine.kernels.flash_paged import supports_dense
 
     if _int8_pool(geometry):
-        return "the dense gather path has no INT8 dequantizing variant"
+        return f"the dense gather path has no {_quantized_pool(geometry)} dequantizing variant"
     dtype = torch.float16 if geometry.dtype == "float16" else torch.bfloat16
     return supports_dense(geometry.head_dim, dtype)
 
 
+def _quantized_pool(geometry: Geometry) -> str | None:
+    """The scaled storage type of the KV pool ("INT8"/"FP8"), or None for fp16.
+
+    A scaled pool is served by its own dequantising kernel pair, so the backends that
+    read fp16 pages directly - the gather paths, GQA-shared, split-K, tiled - cannot run
+    on one and say so.
+    """
+    return geometry.kv_dtype.upper() if geometry.kv_dtype in {"int8", "fp8"} else None
+
+
 def _int8_pool(geometry: Geometry) -> bool:
-    return geometry.kv_dtype == "int8"
+    return _quantized_pool(geometry) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -92,13 +102,13 @@ def _gqa_available(profile, geometry: Geometry) -> str | None:
     if geometry.gqa_group != 2:
         return f"written for a GQA group of exactly 2, not {geometry.gqa_group}"
     if _int8_pool(geometry):
-        return "no INT8 variant"
+        return f"no {_quantized_pool(geometry)} variant"
     return _triton_available(profile, geometry)
 
 
 def _split_k_available(profile, geometry: Geometry) -> str | None:
     if _int8_pool(geometry):
-        return "no INT8 variant"
+        return f"no {_quantized_pool(geometry)} variant"
     return _triton_available(profile, geometry)
 
 
@@ -183,7 +193,8 @@ def _prefill_flash_dense(query, key_pages, value_pages, block_tables, start_posi
 
 def _sdpa_available(profile, geometry: Geometry) -> str | None:
     if _int8_pool(geometry):
-        return "the gather path has no INT8 dequantizing variant; use per_token"
+        return (f"the gather path has no {_quantized_pool(geometry)} dequantizing variant; "
+                f"the engine runs the per-token dequantizing kernel")
     return None
 
 
@@ -193,7 +204,7 @@ def _tiled_available(profile, geometry: Geometry) -> str | None:
         # the kernel spills at 255 registers (journal, "never used the tensor cores").
         return f"tl.dot does not reach the tensor cores on sm_{profile.sm}"
     if _int8_pool(geometry):
-        return "no INT8 variant"
+        return f"no {_quantized_pool(geometry)} variant"
     return _triton_available(profile, geometry)
 
 

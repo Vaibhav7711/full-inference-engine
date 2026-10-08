@@ -185,6 +185,19 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("verify_per_token", {"speculative_ngram": True, "verify_attention": "per_token"}),
         ("verify_tiled", {"speculative_ngram": True, "verify_attention": "tiled"}),
     ],
+    # FP8 (E4M3) KV storage against fp16, sm_89+. Halves KV bytes per token; on a card
+    # whose bandwidth is the decode floor that is the one lever left. The arm is refused
+    # with a reason below sm_89 and the run then has one arm, which it declines to time.
+    "kv_dtype_fp8": [
+        ("fp16_kv", {"kv_cache_dtype": "fp16"}),
+        ("fp8_kv", {"kv_cache_dtype": "fp8"}),
+    ],
+    # The three-way, where a device can build all three.
+    "kv_dtype_all": [
+        ("fp16_kv", {"kv_cache_dtype": "fp16"}),
+        ("int8_kv", {"kv_cache_dtype": "int8"}),
+        ("fp8_kv", {"kv_cache_dtype": "fp8"}),
+    ],
 }
 
 
@@ -248,7 +261,10 @@ TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rm
                         # path, the per-token loop and the 16-row tile reduce in
                         # different orders. The accepted tokens, not the logits, are
                         # the contract, and the stock gate still applies to each arm.
-                        "verify_kernel"}
+                        "verify_kernel",
+                        # Scaled storage changes every K/V value by up to half an E4M3
+                        # ulp; late greedy drift is the expected shape, early is a bug.
+                        "kv_dtype_fp8", "kv_dtype_all"}
 
 
 def drift_expected(setting: str) -> bool:

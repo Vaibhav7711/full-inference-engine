@@ -80,6 +80,9 @@ class _BatchContext:
     decode_num_splits: int = 0
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
+    # Storage type of the pools: "fp16" (the model dtype), "int8" or "fp8". The scaled
+    # types share the scale pools above and dispatch to their own dequantising kernels.
+    kv_dtype: str = "fp16"
     # "per_head": one program per (row, query head). "gqa": one per (row, KV head), the
     # K/V tile read once for the whole group. See `paged_decode_gqa`.
     decode_kernel: str = "per_head"
@@ -100,6 +103,7 @@ class _PrefillContext:
     chunk_lens: torch.Tensor
     key_scale_pool: list | None = None
     value_scale_pool: list | None = None
+    kv_dtype: str = "fp16"
     # Name of the resolved prefill backend, kept for graph keys and reporting.
     attention: str = "sdpa"
     # The backend itself; set by `_set_prefill_context`.
@@ -179,7 +183,7 @@ def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, sca
     """Write one new K/V per row, then attend `[N, heads, 1, D]` over each row's pages."""
     key_pool = ctx.key_pool[layer_idx]      # [num_blocks, block_size, kv_heads, D]
     value_pool = ctx.value_pool[layer_idx]
-    if ctx.key_scale_pool is None:
+    if ctx.kv_dtype == "fp16":
         write_decode_kv(key, value, key_pool, value_pool, ctx.block_tables, ctx.seq_lens)
         return ctx.decode_backend.run(
             query, key_pool, value_pool, ctx.block_tables, ctx.seq_lens,
@@ -187,12 +191,19 @@ def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, sca
             length_offset=1, max_sequence_length=ctx.decode_max_len,
             num_splits=ctx.decode_num_splits,
         )
-    from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
-    write_decode_int8_kv(
+    # A scaled pool has one kernel pair per storage type; the resolved backend's name is
+    # reported but the dequantising kernel is what runs. Same for the prefill path.
+    if ctx.kv_dtype == "fp8":
+        from engine.kernels.fp8_paged_kv import paged_decode_batched_fp8 as attend, \
+            write_decode_fp8_kv as write
+    else:
+        from engine.kernels.int8_paged_kv import paged_decode_batched_int8 as attend, \
+            write_decode_int8_kv as write
+    write(
         key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
         ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
     )
-    return paged_decode_batched_int8(
+    return attend(
         query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
         ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
         scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
@@ -225,31 +236,34 @@ def _prefill_attention(ctx: _PrefillContext, layer_idx: int, query, key, value, 
     """Write a padded K/V chunk batch, then attend `[B, heads, Q, D]` to each paged prefix."""
     key_pool = ctx.key_pool[layer_idx]
     value_pool = ctx.value_pool[layer_idx]
-    if ctx.key_scale_pool is None:
+    if ctx.kv_dtype == "fp16":
         from engine.kernels.kv_write import write_prefill_kv_batched
         write_prefill_kv_batched(
             key, value, key_pool, value_pool, ctx.block_tables,
             ctx.chunk_lens, ctx.start_positions,
         )
-        out = ctx.backend.run(
+        return ctx.backend.run(
             query, key_pool, value_pool, ctx.block_tables,
             ctx.start_positions, ctx.chunk_lens, scale=scaling,
             total_len=ctx.total_len, cache=ctx.sdpa_cache,
             block_m=ctx.prefill_block_m, block_n=ctx.prefill_block_n,
         )
+    if ctx.kv_dtype == "fp8":
+        from engine.kernels.fp8_paged_kv import paged_prefill_fp8 as attend, \
+            write_prefill_fp8_kv_batched as write
     else:
-        from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
-        write_prefill_int8_kv_batched(
-            key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
-            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.chunk_lens,
-            ctx.start_positions,
-        )
-        out = paged_prefill_int8(
-            query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
-            ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.start_positions,
-            ctx.chunk_lens, scale=scaling,
-        )
-    return out
+        from engine.kernels.int8_paged_kv import paged_prefill_int8 as attend, \
+            write_prefill_int8_kv_batched as write
+    write(
+        key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+        ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.chunk_lens,
+        ctx.start_positions,
+    )
+    return attend(
+        query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+        ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.start_positions,
+        ctx.chunk_lens, scale=scaling,
+    )
 
 
 def chunked_prefill_attention_forward(
@@ -362,8 +376,8 @@ class ContinuousBatchingEngine:
             raise ValueError("engine sizes and prefill budgets must be positive")
         if prefix_cache_blocks < 0:
             raise ValueError("prefix_cache_blocks must be non-negative")
-        if kv_cache_dtype not in {"fp16", "int8"}:
-            raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
+        if kv_cache_dtype not in {"fp16", "int8", "fp8"}:
+            raise ValueError("kv_cache_dtype must be 'fp16', 'int8' or 'fp8'")
         if decode_num_splits < 0:
             raise ValueError("decode_num_splits must be non-negative")
         if speculation_depth <= 0 or speculation_depth + 1 > prefill_chunk_size:
@@ -415,7 +429,7 @@ class ContinuousBatchingEngine:
                          or cfg.hidden_size // cfg.num_attention_heads),
             block_size=block_size,
             dtype=str(next(model.parameters()).dtype).removeprefix("torch."),
-            kv_dtype="int8" if kv_cache_dtype == "int8" else "float16",
+            kv_dtype={"int8": "int8", "fp8": "fp8"}.get(kv_cache_dtype, "float16"),
         )
         self.device_profile = current_device(self.device)
         self.geometry = config_geometry
@@ -588,7 +602,18 @@ class ContinuousBatchingEngine:
         elif isinstance(ce, (list, tuple)):
             self.eos_ids.update(ce)
 
-        dtype = torch.int8 if kv_cache_dtype == "int8" else next(model.parameters()).dtype
+        if kv_cache_dtype == "int8":
+            dtype = torch.int8
+        elif kv_cache_dtype == "fp8":
+            from engine.kernels.fp8_format import FP8_DTYPE, unavailable_reason
+
+            reason = unavailable_reason(self.device_profile)
+            if reason is not None:
+                raise ValueError(f"kv_cache_dtype='fp8' cannot run here: {reason}")
+            dtype = FP8_DTYPE
+        else:
+            dtype = next(model.parameters()).dtype
+        element_bytes = 1 if kv_cache_dtype in {"int8", "fp8"} else torch.finfo(dtype).bits // 8
         # Refuse a pool that cannot be allocated, with the arithmetic, rather than letting
         # `torch.zeros` raise a CUDA OOM whose message names neither the cause nor the fix.
         # The documented default (num_blocks=4096, block_size=16) is 7.5 GB of KV for
@@ -596,21 +621,21 @@ class ContinuousBatchingEngine:
         pool_bytes = (
             2 * self.num_layers * num_blocks * block_size
             * self.num_kv_heads * self.head_dim
-            * (1 if kv_cache_dtype == "int8" else torch.finfo(dtype).bits // 8)
+            * element_bytes
         )
         if torch.device(device).type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
             if pool_bytes > free_bytes:
                 affordable = free_bytes // (
                     2 * self.num_layers * block_size * self.num_kv_heads * self.head_dim
-                    * (1 if kv_cache_dtype == "int8" else torch.finfo(dtype).bits // 8)
+                    * element_bytes
                 )
                 raise ValueError(
                     f"KV pool of {num_blocks} x {block_size} tokens needs "
                     f"{pool_bytes / 1e9:.2f} GB but only {free_bytes / 1e9:.2f} GB is free "
                     f"on this device. Pass num_blocks <= {affordable} (leaving nothing for "
-                    f"activations or CUDA graphs), or a smaller block_size, or quantise "
-                    f"the KV cache with kv_cache_dtype='int8'."
+                    f"activations or CUDA graphs), or a smaller block_size, or halve the "
+                    f"cache with kv_cache_dtype='int8' (any device) or 'fp8' (sm_89+)."
                 )
         self.kv_pool_bytes = pool_bytes
         self.key_pool = [
@@ -619,7 +644,7 @@ class ContinuousBatchingEngine:
             for _ in range(self.num_layers)
         ]
         self.value_pool = [torch.zeros_like(k) for k in self.key_pool]
-        if kv_cache_dtype == "int8":
+        if kv_cache_dtype in {"int8", "fp8"}:
             scale_shape = (num_blocks, block_size, self.num_kv_heads)
             self.key_scale_pool = [torch.zeros(scale_shape, device=device, dtype=torch.float16)
                                    for _ in range(self.num_layers)]
@@ -1361,6 +1386,7 @@ class ContinuousBatchingEngine:
             prefill_block_m=self.prefill_block_m if block_m is None else block_m,
             prefill_block_n=self.prefill_block_n if block_n is None else block_n,
             sdpa_cache=attention_cache,
+            kv_dtype=self.kv_cache_dtype,
         ))
 
     def _prefill_forward(self, row_count: int, width: int) -> torch.Tensor:
@@ -1866,6 +1892,7 @@ class ContinuousBatchingEngine:
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
             decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
+            kv_dtype=self.kv_cache_dtype,
         ))
         self._set_prefill_context(prefill_rows, total_len)
         _set_fused_ctx(_FusedContext(decode_rows, prefill_rows, width))
@@ -2071,6 +2098,7 @@ class ContinuousBatchingEngine:
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
             decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
+            kv_dtype=self.kv_cache_dtype,
         )
         graph_key = (graph_bucket_size, decode_block_n, decode_num_warps)
         use_graph = graph_bucket_size is not None
