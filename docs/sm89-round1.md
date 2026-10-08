@@ -31,7 +31,7 @@ two; round 2 is the third.
 | `kv_cache_dtype="fp8"` — E4M3 storage with per-(token, head) fp16 scales, dequantising decode/prefill kernels, sm_89 gate | `engine/kernels/fp8_format.py` (Triton-free contract), `fp8_paged_kv.py` (kernels) | reference pinned on CPU; kernels **not launched** |
 | architecture tiers by gate, not brand | `engine/backends/arch.py`, `results/sm75/`, `results/sm89/` | done |
 | A/B settings: `verify_kernel`, `kv_dtype_fp8`, `kv_dtype_all`; the harness skips an arm the registry refuses | `benchmarks/reliability/ab.py` | done |
-| W4A16 linear (INT4 weights, fp16 activations, group scales) | `engine/kernels/w4a16_linear.py` | see commit log |
+| W4A16 linear — INT4 weights packed split-half per 128-group, fp16 activations, one scale per (channel, group); two `tl.dot`s per group, dequant in registers | `engine/kernels/w4a16_format.py` (Triton-free contract), `w4a16_linear.py` (kernel) | contract pinned on CPU; kernel **not launched**; not yet installed on model modules — standalone, like `w8a16_linear` |
 
 Not in round 1, deliberately: the fused-step mechanism (needs a profile on the card),
 graph replay counters (needs the card), any CUDA C++ (round 2).
