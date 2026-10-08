@@ -109,6 +109,26 @@ per-emitted-token accounting before any speculative A/B is quoted.
 "is there a scale pool" and assumed INT8, handing the FP8 pool to the INT8 writer. Fixed to
 dispatch on storage dtype, pinned by a Triton-free test; re-run queued as `0004`.
 
+### Restart: INT8 resume correctness (`0005`, in progress)
+
+`0004` cleared all mandatory gates but its `kv_dtype_all` A/B rejected the INT8 and FP8
+arms before timing: their greedy continuations diverged from the FP16 stock reference
+within the first eight tokens. Separately, the Ada-only INT8 preemption regression was
+still marked `xfail`: rebuilding a preempted request fed generated history through the
+prefill path, whereas uninterrupted history was written through the paged decode path.
+Those paths have distinct reduction behavior with a quantized cache and changed a
+continuation token.
+
+Commit `d4e0f5c` rebuilds the original prompt through SDPA, then replays each historical
+generated input through the normal paged decode path before resuming. The formerly xfailed
+test now passes normally. Request
+`0005-sm89-round1-full-after-int8-resume-fix` started at 2026-10-08T10:03:32Z on the RTX
+4060 (`torch 2.14.0+cu130`, CUDA 13.0, Triton 3.8). Its CPU suite passed (`365 passed`),
+and its CUDA suite, backend table, and live token gate completed before the timed A/B
+sequence. The canonical in-progress status is
+`ci/rtx/results/0005-sm89-round1-full-after-int8-resume-fix/status.json`; timing artifacts
+will be committed by the RTX agent only after the request finishes.
+
 ## Memory on an 8 GB card
 
 The T4 attribution configuration (16,384 KV tokens, 7-bucket warm-up) does not fit:
