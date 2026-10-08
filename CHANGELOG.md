@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — sm_89 round 1 (written without a GPU; see `docs/sm89-round1.md`)
+
+Nothing in this section has been launched on a card. Each item carries a pure-torch
+reference pinned by CPU tests and a CUDA test that runs on first boot; the gate order is
+`scripts/sm89_round1.sh`.
+
+- **`verify_attention`**: speculative verification attends `depth + 1` queries against a
+  long paged prefix and used to run on the prefill backend - SDPA's per-layer prefix
+  gather on the T4, eager FlashAttention on Ada. It now resolves its own in-place paged
+  kernel (`tiled` at a 16-row tile from sm_80, `per_token` below) with `"prefill"` kept
+  as the A/B baseline. `ab.py --setting verify_kernel`.
+- **`kv_cache_dtype="fp8"`** (E4M3, sm_89+): per-(token, head) scaled storage with
+  dequantising decode and prefill kernels mirroring the INT8 pair; the contract
+  (`fp8_format.py`) is Triton-free so it is tested on CPU. Refused below sm_89 with the
+  device named. `ab.py --setting kv_dtype_fp8` / `kv_dtype_all`.
+- **Architecture tiers** (`engine/backends/arch.py`): `sm75` / `sm80plus` by capability
+  gate, not product name; `results/sm75/`, `results/sm89/` index the existing runs.
+- The A/B harness skips an arm whose backend the registry refuses on this device and
+  records why under `skipped_arms`, instead of dying at construction.
+- `check_hooks.py --verify-attention`, `--kv-cache-dtype`.
+
 ## v0.1.0-beta — 2026-09-24
 
 First public release. A single-GPU LLM serving engine measured on two architectures

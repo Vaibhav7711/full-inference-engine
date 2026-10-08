@@ -182,7 +182,8 @@ real trade, not a free win.
 | `fused_step` | `True` | One packed forward per prefill-carrying step. Disable only for A/B comparison. |
 | `decode_attention` | `"per_head"` | Decode backend. `"auto"` consults the per-device policy. |
 | `prefill_attention` | `None` (→ policy) | `"sdpa"`, `"per_token"`, `"tiled"`, `"flash"`. |
-| `kv_cache_dtype` | `"fp16"` | `"int8"` halves KV bytes; measured neutral on T4 and currently disabled on Ada. |
+| `verify_attention` | `None` (→ policy) | Attention for speculative verification: an in-place paged kernel (`"tiled"` from sm_80, `"per_token"` below) instead of the prefill path's prefix gather; `"prefill"` keeps the old behaviour as the A/B baseline. Unmeasured; see `ab.py --setting verify_kernel`. |
+| `kv_cache_dtype` | `"fp16"` | `"int8"` (any device) or `"fp8"` (E4M3, sm_89+) halves KV bytes per token. INT8 measured neutral on T4; FP8 is unmeasured and refused with the device named below sm_89. |
 | `prefix_cache_blocks` | 256 | Pages retained for prefix reuse. Only useful when requests share prefixes. |
 | `triton_rmsnorm` / `triton_rope` / `triton_swiglu` | `True` | Fused kernels. Disable only to isolate their contribution. |
 | `fuse_mlp_gate_up` | `False` | One GEMM for gate+up instead of two. |

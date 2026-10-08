@@ -27,6 +27,10 @@ def main() -> int:
     parser.add_argument("--dtype", default="auto", choices=("auto", "float16", "bfloat16"))
     parser.add_argument("--decode-attention", default=None)
     parser.add_argument("--prefill-attention", default=None)
+    parser.add_argument("--verify-attention", default=None,
+                        help="speculative verification kernel: prefill | per_token | tiled")
+    parser.add_argument("--kv-cache-dtype", default="fp16", choices=("fp16", "int8", "fp8"),
+                        help="KV storage; fp8 needs sm_89+ and is refused with the reason below it")
     parser.add_argument("--num-blocks", type=int, default=1024)
     parser.add_argument("--block-size", type=int, default=16,
                         help="tokens per KV page (FlashAttention paged-KV requires 256)")
@@ -54,6 +58,7 @@ def main() -> int:
         head_dim=model_report["geometry"]["head_dim"],
         block_size=args.block_size,
         dtype=str(loaded.dtype).removeprefix("torch."),
+        kv_dtype={"int8": "int8", "fp8": "fp8"}.get(args.kv_cache_dtype, "float16"),
     )
     backend_report = report(current_device(), geometry)
     print(f"\nmodel: {model_report['model_type']} ({model_report['class']}), "
@@ -86,8 +91,10 @@ def main() -> int:
         loaded.model, loaded.tokenizer, loaded.device, num_blocks=args.num_blocks,
         block_size=args.block_size, max_active=args.max_active,
         cuda_graph_batch_sizes=tuple(args.buckets),
+        kv_cache_dtype=args.kv_cache_dtype,
         **({"decode_attention": args.decode_attention} if args.decode_attention else {}),
         **({"prefill_attention": args.prefill_attention} if args.prefill_attention else {}),
+        **({"verify_attention": args.verify_attention} if args.verify_attention else {}),
     )
     started = time.perf_counter()
     summary = engine.warmup()
