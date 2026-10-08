@@ -1,0 +1,500 @@
+
+==== provenance ====
+name, driver_version, memory.total [MiB], clocks.max.sm [MHz]
+NVIDIA GeForce RTX 4060, 595.91.07, 8188 MiB, 3105 MHz
+torch 2.14.0+cu130 | triton 3.8.0 | cuda 13.0
+
+==== gate 1: static checks and CPU suite ====
+........................................................................ [ 19%]
+........................................................................ [ 39%]
+........................................................................ [ 59%]
+........................................................................ [ 79%]
+........................................................................ [ 99%]
+.                                                                        [100%]
+=============================== warnings summary ===============================
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+361 passed, 207 deselected, 2 warnings in 48.92s
+
+==== gate 2: CUDA suite (kernels against their fp16 shadows; verify path via speculative tests) ====
+..s............FF.............x......................FF................. [ 34%]
+........................................................................ [ 69%]
+...............................................................          [100%]
+=================================== FAILURES ===================================
+_______ test_fused_step_runs_decode_and_prefill_in_one_forward[graphed] ________
+
+graphs = (2, 4)
+
+    @cuda
+    @requires_cuda
+    @pytest.mark.parametrize("graphs", [None, (2, 4)], ids=["eager", "graphed"])
+    def test_fused_step_runs_decode_and_prefill_in_one_forward(graphs):
+        """A step carrying both decode rows and chunk rows runs one forward, token-identical
+        to the two-forward engine and to stock Transformers."""
+        prompts = _staggered_prompts()
+        max_new = 12
+        model, tok = _load()
+        refs = [_reference_greedy(tok, p, max_new) for p in prompts]
+        separate = _fused_engine(model, tok, fused_step=False, cuda_graph_batch_sizes=graphs)
+        fused = _fused_engine(model, tok, fused_step=True, cuda_graph_batch_sizes=graphs)
+        expected = separate.generate(prompts, max_new_tokens=max_new)
+        assert separate.fused_steps == 0
+        actual = fused.generate(prompts, max_new_tokens=max_new)
+        assert fused.fused_steps > 0, "no step carried decode and prefill together"
+        assert fused.prefill_steps >= fused.fused_steps
+        if graphs:
+            assert fused._fused_graphs, "fused steps never replayed a graph"
+>           assert not fused._prefill_graph_unsupported
+E           AssertionError: assert not {'fused:sdpa': 'graph dummy slots were not reserved for this bucket'}
+E            +  where {'fused:sdpa': 'graph dummy slots were not reserved for this bucket'} = <engine.batching.continuous_batching.ContinuousBatchingEngine object at 0x7e3057c367b0>._prefill_graph_unsupported
+
+tests/batching/test_continuous_batching.py:490: AssertionError
+____________ test_gqa_shared_decode_kernel_matches_reference[eager] ____________
+
+graphs = None
+
+    @cuda
+    @requires_cuda
+    @pytest.mark.parametrize("graphs", [None, (2, 4)], ids=["eager", "graphed"])
+    def test_gqa_shared_decode_kernel_matches_reference(graphs):
+        """The shared-KV decode kernel, eager and under graphs, through the full loop."""
+        prompts = _staggered_prompts()
+        max_new = 12
+        model, tok = _load()
+        refs = [_reference_greedy(tok, p, max_new) for p in prompts]
+>       eng = _fused_engine(model, tok, decode_attention="gqa", cuda_graph_batch_sizes=graphs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/batching/test_continuous_batching.py:508: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/batching/test_continuous_batching.py:468: in _fused_engine
+    return ContinuousBatchingEngine(model, tok, "cuda", **settings)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <engine.batching.continuous_batching.ContinuousBatchingEngine object at 0x7e3057c374d0>
+model = Qwen3ForCausalLM(
+  (model): Qwen3Model(
+    (embed_tokens): Embedding(151936, 1024)
+    (layers): ModuleList(
+      (...)
+    (rotary_emb): Qwen3RotaryEmbedding()
+  )
+  (lm_head): Linear(in_features=1024, out_features=151936, bias=False)
+)
+tokenizer = Qwen2Tokenizer(name_or_path='Qwen/Qwen3-0.6B', vocab_size=151643, model_max_length=131072, padding_side='right', trunc...e),
+	151668: AddedToken("</think>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),
+})
+device = 'cuda', num_blocks = 1024, block_size = 16, max_active = 4
+prefill_chunk_size = 16, prefill_attention = 'sdpa', decode_attention = 'gqa'
+verify_attention = 'tiled', tiled_prefill = False, prefill_block_m = None
+prefill_block_n = None, decode_num_splits = 0
+max_prefill_tokens_per_iteration = 16, max_waiting_requests = None
+prefix_cache_blocks = 0, kv_cache_dtype = 'fp16', cuda_graph_batch_size = None
+cuda_graph_batch_sizes = None, prefill_cuda_graphs = True, fused_step = True
+fuse_mlp_gate_up = False, triton_rmsnorm = True, triton_rope = True
+triton_swiglu = True, sampling_seed = None, speculative_ngram = False
+speculative_proposer = None, speculation_depth = 3
+speculative_ngram_min_match = 2, speculative_ngram_max_match = 4
+
+    def __init__(self, model, tokenizer, device, *,
+                 num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
+                 prefill_chunk_size: int = 128,
+                 prefill_attention: str | None = None,
+                 decode_attention: str = "per_head",
+                 verify_attention: str | None = None,
+                 tiled_prefill: bool = False,
+                 prefill_block_m: int | None = None,
+                 prefill_block_n: int | None = None,
+                 decode_num_splits: int = 0,
+                 max_prefill_tokens_per_iteration: int = 128,
+                 max_waiting_requests: int | None = None,
+                 prefix_cache_blocks: int = 256,
+                 kv_cache_dtype: str = "fp16",
+                 cuda_graph_batch_size: int | None = None,
+                 cuda_graph_batch_sizes: tuple[int, ...] | None = None,
+                 prefill_cuda_graphs: bool = True,
+                 fused_step: bool = True,
+                 fuse_mlp_gate_up: bool = False,
+                 triton_rmsnorm: bool = True,
+                 triton_rope: bool = True,
+                 triton_swiglu: bool = True,
+                 sampling_seed: int | None = None,
+                 speculative_ngram: bool = False,
+                 speculative_proposer=None,
+                 speculation_depth: int = 3,
+                 speculative_ngram_min_match: int = 2,
+                 speculative_ngram_max_match: int = 4):
+        if min(num_blocks, block_size, max_active, prefill_chunk_size,
+               max_prefill_tokens_per_iteration) <= 0:
+            raise ValueError("engine sizes and prefill budgets must be positive")
+        if prefix_cache_blocks < 0:
+            raise ValueError("prefix_cache_blocks must be non-negative")
+        if kv_cache_dtype not in {"fp16", "int8", "fp8"}:
+            raise ValueError("kv_cache_dtype must be 'fp16', 'int8' or 'fp8'")
+        if decode_num_splits < 0:
+            raise ValueError("decode_num_splits must be non-negative")
+        if speculation_depth <= 0 or speculation_depth + 1 > prefill_chunk_size:
+            raise ValueError("speculation_depth must fit with its pending token in a prefill chunk")
+        if cuda_graph_batch_size is not None and cuda_graph_batch_sizes is not None:
+            raise ValueError("use cuda_graph_batch_size or cuda_graph_batch_sizes, not both")
+        if cuda_graph_batch_sizes is None and cuda_graph_batch_size is not None:
+            cuda_graph_batch_sizes = (cuda_graph_batch_size,)
+        if cuda_graph_batch_sizes is not None:
+            cuda_graph_batch_sizes = tuple(sorted(set(cuda_graph_batch_sizes)))
+            if not cuda_graph_batch_sizes or any(not 0 < size <= max_active for size in cuda_graph_batch_sizes):
+                raise ValueError("graph bucket sizes must be within [1, max_active]")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.block_size = block_size
+        self.max_active = max_active
+        self.prefill_chunk_size = prefill_chunk_size
+        if speculative_ngram and speculative_proposer is not None:
+            raise ValueError("use speculative_ngram or speculative_proposer, not both")
+        self.speculative_ngram = speculative_ngram
+        self.speculation_depth = speculation_depth
+        if speculative_ngram:
+            from engine.speculative import NgramProposer
+    
+            self.speculative_proposer = NgramProposer(
+                min_match=speculative_ngram_min_match,
+                max_match=speculative_ngram_max_match,
+            )
+        else:
+            self.speculative_proposer = speculative_proposer
+        self.speculative_rounds = 0
+        self.speculative_proposed_tokens = 0
+        self.speculative_accepted_tokens = 0
+        self.speculative_fallbacks = 0
+        cfg = model.config
+        # Attention backends are resolved against this device and this geometry rather
+        # than hard-coded: "auto" (the default) takes the measured default for the
+        # architecture, or the highest-priority runnable backend on one nobody has
+        # measured. A named backend that cannot run here raises, with the reason - a
+        # silent fallback is how a week of T4 results measured the wrong path.
+        # `tiled_prefill=True` is the older boolean spelling of `prefill_attention="tiled"`.
+        from engine.kernels.device import current_device
+    
+        config_geometry = Geometry(
+            num_q_heads=int(cfg.num_attention_heads),
+            num_kv_heads=int(getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)),
+            head_dim=int(getattr(cfg, "head_dim", 0)
+                         or cfg.hidden_size // cfg.num_attention_heads),
+            block_size=block_size,
+            dtype=str(next(model.parameters()).dtype).removeprefix("torch."),
+            kv_dtype={"int8": "int8", "fp8": "fp8"}.get(kv_cache_dtype, "float16"),
+        )
+        self.device_profile = current_device(self.device)
+        self.geometry = config_geometry
+        device_defaults = defaults_for(self.device_profile, config_geometry)
+        self.backend_reasons = dict(device_defaults.reasons)
+        if prefill_attention is None:
+            prefill_attention = "tiled" if tiled_prefill else device_defaults.prefill_attention
+        if decode_attention in (None, "auto"):
+            decode_attention = device_defaults.decode_attention
+        self.prefill_backend = resolve(
+            "prefill", prefill_attention, self.device_profile, config_geometry,
+        )
+        self.decode_backend = resolve(
+            "decode", decode_attention, self.device_profile, config_geometry,
+        )
+        self.prefill_attention = self.prefill_backend.name
+        self.decode_attention = self.decode_backend.name
+        self.tiled_prefill = self.prefill_attention == "tiled"
+        # Speculative verification is decode-shaped - `depth + 1` queries against a long
+        # paged prefix - but it used to run on whatever `prefill_attention` resolved to:
+        # SDPA on the T4, which gathers every row's whole prefix per layer to attend four
+        # tokens, and eager FlashAttention on Ada. "prefill" keeps that as the A/B
+        # baseline; the default is an in-place paged kernel chosen by `policy.py`.
+        if verify_attention in (None, "auto"):
+            verify_attention = device_defaults.verify_attention
+        if verify_attention == "prefill":
+            self.verify_backend = self.prefill_backend
+            self.verify_attention = "prefill"
+        else:
+            self.verify_backend = resolve(
+                "prefill", verify_attention, self.device_profile, config_geometry,
+            )
+            self.verify_attention = self.verify_backend.name
+        self.prefill_block_m = prefill_block_m
+        self.prefill_block_n = prefill_block_n
+        self.decode_num_splits = decode_num_splits
+        self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
+        self.max_waiting_requests = max_waiting_requests
+        self.prefix_cache_blocks = prefix_cache_blocks
+        self.kv_cache_dtype = kv_cache_dtype
+        self.cuda_graph_batch_sizes = cuda_graph_batch_sizes or ()
+        self.decode_cuda_graphs = self.decode_backend.graph_safe
+        self.decode_graph_eager_reason: str | None = None
+        if not self.decode_cuda_graphs:
+            # The FA2 kvcache entry point synchronizes while preparing its split-KV
+            # workspace, including with an explicit split count, and invalidates stream
+            # capture on the tested 2.8.4 build. Keep other phase graphs enabled.
+            self.decode_graph_eager_reason = (
+                "flash_attn kvcache decode is eager-only on this build: its split-KV "
+                "workspace setup is not CUDA-graph safe"
+            )
+        # Chunked prefill forwards are captured per (row bucket, kind, context bucket)
+        # when graph buckets are configured. Off keeps decode graphs and runs prefill
+        # eagerly on the same staged buffers, which is the A/B for the capture itself.
+        self.prefill_cuda_graphs = prefill_cuda_graphs
+        self.prefill_graph_eager_reason: str | None = None
+        if not self.prefill_backend.graph_safe:
+            # FA2 kvcache has no query-length vector. Correct variable-size chunks are
+            # grouped by their active length in `flash_paged_prefill`, which requires a
+            # host-side grouping step; its internal workspace allocation is also not
+            # capture-safe on the tested build. Do not capture an all-padding warmup
+            # graph and replay it for real rows: Flash prefill is deliberately eager.
+            self.prefill_cuda_graphs = False
+            self.prefill_graph_eager_reason = (
+                f"{self.prefill_attention} prefill backend is eager-only: variable "
+                "chunk groups and/or backend workspace are not CUDA-graph safe"
+            )
+        # A step that carries both decode rows and prefill chunks runs them as one packed
+        # forward (decode tokens first, chunk batch after) instead of two. The weights
+        # are read once for both, and the prefill's launch cost rides on the decode
+        # forward's. Off runs the two forwards back to back, which is the A/B.
+        self.fused_step = fused_step
+        self.fuse_mlp_gate_up = fuse_mlp_gate_up
+        self.triton_rmsnorm = triton_rmsnorm
+        self.triton_rope = triton_rope
+        self.triton_swiglu = triton_swiglu
+        self._decode_graphs = {}
+    
+        # Refuse a checkpoint whose geometry the paged kernels cannot serve, at load,
+        # with the reason - rather than a wrong answer or a launch failure later.
+        from engine.model.adapters import ensure_supported
+    
+        ensure_supported(cfg)
+        self.num_layers = cfg.num_hidden_layers
+        self.max_model_len = getattr(cfg, "max_position_embeddings", None)
+        # Step accounting: a prefill-carrying iteration and a decode-only iteration cost
+        # very different amounts, and mixing them makes any latency percentile a blend.
+        self.prefill_steps = 0
+        self.decode_only_steps = 0
+        # Of the prefill-carrying steps, how many ran decode and prefill as one forward.
+        self.fused_steps = 0
+        self.last_step_prefill_tokens = 0
+        self.last_step_decode_rows = 0
+        # Which prefill implementation ran. The SDPA fast path and the resumable chunk
+        # path have different cost structures, so a measured prefill cost cannot be
+        # attributed to either without knowing which one produced it.
+        self.prefill_sdpa_calls = 0
+        self.prefill_chunked_calls = 0
+        self.prefill_sdpa_tokens = 0
+        self.prefill_chunked_tokens = 0
+        self.last_step_prefill_path = ""
+        # Opt-in step decomposition. A wall-clock timer around `step()` blends Python
+        # staging, the H2D copies, the forward and the sampling sync, so it cannot say
+        # which of them a change moved. With `instrument` on, `last_step_timing` holds
+        # per-phase milliseconds for the step just run: `host_stage_ms` (metadata staging
+        # before the copies), `decode_gpu_ms` / `prefill_gpu_ms` (CUDA events around each
+        # forward), `sync_ms` (the sampling device-to-host wait). GPU phases need an event
+        # sync, which decode already pays at sampling; a prefill step that completes no
+        # request gains one sync it would not otherwise have, so leave this off for
+        # production serving and on for benchmarks that want the split.
+        self.instrument = False
+        self.last_step_timing: dict[str, float] = {}
+        self.num_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+        self.num_q_heads = cfg.num_attention_heads
+        self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+    
+        # Qwen uses RMSNorm for hidden states and for per-head Q/K normalization.
+        # Install one FP32-accumulating Triton kernel for both shapes before warmup.
+        # Each fusion is a toggle so an A/B can attribute it: a `False` flag actively
+        # restores the stock implementation, because benchmarks build several engines
+        # on one shared model object and a previous engine may have patched it.
+        from engine.kernels.rmsnorm import install_triton_rmsnorm, uninstall_triton_rmsnorm
+        from engine.kernels.rope import install_triton_rope, uninstall_triton_rope
+        from engine.kernels.swiglu import install_triton_swiglu, uninstall_triton_swiglu
+        if triton_rmsnorm:
+            self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
+        else:
+            uninstall_triton_rmsnorm(model)
+            self.triton_rmsnorm_modules = 0
+        # RoPE is patched in this model's own modeling module, so a family the engine has
+        # never seen is covered without an entry anywhere.
+        if triton_rope:
+            install_triton_rope(model)
+        else:
+            uninstall_triton_rope(model)
+        if fuse_mlp_gate_up and not triton_swiglu:
+            raise ValueError("fuse_mlp_gate_up requires triton_swiglu=True")
+        # Re-install when the fusion mode changes: the installer is a no-op on an
+        # already patched module, so a prior engine's choice would otherwise persist.
+        uninstall_triton_swiglu(model)
+        self.swiglu_unavailable_reason: str | None = None
+        if triton_swiglu:
+            try:
+                self.triton_swiglu_modules = install_triton_swiglu(
+                    model, fuse_gate_up=fuse_mlp_gate_up,
+                )
+            except RuntimeError as error:
+                # Some families (Phi-3 among them) ship one fused `gate_up_proj` linear
+                # instead of separate gate/up projections, so there is nothing for this
+                # kernel to patch. The fusion is an optimization, not a requirement: the
+                # model still serves through its own MLP. Record why rather than refusing
+                # to construct, since the geometry gate already accepted this checkpoint.
+                if fuse_mlp_gate_up:
+                    raise
+                self.triton_swiglu_modules = 0
+                self.swiglu_unavailable_reason = str(error)
+        else:
+            self.triton_swiglu_modules = 0
+    
+        # One sampler for the engine. Requests that ask for nothing sample greedily,
+        # which is the argmax path every recorded benchmark measured; `sampling_seed`
+        # seeds the shared generator for requests that sample without their own seed.
+        self.sampler = BatchedSampler(device, generator_seed=sampling_seed)
+        self.vocab_size = int(getattr(cfg, "vocab_size", 0))
+    
+        self.eos_ids = set()
+        ce = model.generation_config.eos_token_id
+        if isinstance(ce, int):
+            self.eos_ids.add(ce)
+        elif isinstance(ce, (list, tuple)):
+            self.eos_ids.update(ce)
+    
+        if kv_cache_dtype == "int8":
+            dtype = torch.int8
+        elif kv_cache_dtype == "fp8":
+            from engine.kernels.fp8_format import FP8_DTYPE, unavailable_reason
+    
+            reason = unavailable_reason(self.device_profile)
+            if reason is not None:
+                raise ValueError(f"kv_cache_dtype='fp8' cannot run here: {reason}")
+            dtype = FP8_DTYPE
+        else:
+            dtype = next(model.parameters()).dtype
+        element_bytes = 1 if kv_cache_dtype in {"int8", "fp8"} else torch.finfo(dtype).bits // 8
+        # Refuse a pool that cannot be allocated, with the arithmetic, rather than letting
+        # `torch.zeros` raise a CUDA OOM whose message names neither the cause nor the fix.
+        # The documented default (num_blocks=4096, block_size=16) is 7.5 GB of KV for
+        # Qwen3-0.6B and cannot be built on an 8 GB card at all.
+        pool_bytes = (
+            2 * self.num_layers * num_blocks * block_size
+            * self.num_kv_heads * self.head_dim
+            * element_bytes
+        )
+        if torch.device(device).type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+            if pool_bytes > free_bytes:
+                affordable = free_bytes // (
+                    2 * self.num_layers * block_size * self.num_kv_heads * self.head_dim
+                    * element_bytes
+                )
+>               raise ValueError(
+                    f"KV pool of {num_blocks} x {block_size} tokens needs "
+                    f"{pool_bytes / 1e9:.2f} GB but only {free_bytes / 1e9:.2f} GB is free "
+                    f"on this device. Pass num_blocks <= {affordable} (leaving nothing for "
+                    f"activations or CUDA graphs), or a smaller block_size, or halve the "
+                    f"cache with kv_cache_dtype='int8' (any device) or 'fp8' (sm_89+)."
+                )
+E               ValueError: KV pool of 1024 x 16 tokens needs 1.88 GB but only 0.83 GB is free on this device. Pass num_blocks <= 450 (leaving nothing for activations or CUDA graphs), or a smaller block_size, or halve the cache with kv_cache_dtype='int8' (any device) or 'fp8' (sm_89+).
+
+engine/batching/continuous_batching.py:633: ValueError
+____________ test_fp8_decode_writer_matches_the_reference_quantiser ____________
+
+    @cuda
+    @requires_cuda
+    @requires_fp8_dtype
+    def test_fp8_decode_writer_matches_the_reference_quantiser():
+        torch.manual_seed(61)
+        batch, heads, dim, block_size, blocks = 3, 8, 128, 16, 12
+        key = torch.randn(batch, heads, 1, dim, device="cuda", dtype=torch.float16)
+        value = torch.randn_like(key)
+        tables = torch.tensor([[9, 2, 7], [1, 11, 4], [6, 3, 10]], device="cuda", dtype=torch.int32)
+        positions = torch.tensor([0, 15, 16], device="cuda", dtype=torch.int32)
+        key_pages = torch.zeros(blocks, block_size, heads, dim, device="cuda", dtype=fp8.FP8_DTYPE)
+        value_pages = torch.zeros_like(key_pages)
+        key_scales = torch.zeros(blocks, block_size, heads, device="cuda", dtype=torch.float16)
+        value_scales = torch.zeros_like(key_scales)
+    
+        kernels = pytest.importorskip("engine.kernels.fp8_paged_kv")
+        kernels.write_decode_fp8_kv(key, value, key_pages, value_pages, key_scales, value_scales,
+                                    tables, positions)
+        torch.cuda.synchronize()
+        for row, position in enumerate(positions.tolist()):
+            logical, offset = divmod(position, block_size)
+            physical = int(tables[row, logical])
+            for source, pages, scales in ((key[row, :, 0], key_pages, key_scales),
+                                          (value[row, :, 0], value_pages, value_scales)):
+                expected_q, expected_scale = fp8.quantize_fp8_reference(source)
+                torch.testing.assert_close(scales[physical, offset].float(), expected_scale,
+                                           atol=1e-4, rtol=1e-3)
+>               torch.testing.assert_close(pages[physical, offset].float(), expected_q.float(),
+                                           atol=0, rtol=0)
+E               AssertionError: Tensor-likes are not equal!
+E               
+E               Mismatched elements: 3 / 1024 (0.3%)
+E               Greatest absolute difference: 8.0 at index (0, 29)
+E               Greatest relative difference: 0.1111111119389534 at index (0, 29)
+
+tests/kernels/test_fp8_paged_kv.py:132: AssertionError
+___________ test_fp8_prefill_writer_maps_chunks_and_ignores_padding ____________
+
+    @cuda
+    @requires_cuda
+    @requires_fp8_dtype
+    def test_fp8_prefill_writer_maps_chunks_and_ignores_padding():
+        torch.manual_seed(63)
+        batch, heads, padded, dim, block_size, blocks = 2, 4, 9, 128, 4, 12
+        starts = torch.tensor([3, 8], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([6, 9], device="cuda", dtype=torch.int32)
+        tables = torch.tensor([[7, 2, 10, 1, 0], [5, 11, 3, 9, 6]], device="cuda", dtype=torch.int32)
+        key = torch.randn(batch, heads, padded, dim, device="cuda", dtype=torch.float16)
+        value = torch.randn_like(key)
+        key_pages = torch.zeros(blocks, block_size, heads, dim, device="cuda", dtype=fp8.FP8_DTYPE)
+        value_pages = torch.zeros_like(key_pages)
+        key_scales = torch.zeros(blocks, block_size, heads, device="cuda", dtype=torch.float16)
+        value_scales = torch.zeros_like(key_scales)
+    
+        kernels = pytest.importorskip("engine.kernels.fp8_paged_kv")
+        kernels.write_prefill_fp8_kv_batched(key, value, key_pages, value_pages, key_scales,
+                                             value_scales, tables, lengths, starts)
+        torch.cuda.synchronize()
+        written = set()
+        for row, length in enumerate(lengths.tolist()):
+            for token in range(length):
+                logical, offset = divmod(int(starts[row]) + token, block_size)
+                physical = int(tables[row, logical])
+                written.add((physical, offset))
+                expected_q, expected_scale = fp8.quantize_fp8_reference(key[row, :, token])
+>               torch.testing.assert_close(key_pages[physical, offset].float(), expected_q.float(),
+                                           atol=0, rtol=0)
+E               AssertionError: Tensor-likes are not equal!
+E               
+E               Mismatched elements: 4 / 512 (0.8%)
+E               Greatest absolute difference: 16.0 at index (0, 34)
+E               Greatest relative difference: 0.1111111119389534 at index (0, 7)
+
+tests/kernels/test_fp8_paged_kv.py:163: AssertionError
+=============================== warnings summary ===============================
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+tests/kernels/test_fp8_paged_kv.py: 9 warnings
+tests/speculative/test_engine_native.py: 1 warning
+  /home/divy/Documents/inference-engine/.venv/lib/python3.14/site-packages/triton/compiler/code_generator.py:643: DeprecationWarning: AnnAssign.__init__ missing 1 required positional argument: 'simple'. This will become an error in Python 3.15.
+    init_node = ast.AnnAssign(target=st_target, value=default_value, annotation=annotation)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/batching/test_continuous_batching.py::test_fused_step_runs_decode_and_prefill_in_one_forward[graphed]
+FAILED tests/batching/test_continuous_batching.py::test_gqa_shared_decode_kernel_matches_reference[eager]
+FAILED tests/kernels/test_fp8_paged_kv.py::test_fp8_decode_writer_matches_the_reference_quantiser
+FAILED tests/kernels/test_fp8_paged_kv.py::test_fp8_prefill_writer_maps_chunks_and_ignores_padding
+4 failed, 201 passed, 1 skipped, 361 deselected, 1 xfailed, 12 warnings in 287.21s (0:04:47)
