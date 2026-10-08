@@ -334,6 +334,7 @@ class ContinuousBatchingEngine:
                  prefill_chunk_size: int = 128,
                  prefill_attention: str | None = None,
                  decode_attention: str = "per_head",
+                 verify_attention: str | None = None,
                  tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
                  prefill_block_n: int | None = None,
@@ -433,6 +434,21 @@ class ContinuousBatchingEngine:
         self.prefill_attention = self.prefill_backend.name
         self.decode_attention = self.decode_backend.name
         self.tiled_prefill = self.prefill_attention == "tiled"
+        # Speculative verification is decode-shaped - `depth + 1` queries against a long
+        # paged prefix - but it used to run on whatever `prefill_attention` resolved to:
+        # SDPA on the T4, which gathers every row's whole prefix per layer to attend four
+        # tokens, and eager FlashAttention on Ada. "prefill" keeps that as the A/B
+        # baseline; the default is an in-place paged kernel chosen by `policy.py`.
+        if verify_attention in (None, "auto"):
+            verify_attention = device_defaults.verify_attention
+        if verify_attention == "prefill":
+            self.verify_backend = self.prefill_backend
+            self.verify_attention = "prefill"
+        else:
+            self.verify_backend = resolve(
+                "prefill", verify_attention, self.device_profile, config_geometry,
+            )
+            self.verify_attention = self.verify_backend.name
         self.prefill_block_m = prefill_block_m
         self.prefill_block_n = prefill_block_n
         self.decode_num_splits = decode_num_splits
@@ -1287,9 +1303,21 @@ class ContinuousBatchingEngine:
         self._prefill_device_block_tables[:row_count].copy_(
             self._prefill_host_block_tables[:row_count], non_blocking=True)
 
-    def _set_prefill_context(self, row_count: int, total_len: int) -> None:
+    def _set_prefill_context(
+        self, row_count: int, total_len: int, *,
+        backend=None, block_m: int | None = None, block_n: int | None = None,
+    ) -> None:
+        """Publish the paged metadata one chunk batch's attention needs.
+
+        `backend` overrides the resolved prefill backend for this batch; speculative
+        verification passes its own, with a 16-row tile for `tiled`, so a handful of
+        query tokens is attended by an in-place paged kernel rather than the prefill
+        path's prefix gather.
+        """
+        backend = self.prefill_backend if backend is None else backend
+        attention = backend.name
         attention_cache: dict = {}
-        if self.prefill_attention in {"flash", "flash_dense"}:
+        if attention in {"flash", "flash_dense"}:
             # These lengths already exist in pinned host staging. Group them once per
             # engine step, not once per transformer layer; reading the CUDA tensor in
             # `flash_paged_prefill` caused 28 device synchronizations on Qwen3.
@@ -1298,7 +1326,7 @@ class ContinuousBatchingEngine:
             for row, length in enumerate(lengths):
                 if length > 0:
                     grouped.setdefault(int(length), []).append(row)
-            if self.prefill_attention == "flash_dense":
+            if attention == "flash_dense":
                 starts = self._prefill_host_starts[:row_count].tolist()
                 dense_grouped: dict[tuple[int, int], list[int]] = {}
                 for row, length in enumerate(lengths):
@@ -1327,11 +1355,11 @@ class ContinuousBatchingEngine:
             self._prefill_device_starts[:row_count],
             self._prefill_device_chunk_lens[:row_count],
             self.key_scale_pool, self.value_scale_pool,
-            attention=self.prefill_attention,
-            backend=self.prefill_backend,
+            attention=attention,
+            backend=backend,
             total_len=total_len,
-            prefill_block_m=self.prefill_block_m,
-            prefill_block_n=self.prefill_block_n,
+            prefill_block_m=self.prefill_block_m if block_m is None else block_m,
+            prefill_block_n=self.prefill_block_n if block_n is None else block_n,
             sdpa_cache=attention_cache,
         ))
 
@@ -1520,6 +1548,9 @@ class ContinuousBatchingEngine:
     # rather than at the smallest decode bucket. Above this many rows the fused graph
     # would spend more on inert rows than a second forward costs; eager runs exact.
     FUSED_PREFILL_ROW_LIMIT = 4
+    # Query-row tile for `tiled` speculative verification: the smallest `tl.dot` allows,
+    # since a verify batch carries `depth + 1` (3-5) real queries per row.
+    VERIFY_BLOCK_M = 16
 
     def _prefill_row_bucket(self, count: int, limit: int | None = None) -> int | None:
         if not self.cuda_graph_batch_sizes:
@@ -1764,7 +1795,13 @@ class ContinuousBatchingEngine:
             request.allocation.sequence_length + width
             for request, _ in rows if request.allocation is not None
         )
-        self._set_prefill_context(len(rows), total_len)
+        # Verification attends `width` (3-5) queries per row against the whole prefix.
+        # The in-place paged kernels read the pages once per program; the prefill path's
+        # SDPA gather would copy every row's prefix per layer to attend those few tokens.
+        self._set_prefill_context(
+            len(rows), total_len, backend=self.verify_backend,
+            block_m=self.VERIFY_BLOCK_M if self.verify_backend.name == "tiled" else None,
+        )
         timer = self._gpu_timer()
         try:
             logits = self._verify_forward(len(rows), width)

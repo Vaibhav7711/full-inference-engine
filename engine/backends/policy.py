@@ -25,6 +25,35 @@ class DeviceDefaults:
     # Why each choice was made, for the startup log and the result JSON. A default whose
     # provenance is not recorded turns into folklore within two sessions.
     reasons: dict[str, str] = field(default_factory=dict)
+    # Attention for speculative verification: `depth + 1` queries against a long paged
+    # prefix. "prefill" means "whatever prefill_attention resolved to", which is how the
+    # engine behaved before this field existed and is kept as the A/B baseline.
+    verify_attention: str = "prefill"
+
+
+def _verify_default(profile, available_prefill: set[str]) -> tuple[str, str]:
+    """A paged, in-place kernel for verification, chosen by capability.
+
+    Verification is decode-shaped - a handful of new queries, hundreds or thousands of
+    keys - but it used to ride the prefill backend. On the T4 that was SDPA, which
+    gathers every row's whole prefix into a dense tensor per layer to attend four tokens:
+    `sdpa_prefill.py` prices that at ~1.6 ms across 28 layers at an 896-token prefix,
+    paid on every speculative round and growing with context, which is exactly where
+    speculation is meant to pay. On Ada it was FlashAttention, which is eager-only.
+
+    Both in-place kernels already exist. `tiled` at a 16-row tile is a multi-query tile
+    on the tensor cores from sm_80; below that `tl.dot` lowers to FMA and `per_token`,
+    one program per (row, head, query), is the right shape. Neither has been A/B'd for
+    this phase yet, so the reason says so.
+    """
+    sm = profile.sm if profile is not None else 0
+    if sm >= 80 and "tiled" in available_prefill:
+        return "tiled", (f"unmeasured for verification on sm_{sm}: paged multi-query tile "
+                         f"(block_m=16) on the tensor cores; A/B with `--setting verify_kernel`")
+    if "per_token" in available_prefill:
+        return "per_token", (f"unmeasured for verification on sm_{sm}: in-place paged kernel, "
+                             f"no prefix gather; A/B with `--setting verify_kernel`")
+    return "prefill", "no in-place paged kernel can run here; verification uses the prefill backend"
 
 
 # Architecture -> settings an A/B on that architecture chose, with the entry that did it.
@@ -110,10 +139,15 @@ def defaults_for(profile, geometry: Geometry) -> DeviceDefaults:
                 decode = replacement
             else:
                 prefill = replacement
-        return DeviceDefaults(decode, prefill, entry["dtype"], reasons)
+        verify, reasons["verify_attention"] = _verify_default(profile, available["prefill"])
+        return DeviceDefaults(decode, prefill, entry["dtype"], reasons, verify_attention=verify)
 
     decode, decode_note = _pick("decode", profile, geometry)
     prefill, prefill_note = _pick("prefill", profile, geometry)
+    available_prefill = {
+        row["name"] for row in describe("prefill", profile, geometry) if row["available"]
+    }
+    verify, verify_reason = _verify_default(profile, available_prefill)
     dtype = "bfloat16" if profile is not None and profile.sm >= 80 else "float16"
     sm = f"sm_{profile.sm}" if profile is not None else "no CUDA device"
     return DeviceDefaults(
@@ -125,11 +159,13 @@ def defaults_for(profile, geometry: Geometry) -> DeviceDefaults:
                                 + (f"; {decode_note}" if decode_note else ""),
             "prefill_attention": f"unmeasured on {sm}; highest-priority available backend"
                                  + (f"; {prefill_note}" if prefill_note else ""),
+            "verify_attention": verify_reason,
             "dtype": "bf16 tensor cores from sm_80" if dtype == "bfloat16"
                      else "fp16 (no bf16 tensor cores below sm_80)",
             "measure": "run `ab.py --setting decode_kernel` and `--setting prefill_kernel` "
                        "on this device, then add the winners to MEASURED",
         },
+        verify_attention=verify,
     )
 
 

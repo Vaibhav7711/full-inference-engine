@@ -176,6 +176,15 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("cold_start", {"warmup": False}),
         ("warmed", {"warmup": True}),
     ],
+    # Attention for speculative verification, with the n-gram proposer so every arm
+    # actually verifies. `prefill` is the pre-existing behaviour (the prefill backend:
+    # SDPA's prefix gather on the T4, eager Flash on Ada). The other two read pages in
+    # place; `tiled` is only runnable from sm_80, so on a T4 this setting has two arms.
+    "verify_kernel": [
+        ("verify_prefill_path", {"speculative_ngram": True, "verify_attention": "prefill"}),
+        ("verify_per_token", {"speculative_ngram": True, "verify_attention": "per_token"}),
+        ("verify_tiled", {"speculative_ngram": True, "verify_attention": "tiled"}),
+    ],
 }
 
 
@@ -234,7 +243,12 @@ TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rm
                         # prefilled in six chunks and in two accumulates in a different
                         # order. Same kernel, different reduction tree: a late near-tie
                         # can flip, and the stock-reference gate below still decides.
-                        "prefill_chunk_large", "prefill_chunk_small"}
+                        "prefill_chunk_large", "prefill_chunk_small",
+                        # Three verification kernels over the same pages: the gather
+                        # path, the per-token loop and the 16-row tile reduce in
+                        # different orders. The accepted tokens, not the logits, are
+                        # the contract, and the stock gate still applies to each arm.
+                        "verify_kernel"}
 
 
 def drift_expected(setting: str) -> bool:
@@ -502,12 +516,30 @@ def main() -> int:
     # prompts greedily on a warmed engine; the outputs must match unless the setting is
     # one that legitimately changes numerics.
     identity = {}
-    for label, make_engine in makers.items():
-        engine = make_engine()
+    skipped: dict[str, str] = {}
+    for label, make_engine in list(makers.items()):
+        try:
+            engine = make_engine()
+        except ValueError as error:
+            # The registry refuses a named backend that cannot run on this device and
+            # says why. For a multi-arm setting that is an answer for the arm, not a
+            # failure of the run: `verify_kernel` lists `tiled`, which exists from sm_80,
+            # and on a T4 the setting should measure its other two arms.
+            if "cannot run here" not in str(error):
+                raise
+            skipped[label] = str(error)
+            print(f"skipping arm {label!r}: {error}")
+            del makers[label]
+            arm_settings.pop(label, None)
+            continue
         engine.warmup()  # the gate checks tokens, not first-use cost; always warm here
         identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
         del engine
     labels = list(makers)
+    if len(labels) < 2:
+        print(f"refusing to run: fewer than two arms can run on this device "
+              f"(skipped: {skipped})")
+        return 2
     divergence = {label: _first_divergence(identity[label], reference, margins) for label in labels}
     ties = {label: _ties(identity[label], reference, margins) for label in labels}
     for label in labels:
@@ -619,6 +651,7 @@ def main() -> int:
         "model": args.model, "dtype": str(loaded.dtype),
         "config": {**config.__dict__, **shared},
         "arm_settings": arm_settings,
+        "skipped_arms": skipped,
         "prompt_profile": args.prompt_profile,
         "mean_prompt_tokens": mean_prompt,
         "environment": environment_record(loaded.device),
