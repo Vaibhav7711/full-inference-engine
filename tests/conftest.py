@@ -21,6 +21,17 @@ def _release_cuda_between_tests():
     into an OOM in whichever test happens to load last.
     """
     yield
+    # The engine publishes per-step attention metadata through module globals. A test
+    # that fails inside a step leaves them set, and they reference the KV pools - so
+    # clear them before collecting, or the pools outlive the test that made them.
+    try:
+        from engine.batching import continuous_batching as cb
+
+        cb._clear_batch_ctx()
+        cb._clear_prefill_ctx()
+        cb._clear_fused_ctx()
+    except Exception:  # pragma: no cover - the module needs Triton to import
+        pass
     if torch.cuda.is_available():
         import gc
 

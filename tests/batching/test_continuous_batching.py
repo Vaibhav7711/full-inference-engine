@@ -441,10 +441,11 @@ def test_padded_cuda_graph_bucket_matches_reference():
     outputs = eng.generate(prompts, max_new_tokens=3)
     assert outputs == refs
     assert any(key[0] == 4 for key in eng._decode_graphs)
-    # Three padded rows need three KV *slots*, which share one 16-token page.
+    # The widest bucket (4) is captured with no live rows, so four padded rows need four
+    # KV *slots* - which still share one 16-token page.
     assert len(eng._graph_dummy_blocks) == 1
-    assert len(eng._graph_dummy_slots) == 3
-    assert len({slot for slot in eng._graph_dummy_slots}) == 3
+    assert len(eng._graph_dummy_slots) == 4
+    assert len({slot for slot in eng._graph_dummy_slots}) == 4
 
 
 def _staggered_prompts():
@@ -460,8 +461,12 @@ def _staggered_prompts():
 def _fused_engine(model, tok, **overrides):
     from engine.batching.continuous_batching import ContinuousBatchingEngine
 
+    # 4,096 KV tokens is ample for four short prompts at max_active=4. These tests build
+    # two engines side by side, and on an 8 GB card a pair of 1024-block pools (1.88 GB
+    # each) plus the model left the next test 0.83 GB - and a failed test's traceback
+    # keeps its engines alive, so a small pool is what makes failures independent.
     settings = dict(
-        num_blocks=1024, block_size=16, max_active=4, prefix_cache_blocks=0,
+        num_blocks=256, block_size=16, max_active=4, prefix_cache_blocks=0,
         prefill_chunk_size=16, max_prefill_tokens_per_iteration=16,
     )
     settings.update(overrides)

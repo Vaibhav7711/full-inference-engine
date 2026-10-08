@@ -742,7 +742,12 @@ class ContinuousBatchingEngine:
         self._graph_dummy_slots: list[tuple[int, int]] = []
         if not self.cuda_graph_batch_sizes:
             return
-        required = max(self.cuda_graph_batch_sizes) - 1
+        # One slot per row of the widest bucket, not one fewer. A live step always has at
+        # least one real row, but graph *capture* stages none - every row of the bucket
+        # is a padded dummy - so `max - 1` left the widest fused capture one slot short.
+        # On the first Ada run that refused `fused:sdpa` for the whole kind: the smaller
+        # buckets' graphs were captured and counted, and never replayed.
+        required = max(self.cuda_graph_batch_sizes)
         if required <= 0:
             return
         pages = -(-required // self.block_size)

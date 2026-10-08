@@ -30,7 +30,8 @@ def test_graph_dummy_slots_are_distinct_and_fit_their_pages() -> None:
     from engine.cache import KVBlockManager
 
     for block_size, buckets in ((16, (2, 4, 8)), (256, (1, 2, 4, 8)), (16, (8, 16, 32))):
-        required = max(buckets) - 1
+        # Graph capture stages no live rows, so the widest bucket needs a slot per row.
+        required = max(buckets)
         expected_pages = -(-required // block_size)
 
         class _Fake:

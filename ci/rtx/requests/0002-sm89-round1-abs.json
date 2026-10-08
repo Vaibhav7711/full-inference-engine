@@ -9,6 +9,6 @@
     "results/sm89/round1-*"
   ],
   "requires_gpu_idle": true,
-  "depends_on": "0001-sm89-round1-gates",
+  "depends_on": "0003-sm89-round1-gates-rerun",
   "continue_on_error": false
 }

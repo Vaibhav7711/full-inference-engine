@@ -1,0 +1,14 @@
+{
+  "id": "0003-sm89-round1-gates-rerun",
+  "description": "Re-run of the round-1 gates after the first run's four failures were fixed from its logs: the fused-graph dummy-slot reservation was one short for a capture with no live rows (now max(buckets) slots), the fused tests built two 1.88 GB pools side by side on an 8 GB card (now 256 blocks), and the FP8 writer tests demanded bit-exact agreement with torch's fp32->fp8 cast where one E4M3 ulp of disagreement is expected (attention kernels matched exactly). 0001 is kept as the record of the first run.",
+  "commands": [
+    "bash scripts/sm89_round1.sh --gates"
+  ],
+  "timeout_minutes": 60,
+  "artifacts": [
+    "results/sm89/round1-*"
+  ],
+  "requires_gpu_idle": true,
+  "depends_on": null,
+  "continue_on_error": false
+}
