@@ -83,6 +83,17 @@ commit_push() {  # commit_push <message> <paths...>
   local message="$1"; shift
   git add -A -- "$@" 2>/dev/null
   git diff --cached --quiet && return 0
+  # The write-set is a contract, not advice: this side owns ci/rtx/results/ and
+  # results/sm89/ and nothing else. A staged path outside them is unstaged and reported,
+  # never committed - the first thing this machine did on its own was edit the engine
+  # and delete an xfail, which is exactly how a measurement stops being one.
+  local outside
+  outside="$(git diff --cached --name-only | grep -v -E '^(ci/rtx/results/|results/sm89/)' || true)"
+  if [[ -n "$outside" ]]; then
+    say "REFUSING to commit paths outside the agent's write-set:"; printf '  %s\n' $outside
+    git reset -q -- $outside
+    git diff --cached --quiet && return 0
+  fi
   git commit -q -m "$message" -m "Co-Authored-By: rtx4060-agent <rtx4060-agent@local>" || return 1
   for attempt in 1 2 3 4; do
     git pull -q --rebase origin "$BRANCH" && git push -q origin "$BRANCH" && return 0

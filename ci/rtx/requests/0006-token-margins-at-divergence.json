@@ -1,0 +1,12 @@
+{
+  "id": "0006-token-margins-at-divergence",
+  "description": "Decide quantization-vs-bug with data. kv_dtype_all was refused in 0004 and 0005 with the identical divergence list (int8_kv: [None, 0, None, 7]; fp8_kv: [None, 12, 8, 7]) - a resume-path change in between made no difference, which is expected because the identity gate never preempts. Print the stock fp32 top-2 logit margins at exactly those positions plus the eight smallest along each continuation. A margin near one fp16 ulp (~1e-2) means a tie that scaled storage legitimately flips and the gate's 8-token rule is the wrong instrument for a lossy format; a large margin at (prompt 1, token 0) means the INT8/FP8 write or read path is wrong on this build. Output is in step-1.log; no artifacts.",
+  "commands": [
+    "python scripts/token_margins.py --model Qwen/Qwen3-0.6B --positions 1:0 3:7 1:12 2:8 --smallest 8"
+  ],
+  "timeout_minutes": 15,
+  "artifacts": [],
+  "requires_gpu_idle": true,
+  "depends_on": null,
+  "continue_on_error": false
+}
