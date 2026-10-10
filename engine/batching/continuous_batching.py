@@ -364,8 +364,10 @@ class ContinuousBatchingEngine:
                  fused_graph_prefill_rows: int = 4,
                  fused_graph_regimes: tuple[int, ...] = (64, 128),
                  # num_blocks="auto": size the pool from free device memory after the
-                 # weights, keeping `kv_reserve_bytes` for graphs and activations.
-                 kv_reserve_bytes: int = 1_500_000_000,
+                 # weights, keeping `kv_reserve_bytes` for graphs and activations. "auto"
+                 # derives the reserve from the model (see `_auto_kv_reserve`); a flat
+                 # 1.5 GB left the 0.6B at W4A16 with 90 graphs and no room to prefill.
+                 kv_reserve_bytes: int | str = "auto",
                  kv_fraction: float = 0.95,
                  tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
@@ -390,8 +392,9 @@ class ContinuousBatchingEngine:
                  speculative_ngram_min_match: int = 2,
                  speculative_ngram_max_match: int = 4):
         if num_blocks == "auto":
-            if not 0 < kv_fraction <= 1 or kv_reserve_bytes < 0:
-                raise ValueError("kv_fraction must be in (0, 1] and kv_reserve_bytes non-negative")
+            if not 0 < kv_fraction <= 1 or (kv_reserve_bytes != "auto" and kv_reserve_bytes < 0):
+                raise ValueError("kv_fraction must be in (0, 1] and kv_reserve_bytes "
+                                 "non-negative or 'auto'")
         elif not isinstance(num_blocks, int):
             raise ValueError("num_blocks must be an int or 'auto'")
         if min(1 if num_blocks == "auto" else num_blocks, block_size, max_active, prefill_chunk_size,
@@ -659,11 +662,14 @@ class ContinuousBatchingEngine:
             if torch.device(device).type != "cuda":
                 raise ValueError("num_blocks='auto' needs a CUDA device to size from")
             free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+            if kv_reserve_bytes == "auto":
+                kv_reserve_bytes = self._auto_kv_reserve(model, cuda_graph_batch_sizes)
             budget = int(free_bytes * kv_fraction) - int(kv_reserve_bytes)
             num_blocks = max(1, budget // bytes_per_block)
             print(f"[engine] KV pool auto-sized: {num_blocks} blocks x {block_size} = "
                   f"{num_blocks * block_size} tokens ({num_blocks * bytes_per_block / 1e9:.2f} GB) "
                   f"from {free_bytes / 1e9:.2f} GB free, {kv_reserve_bytes / 1e9:.2f} GB reserved")
+        self.kv_reserve_bytes = None if kv_reserve_bytes == "auto" else int(kv_reserve_bytes)
         self.num_blocks_resolved = int(num_blocks)
         pool_bytes = num_blocks * bytes_per_block
         if torch.device(device).type == "cuda":
@@ -776,6 +782,34 @@ class ContinuousBatchingEngine:
         ALL_ATTENTION_FUNCTIONS[self.ATTN_NAME] = batched_decode_attention_forward
         ALL_ATTENTION_FUNCTIONS[self.PREFILL_ATTN_NAME] = chunked_prefill_attention_forward
         ALL_ATTENTION_FUNCTIONS[self.FUSED_ATTN_NAME] = fused_step_attention_forward
+
+    # One captured graph's executable, measured on the 0.6B (28 layers): 7.7 MiB, outside
+    # the allocator. It scales with layer count; the private pools are small next to it.
+    GRAPH_EXECUTABLE_BYTES_PER_LAYER = int(7.7 * 2**20 / 28)
+    # Upper bound on the graph set with the lean policy at max_model_len 4096 (the 0.6B
+    # captured 90: 8 decode + 15 prefill + 67 fused). Warm-up is the truth; this is the
+    # number the pool keeps out of its way before warm-up has run.
+    AUTO_RESERVE_GRAPH_COUNT = 128
+
+    def _auto_kv_reserve(self, model, cuda_graph_batch_sizes) -> int:
+        """Bytes to keep out of the KV pool when `num_blocks="auto"`.
+
+        Three terms, each named after what it is for: the graph executables (count x
+        per-layer size x layers), the prefill working set (1 GB: a 128-token chunk's
+        activations, the sdpa score tile at 4,096 context, allocator slack), and the
+        dequantised slabs of a weight-quantised model's dense path.
+        """
+        graphs = self.AUTO_RESERVE_GRAPH_COUNT * self.GRAPH_EXECUTABLE_BYTES_PER_LAYER * self.num_layers
+        if not cuda_graph_batch_sizes:
+            graphs = 0
+        working_set = 1_000_000_000
+        quantised = 0
+        for module in model.modules():
+            slab = getattr(module, "dense_slab_bytes", None)
+            if slab is not None:
+                quantised = 4 * slab      # int8 nibbles + fp16 tile + the matmul operands
+                break
+        return int(graphs + working_set + quantised)
 
     def _reserve_graph_dummy_blocks(self) -> None:
         """Reserve permanent, non-customer KV *slots* for padded CUDA-Graph rows.

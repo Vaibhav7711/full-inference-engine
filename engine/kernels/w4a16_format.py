@@ -57,10 +57,13 @@ def unpack_w4_reference(
     groups = in_features // group_size
     half = group_size // 2
     bytes_ = packed.reshape(out_features, groups, half)
-    low = (bytes_ & 0x0F).to(torch.int16) - OFFSET
-    high = (bytes_ >> 4).to(torch.int16) - OFFSET
-    q = torch.cat((low, high), dim=-1).float()                               # [N, groups, G]
-    return (q * scales.float()[..., None]).reshape(out_features, in_features).to(torch.float16)
+    # Integers in [-7, 7] times an fp16 scale round once either way, so the product is
+    # taken in fp16 directly: the float detour was 5x the tile in transients, which on the
+    # 8B's lm_head (1.2 GB fp16) is the difference between fitting and not.
+    low = (bytes_ & 0x0F).to(torch.int8) - OFFSET
+    high = (bytes_ >> 4).to(torch.int8) - OFFSET
+    q = torch.cat((low, high), dim=-1).to(torch.float16)                     # [N, groups, G]
+    return (q * scales.to(torch.float16)[..., None]).reshape(out_features, in_features)
 
 
 def weight_bytes(in_features: int, out_features: int, group_size: int = GROUP_SIZE) -> dict[str, int]:

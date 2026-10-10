@@ -35,6 +35,15 @@ reference pinned by CPU tests and a CUDA test that runs on first boot; the gate 
   `num_blocks="auto"` sizes the KV pool from free memory. Measured on the 0.6B: 5,059 →
   3,735 MiB resident at 16,384 KV tokens (vLLM 3,491), free below saturation, −4% / +7–16%
   tails at 8 req/s into 16 slots.
+- **First Kaggle T4 run of the 8B notebook (gate 2 + pre-gate)**: `num_blocks="auto"` now
+  keeps back a reserve derived from the model (128 graphs × 7.7 MiB × layers/28, a 1 GB
+  prefill working set, the dense-path slabs) instead of a flat 1.5 GB — the 0.6B at W4A16
+  took 12.5 of 14.8 GB for KV and OOMed capturing its 91st graph. `W4A16Linear`'s dense
+  path dequantises in 32 MiB slabs (the 8B's lm_head is 1.2 GB in fp16 and verification
+  calls it with ≥ 32 rows); the reference unpack stays in fp16 (5× → 3× the tile in
+  transients). FP8 CUDA tests skip below sm_89 for the engine's own reason (Triton has no
+  `float8e4nv` there). INT8 recompute is held to the stock gate's horizon, not bit
+  identity: prefill-shaped GEMM rounding flips an INT8 bin once in 96 tokens on T4.
 - `docs/qwen3-8b-optimization-map.md`: every stage of Qwen3-8B on a T4 with bytes, FLOPs
   and a prediction per optimization, written before the run.
 

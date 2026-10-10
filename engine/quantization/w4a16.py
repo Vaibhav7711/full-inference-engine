@@ -126,9 +126,27 @@ class W4A16Linear(nn.Module):
                                self.bias, group_size=self.group_size)
             out = out.to(x.dtype)
         else:
-            out = F.linear(rows, self.dequantized(rows.dtype),
-                           None if self.bias is None else self.bias.to(rows.dtype))
+            out = self._dense(rows)
         return out.reshape(*x.shape[:-1], self.out_features)
+
+    # The dense path never materialises more than this much dequantised fp16 at once. The
+    # 8B's lm_head is 1.2 GB in fp16 and verification calls it with M >= 32 rows, so an
+    # unbounded dequantise would take the KV pool's headroom in one transient.
+    dense_slab_bytes: int = 32 << 20
+
+    def _dense(self, rows: torch.Tensor) -> torch.Tensor:
+        bias = None if self.bias is None else self.bias.to(rows.dtype)
+        tile_bytes = 2 * self.out_features * self.in_features
+        if tile_bytes <= self.dense_slab_bytes:
+            return F.linear(rows, self.dequantized(rows.dtype), bias)
+        slab = max(1, self.dense_slab_bytes // (2 * self.in_features))
+        out = torch.empty(rows.shape[0], self.out_features, device=rows.device, dtype=rows.dtype)
+        for start in range(0, self.out_features, slab):
+            stop = min(start + slab, self.out_features)
+            weight = unpack_w4_reference(self.packed[start:stop], self.scales[start:stop],
+                                         self.in_features, self.group_size).to(rows.dtype)
+            out[:, start:stop] = F.linear(rows, weight, None if bias is None else bias[start:stop])
+        return out
 
     def extra_repr(self) -> str:
         return (f"in={self.in_features}, out={self.out_features}, group={self.group_size}, "
@@ -252,7 +270,8 @@ def _reinit_rotary(model: nn.Module, config, device) -> int:
         if not hasattr(module, "inv_freq"):
             continue
         parent, attribute = _parent(model, name)
-        setattr(parent, attribute, type(module)(config, device=device))
+        # Built on the CPU and moved: the `device` kwarg is deprecated in transformers 5.
+        setattr(parent, attribute, type(module)(config).to(device))
         rebuilt += 1
     return rebuilt
 

@@ -468,8 +468,9 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--num-blocks", type=lambda v: v if v == "auto" else int(v), default=256,
                         help="KV pool pages, or 'auto' to size from free memory after the weights")
-    parser.add_argument("--kv-reserve-gb", type=float, default=1.5,
-                        help="with --num-blocks auto: bytes kept back for graphs and activations")
+    parser.add_argument("--kv-reserve-gb", type=float, default=None,
+                        help="with --num-blocks auto: GB kept back for graphs and activations "
+                             "(default: derived from the model's layer count and quantisation)")
     parser.add_argument("--max-model-len", type=int, default=None,
                         help="served max context: caps warm-up graph buckets and refuses longer "
                              "requests at submit (the cap is honest or it is a lazy capture)")
@@ -511,7 +512,7 @@ def main() -> int:
     shared = dict(
         num_blocks=args.num_blocks, block_size=args.block_size, max_active=args.max_active,
         max_waiting_requests=args.max_waiting, prefix_cache_blocks=64,
-        kv_reserve_bytes=int(args.kv_reserve_gb * 1e9),
+        kv_reserve_bytes="auto" if args.kv_reserve_gb is None else int(args.kv_reserve_gb * 1e9),
         prefill_graph_rows=args.prefill_graph_rows,
         fused_graph_prefill_rows=args.fused_graph_prefill_rows,
         fused_graph_regimes=tuple(args.fused_graph_regimes),

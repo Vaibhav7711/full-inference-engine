@@ -22,6 +22,20 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 requires_fp8_dtype = pytest.mark.skipif(fp8.FP8_DTYPE is None, reason="torch has no float8_e4m3fn")
 
 
+def _fp8_device_reason() -> str | None:
+    # Triton has no `float8e4nv` below sm_89: the kernels fail at compile time, which is
+    # exactly what `unavailable_reason` refuses in the engine. Skip here for the same reason.
+    if not torch.cuda.is_available():
+        return "requires CUDA"
+    from engine.kernels.device import current_device
+
+    return fp8.unavailable_reason(current_device())
+
+
+requires_fp8_device = pytest.mark.skipif(_fp8_device_reason() is not None,
+                                         reason=str(_fp8_device_reason()))
+
+
 def _profile(sm: int) -> DeviceProfile:
     major, minor = divmod(sm, 10)
     return DeviceProfile(name=f"sm_{sm}", capability=(major, minor), total_memory_gb=8.0,
@@ -121,7 +135,7 @@ def _fp8_pages(blocks, block_size, heads, dim, device):
 
 @cuda
 @requires_cuda
-@requires_fp8_dtype
+@requires_fp8_device
 def test_fp8_decode_writer_matches_the_reference_quantiser():
     torch.manual_seed(61)
     batch, heads, dim, block_size, blocks = 3, 8, 128, 16, 12
@@ -151,7 +165,7 @@ def test_fp8_decode_writer_matches_the_reference_quantiser():
 
 @cuda
 @requires_cuda
-@requires_fp8_dtype
+@requires_fp8_device
 def test_fp8_prefill_writer_maps_chunks_and_ignores_padding():
     torch.manual_seed(63)
     batch, heads, padded, dim, block_size, blocks = 2, 4, 9, 128, 4, 12
@@ -188,7 +202,7 @@ def test_fp8_prefill_writer_maps_chunks_and_ignores_padding():
 
 @cuda
 @requires_cuda
-@requires_fp8_dtype
+@requires_fp8_device
 @pytest.mark.parametrize("block_n", [64, 128])
 def test_fp8_decode_matches_fp16_per_head_over_the_same_values(block_n):
     from engine.kernels.paged_decode_batched import paged_decode_batched
@@ -214,7 +228,7 @@ def test_fp8_decode_matches_fp16_per_head_over_the_same_values(block_n):
 
 @cuda
 @requires_cuda
-@requires_fp8_dtype
+@requires_fp8_device
 def test_fp8_prefill_matches_per_token_fp16_over_the_same_values():
     from engine.kernels.paged_prefill import paged_prefill
 
