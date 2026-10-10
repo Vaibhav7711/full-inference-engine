@@ -364,6 +364,8 @@ def _stock_reference(
     Triton RMSNorm/SwiGLU on it in place; the RoPE install is process-global and is
     undone here explicitly in case an engine already exists in this process.
     """
+    import contextlib
+
     import torch
 
     from engine.kernels.rope import stock_rope
@@ -372,8 +374,16 @@ def _stock_reference(
     model.config._attn_implementation = "sdpa"
     if hasattr(model.config, "_attn_implementation_internal"):
         model.config._attn_implementation_internal = "sdpa"
+    # A quantised model has no fp16 twin to compare against (an 8B's would not fit the
+    # second card). Its reference is the same packed weights through torch's matmul,
+    # so the gate tests the kernels and not the quantisation.
+    reference = contextlib.nullcontext()
+    if getattr(loaded, "quantization", None) == "w4a16":
+        from engine.quantization.w4a16 import reference_mode
+
+        reference = reference_mode(model)
     outputs, margins = [], []
-    with stock_rope(), torch.inference_mode():
+    with stock_rope(), reference, torch.inference_mode():
         for prompt in prompts:
             ids = tokenizer(prompt, return_tensors="pt").input_ids.to(loaded.device)
             generated = model.generate(
@@ -447,6 +457,11 @@ def main() -> int:
     parser.add_argument("--dtype", default="auto", choices=("auto", "float16", "bfloat16"),
                         help="model/KV activation dtype; explicit values make numerical "
                              "and performance comparisons reproducible")
+    parser.add_argument("--quantize", default=None, choices=(None, "w4a16"),
+                        help="w4a16: stream the checkpoint into 4-bit grouped Linear layers; "
+                             "the identity gate then compares kernels against torch over the "
+                             "same packed weights")
+    parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--setting", default="cuda_graphs", choices=sorted(SETTINGS))
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--duration", type=float, default=8.0)
@@ -480,7 +495,10 @@ def main() -> int:
 
     # One model, many engines: reloading weights per arm would add minutes and change
     # nothing the comparison is about.
-    loaded = load_model(args.model, dtype=args.dtype)
+    loaded = load_model(args.model, dtype=args.dtype, quantize=args.quantize,
+                        group_size=args.group_size)
+    if loaded.quantization:
+        print(f"quantization: {loaded.quantization} {loaded.quantization_report}")
     shared = dict(
         num_blocks=args.num_blocks, block_size=args.block_size, max_active=args.max_active,
         max_waiting_requests=args.max_waiting, prefix_cache_blocks=64,
@@ -665,6 +683,8 @@ def main() -> int:
     payload = {
         "setting": args.setting, "repeats": args.repeats,
         "model": args.model, "dtype": str(loaded.dtype),
+        "quantization": loaded.quantization,
+        "quantization_report": loaded.quantization_report,
         "config": {**config.__dict__, **shared},
         "arm_settings": arm_settings,
         "skipped_arms": skipped,

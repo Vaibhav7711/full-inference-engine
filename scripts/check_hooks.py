@@ -24,6 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--quantize", default=None, choices=(None, "w4a16"),
+                        help="w4a16: 4-bit grouped Linear layers, streamed in without an fp16 copy")
+    parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--dtype", default="auto", choices=("auto", "float16", "bfloat16"))
     parser.add_argument("--decode-attention", default=None)
     parser.add_argument("--prefill-attention", default=None)
@@ -50,7 +53,10 @@ def main() -> int:
     from engine.kernels.device import current_device
     from engine.model import adapters
 
-    loaded = load_model(args.model, dtype=args.dtype)
+    loaded = load_model(args.model, dtype=args.dtype, quantize=args.quantize,
+                        group_size=args.group_size)
+    if loaded.quantization:
+        print(f"quantization: {loaded.quantization} {loaded.quantization_report}")
     model_report = adapters.describe(loaded.model)
     geometry = Geometry(
         num_q_heads=model_report["geometry"]["num_q_heads"],
