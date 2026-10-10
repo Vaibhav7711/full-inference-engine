@@ -34,7 +34,12 @@ def main() -> int:
                         help="speculative verification kernel: prefill | per_token | tiled")
     parser.add_argument("--kv-cache-dtype", default="fp16", choices=("fp16", "int8", "fp8"),
                         help="KV storage; fp8 needs sm_89+ and is refused with the reason below it")
-    parser.add_argument("--num-blocks", type=int, default=1024)
+    parser.add_argument("--num-blocks", type=lambda v: v if v == "auto" else int(v), default=1024,
+                        help="KV pool pages, or 'auto' to size from free memory after the weights")
+    parser.add_argument("--max-model-len", type=int, default=None,
+                        help="served max context; caps warm-up buckets and gates admission")
+    parser.add_argument("--prefill-graph-rows", type=int, default=4)
+    parser.add_argument("--fused-graph-prefill-rows", type=int, default=4)
     parser.add_argument("--block-size", type=int, default=16,
                         help="tokens per KV page (FlashAttention paged-KV requires 256)")
     parser.add_argument("--max-active", type=int, default=8)
@@ -95,6 +100,9 @@ def main() -> int:
 
     engine = ContinuousBatchingEngine(
         loaded.model, loaded.tokenizer, loaded.device, num_blocks=args.num_blocks,
+        prefill_graph_rows=args.prefill_graph_rows,
+        fused_graph_prefill_rows=args.fused_graph_prefill_rows,
+        **({"max_model_len": args.max_model_len} if args.max_model_len else {}),
         block_size=args.block_size, max_active=args.max_active,
         cuda_graph_batch_sizes=tuple(args.buckets),
         kv_cache_dtype=args.kv_cache_dtype,
@@ -151,9 +159,22 @@ def main() -> int:
     if engine.lazy_graph_captures:
         problems.append(f"{engine.lazy_graph_captures} graph capture(s) happened after warmup")
 
+    free_bytes, total_bytes = torch.cuda.mem_get_info(loaded.device)
+    memory = {
+        "allocated_mib": round(torch.cuda.memory_allocated(loaded.device) / 2**20),
+        "reserved_mib": round(torch.cuda.memory_reserved(loaded.device) / 2**20),
+        "device_used_mib": round((total_bytes - free_bytes) / 2**20),
+        "device_total_mib": round(total_bytes / 2**20),
+        "kv_pool_blocks": engine.num_blocks_resolved,
+        "kv_pool_tokens": engine.num_blocks_resolved * engine.block_size,
+        "kv_pool_mib": round(engine.kv_pool_bytes / 2**20),
+    }
+    print(f"memory after warm-up + smoke: {memory}")
     record = {
         "model": model_report, "backends": backend_report,
+        "quantization": loaded.quantization, "quantization_report": loaded.quantization_report,
         "warmup_s": warmup_s, "warmup": summary, "captured_graphs": captured,
+        "graph_replay_report": engine.graph_replay_report(), "memory": memory,
         "last_step_timing_ms": timing, "git": git_record(),
         "environment": environment_record(loaded.device), "clocks": device_clock_record(),
         "problems": problems,

@@ -3,8 +3,10 @@
 The 0.6B work established the method and the measured facts about this card. This
 document applies both to Qwen3-8B — stage by stage through one forward, with the bytes and
 FLOPs each stage moves, what the repository already has for it, what is new, and a
-**prediction written down before the run**. The run is `scripts/sm75_qwen3_8b.sh` on a
-Kaggle T4 x2: GPU 0 serves, GPU 1 holds the dequantised reference and the draft model.
+**prediction written down before the run**. The run is `scripts/kaggle_qwen3_8b_t4x2.ipynb`
+on a Kaggle T4 x2: GPU 0 serves at W4A16 (`load_model(quantize="w4a16")`, no fp16 copy ever
+assembled), GPU 1 is reserved for the reference and the draft model. The identity gate's
+reference is the same packed weights through torch (`reference_mode`), so it tests kernels.
 
 ## 1. The model and the card
 

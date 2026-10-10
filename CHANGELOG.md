@@ -24,6 +24,19 @@ reference pinned by CPU tests and a CUDA test that runs on first boot; the gate 
 - The A/B harness skips an arm whose backend the registry refuses on this device and
   records why under `skipped_arms`, instead of dying at construction.
 - `check_hooks.py --verify-attention`, `--kv-cache-dtype`.
+- **W4A16 in the model** (`engine/quantization/w4a16.py`): `install_w4a16` quantises a
+  loaded model in place; `load_w4a16_model` streams a checkpoint into 4-bit grouped Linear
+  layers on the `meta` device without ever assembling fp16 — how an 8B loads on a 15 GB
+  card. `load_model(quantize="w4a16")`, `ab.py`/`check_hooks.py --quantize w4a16`; the
+  identity gate's reference runs the same packed weights through torch (`reference_mode`).
+- **The graph set is policy** (`max_model_len` gates admission as well as warm-up;
+  `prefill_graph_rows`, `fused_graph_prefill_rows`, `fused_graph_regimes`), with per-key
+  replay counters and lazy-capture keys in `graph_replay_report()` / `stats_snapshot`.
+  `num_blocks="auto"` sizes the KV pool from free memory. Measured on the 0.6B: 5,059 →
+  3,735 MiB resident at 16,384 KV tokens (vLLM 3,491), free below saturation, −4% / +7–16%
+  tails at 8 req/s into 16 slots.
+- `docs/qwen3-8b-optimization-map.md`: every stage of Qwen3-8B on a T4 with bytes, FLOPs
+  and a prediction per optimization, written before the run.
 
 ## v0.1.0-beta — 2026-09-24
 
