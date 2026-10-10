@@ -74,13 +74,18 @@ def default_engine_factory(
     max_pending_requests: int, target_device: str,
     draft_model_name: str | None, draft_device: str,
     speculative_ngram: bool, speculation_depth: int,
+    quantize: str | None = None,
 ):
     """Load the checkpoint and build the GPU engine. Imported lazily so the API module
-    stays importable (and unit-testable) without CUDA, Triton, or a checkpoint."""
+    stays importable (and unit-testable) without CUDA, Triton, or a checkpoint.
+
+    `quantize="w4a16"` serves 4-bit grouped weights streamed in without an fp16 copy -
+    the only way a Qwen3-8B fits beside its KV cache on a 15 GB card.
+    """
     from engine.batching.continuous_batching import ContinuousBatchingEngine
     from engine.model import load_model
 
-    loaded = load_model(model_name, dtype=dtype, device=target_device)
+    loaded = load_model(model_name, dtype=dtype, device=target_device, quantize=quantize)
     proposer = None
     if draft_model_name is not None:
         from engine.speculative import DraftModelProposer
@@ -118,6 +123,7 @@ def create_app(
     target_device: str = "cuda:0", draft_model_name: str | None = None,
     draft_device: str = "cuda:1", speculative_ngram: bool = False,
     speculation_depth: int = 3,
+    quantize: str | None = None,
     max_pending_requests: int = 256, max_prompt_tokens: int = 4096,
     request_timeout_s: float = 120.0, drain_timeout_s: float = 30.0,
     engine_factory: Callable[[], object] | None = None,
@@ -145,7 +151,7 @@ def create_app(
             graph_buckets=graph_buckets, max_pending_requests=max_pending_requests,
             target_device=target_device, draft_model_name=draft_model_name,
             draft_device=draft_device, speculative_ngram=speculative_ngram,
-            speculation_depth=speculation_depth,
+            speculation_depth=speculation_depth, quantize=quantize,
         )
 
     @asynccontextmanager

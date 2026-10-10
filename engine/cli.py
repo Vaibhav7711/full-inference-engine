@@ -11,11 +11,14 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--revision", default=None)
+    parser.add_argument("--quantize", default=None, choices=(None, "w4a16"),
+                        help="w4a16: 4-bit grouped weights, streamed in without an fp16 copy")
     parser.add_argument(
         "--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto"
     )
     args = parser.parse_args()
-    loaded = load_model(args.model, revision=args.revision, dtype=args.dtype)
+    loaded = load_model(args.model, revision=args.revision, dtype=args.dtype,
+                        quantize=args.quantize)
     result = ExplicitDecodeRunner(loaded.model, loaded.tokenizer, loaded.device).generate(
         args.prompt, max_new_tokens=args.max_new_tokens
     )

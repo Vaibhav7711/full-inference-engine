@@ -80,6 +80,9 @@ def _engine(model, tokenizer, device, args, *, proposer=None):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", default="Qwen/Qwen3-4B")
+    parser.add_argument("--quantize-target", default=None, choices=(None, "w4a16"),
+                        help="serve the target at W4A16 (the draft stays fp16); an 8B target "
+                             "needs this to fit beside its KV cache on a T4")
     parser.add_argument("--draft-model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--concurrencies", default="1,2,4")
     parser.add_argument("--depth", type=int, default=3)
@@ -96,7 +99,8 @@ def main() -> None:
     if min(*args.concurrencies, args.depth, args.max_new_tokens, args.num_blocks, args.runs) <= 0:
         parser.error("concurrencies, depth, lengths, blocks and runs must be positive")
 
-    target = load_model(args.target_model, dtype="float16", device="cuda:0")
+    target = load_model(args.target_model, dtype="float16", device="cuda:0",
+                        quantize=args.quantize_target)
     result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "target_model": args.target_model, "target_revision": target.resolved_revision,
