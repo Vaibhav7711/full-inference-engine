@@ -1749,6 +1749,33 @@ class ContinuousBatchingEngine:
     def _note_replay(self, key: tuple) -> None:
         self.graph_replays[key] = self.graph_replays.get(key, 0) + 1
 
+    def release(self) -> None:
+        """Give the device memory back now, not when the garbage collector gets to it.
+
+        The engine, its captured graphs and the model's patched forwards form reference
+        cycles, so `del engine` leaves the KV pool and every graph's private pool resident
+        until a collection happens. A harness that builds engines back to back (the A/B
+        gate, then each arm per repeat) sizes `num_blocks="auto"` from what is free, and
+        on the 8B that free number fell 7.4 -> 4.0 -> 1.2 GB across three constructions.
+        The engine is unusable afterwards.
+        """
+        for name in ("_decode_graphs", "_prefill_graphs", "_fused_graphs"):
+            graphs = getattr(self, name, None)
+            if graphs:
+                graphs.clear()
+        for name in ("key_pool", "value_pool", "key_scale_pool", "value_scale_pool"):
+            if hasattr(self, name):
+                setattr(self, name, [])
+        for name in list(vars(self)):
+            if name.startswith(("_device_", "_prefill_device_", "_fused_device_")):
+                setattr(self, name, None)
+        import gc
+
+        gc.collect()
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
     def graph_replay_report(self) -> dict:
         """Which captured graphs earn their memory, and which shapes were captured live.
 

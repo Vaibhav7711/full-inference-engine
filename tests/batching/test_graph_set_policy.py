@@ -80,3 +80,23 @@ def test_prefill_row_bucket_honours_the_graph_row_limit():
     assert bucket(fake, 3, 4) == 4
     assert bucket(fake, 5, 4) is None          # wider than the limit: eager, no capture
     assert bucket(fake, 5, None) == 8          # no limit: the next bucket up
+
+
+def test_release_drops_graphs_pools_and_staged_buffers():
+    import torch
+
+    fake = _Fake()
+    fake.device = "cpu"
+    fake._decode_graphs = {("decode", 1): object()}
+    fake._prefill_graphs = {}
+    fake._fused_graphs = {("fused", 2): object()}
+    fake.key_pool = [torch.zeros(4)]
+    fake.value_pool = [torch.zeros(4)]
+    fake._device_input_ids = torch.zeros(2, dtype=torch.long)
+    fake._prefill_device_starts = torch.zeros(2, dtype=torch.int32)
+    fake.block_manager = object()           # untouched: not device memory
+    ContinuousBatchingEngine.release(fake)
+    assert fake._decode_graphs == {} and fake._fused_graphs == {}
+    assert fake.key_pool == [] and fake.value_pool == []
+    assert fake._device_input_ids is None and fake._prefill_device_starts is None
+    assert fake.block_manager is not None

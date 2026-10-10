@@ -557,7 +557,13 @@ def run_interleaved(makers: dict[str, object], config: SoakConfig, repeats: int 
     for offset in range(repeats):
         seeded = replace(config, seed=config.seed + offset)
         for label, make_engine in makers.items():
-            run = run_soak(_warmed(make_engine()), seeded)
+            engine = _warmed(make_engine())
+            try:
+                run = run_soak(engine, seeded)
+            finally:
+                if hasattr(engine, "release"):
+                    engine.release()
+                del engine
             results[label].runs.append(run)
             if on_run is not None:
                 on_run(label, offset, run)

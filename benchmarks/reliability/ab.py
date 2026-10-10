@@ -540,6 +540,7 @@ def main() -> int:
 
     makers = {}
     arm_settings = {}
+    resolved_blocks: list[int] = []
     for label, overrides in arms_spec:
         settings = _clamp_graph_buckets({**shared, **overrides}, args.max_active)
         if settings.get("cuda_graph_batch_sizes") is None:
@@ -550,9 +551,17 @@ def main() -> int:
         skip_warmup = settings.get("warmup", True) is False
 
         def make_engine(engine_kwargs=engine_kwargs, skip_warmup=skip_warmup):
+            # `num_blocks="auto"` is resolved by the first engine of the run and pinned
+            # for every later one: the arms must compare over the same pool, and what is
+            # free at each later construction depends on how promptly the previous engine
+            # was torn down, not on the device.
+            if engine_kwargs.get("num_blocks") == "auto" and resolved_blocks:
+                engine_kwargs = {**engine_kwargs, "num_blocks": resolved_blocks[0]}
             engine = ContinuousBatchingEngine(
                 loaded.model, loaded.tokenizer, loaded.device, **engine_kwargs
             )
+            if not resolved_blocks:
+                resolved_blocks.append(engine.num_blocks_resolved)
             engine.skip_benchmark_warmup = skip_warmup
             return engine
 
@@ -584,6 +593,7 @@ def main() -> int:
             continue
         engine.warmup()  # the gate checks tokens, not first-use cost; always warm here
         identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
+        engine.release()
         del engine
     labels = list(makers)
     if len(labels) < 2:
