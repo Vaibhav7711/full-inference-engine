@@ -15,6 +15,9 @@ class LoadedModel:
     tokenizer: PreTrainedTokenizerBase
     dtype: torch.dtype
     device: torch.device
+    # "w4a16" when the Linear layers hold 4-bit grouped weights; None for a stock model.
+    quantization: str | None = None
+    quantization_report: dict | None = None
 
 
 _DTYPES = {
@@ -86,11 +89,17 @@ def load_model(
     dtype: str | torch.dtype = "auto",
     revision: str | None = None,
     device: str | torch.device | None = None,
+    quantize: str | None = None,
+    group_size: int = 128,
 ) -> LoadedModel:
     """Load an actual decoder-only checkpoint for CUDA inference.
 
     This runtime intentionally refuses CPU: Stage 1 timing and cache behaviour must
     describe the GPU execution path that later stages optimize.
+
+    `quantize="w4a16"` streams the checkpoint into 4-bit grouped Linear layers without
+    ever assembling the fp16 model - the only way an 8B fits beside its KV cache on a
+    15 GB card, or loads at all on a 16 GB host. Activations stay fp16.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required. Start a GPU runtime before loading a model.")
@@ -99,15 +108,28 @@ def load_model(
         raise RuntimeError("CUDA is required. load_model(device=...) must name a CUDA device.")
     if device.index is not None and not 0 <= device.index < torch.cuda.device_count():
         raise ValueError(f"CUDA device index {device.index} is not visible")
+    if quantize not in (None, "w4a16"):
+        raise ValueError(f"unsupported quantize={quantize!r}; choose None or 'w4a16'")
     resolved_dtype = resolve_dtype(dtype, device)
     tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, revision=revision, dtype=resolved_dtype
-    ).to(device)
-    model.eval()
-    tie_output_embeddings(model)
+    report = None
+    if quantize == "w4a16":
+        from engine.quantization.w4a16 import load_w4a16_model
+
+        # The kernel consumes fp16 activations; bf16 would be dequantised to fp16 anyway.
+        resolved_dtype = torch.float16
+        model, w4_report = load_w4a16_model(
+            model_name, device=device, revision=revision, group_size=group_size,
+        )
+        report = w4_report.as_dict()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, revision=revision, dtype=resolved_dtype
+        ).to(device)
+        model.eval()
+        tie_output_embeddings(model)
     resolved_revision = getattr(model.config, "_commit_hash", None)
     return LoadedModel(
         model_name=model_name,
@@ -117,4 +139,6 @@ def load_model(
         tokenizer=tokenizer,
         dtype=resolved_dtype,
         device=device,
+        quantization=quantize,
+        quantization_report=report,
     )
