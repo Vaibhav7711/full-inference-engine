@@ -1754,21 +1754,27 @@ class ContinuousBatchingEngine:
 
         The engine, its captured graphs and the model's patched forwards form reference
         cycles, so `del engine` leaves the KV pool and every graph's private pool resident
-        until a collection happens. A harness that builds engines back to back (the A/B
-        gate, then each arm per repeat) sizes `num_blocks="auto"` from what is free, and
-        on the 8B that free number fell 7.4 -> 4.0 -> 1.2 GB across three constructions.
-        The engine is unusable afterwards.
+        until a collection happens; and the module-level attention contexts carry the pool
+        lists themselves, so a context left set outlives the engine entirely. A harness
+        that builds engines back to back (the A/B gate, then each arm per repeat) sizes
+        `num_blocks="auto"` from what is free, and on the 8B that number fell 7.4 -> 4.0
+        -> 1.2 GB across three constructions. The engine is unusable afterwards.
         """
-        for name in ("_decode_graphs", "_prefill_graphs", "_fused_graphs"):
-            graphs = getattr(self, name, None)
-            if graphs:
-                graphs.clear()
-        for name in ("key_pool", "value_pool", "key_scale_pool", "value_scale_pool"):
-            if hasattr(self, name):
-                setattr(self, name, [])
-        for name in list(vars(self)):
-            if name.startswith(("_device_", "_prefill_device_", "_fused_device_")):
+        _clear_batch_ctx()
+        _clear_prefill_ctx()
+        _clear_fused_ctx()
+        for name, value in list(vars(self).items()):
+            if name in {"model", "tokenizer"}:
+                continue
+            if isinstance(value, torch.Tensor):
                 setattr(self, name, None)
+            elif isinstance(value, (list, tuple)) and value and all(
+                    isinstance(v, torch.Tensor) for v in value):
+                setattr(self, name, [])
+            elif isinstance(value, dict) and value and all(
+                    hasattr(v, "graph") or isinstance(v, torch.Tensor) for v in value.values()):
+                value.clear()
+        self._prefill_graph_pool = None
         import gc
 
         gc.collect()

@@ -1019,3 +1019,30 @@ def test_stop_token_ids_and_logprobs_are_honoured():
     assert len(request.output_logprobs) == len(request.output_token_ids)
     for entries in request.output_logprobs:
         assert entries and entries[0][1] <= 0.0
+
+
+@cuda
+@requires_cuda
+def test_release_returns_the_pool_and_graphs_to_the_device():
+    """Two engines built back to back must see the same free memory: `num_blocks="auto"`
+    sizes from it, and the A/B harness builds an engine per arm per repeat."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    before, _ = torch.cuda.mem_get_info()
+    eng = ContinuousBatchingEngine(
+        model, tok, "cuda", num_blocks=1024, block_size=16, max_active=4,
+        prefix_cache_blocks=0, cuda_graph_batch_sizes=(1, 2, 4),
+    )
+    eng.warmup()
+    eng.generate(["The capital of France is"], max_new_tokens=8)
+    held, _ = torch.cuda.mem_get_info()
+    assert before - held > eng.kv_pool_bytes, "engine did not take its pool"
+    eng.release()
+    del eng
+    after, _ = torch.cuda.mem_get_info()
+    # Graph executables live outside the allocator and some are never returned by the
+    # driver; the pool (the number that decides the next engine's size) must come back.
+    assert before - after < 256 << 20, f"{(before - after) >> 20} MiB still held after release"
