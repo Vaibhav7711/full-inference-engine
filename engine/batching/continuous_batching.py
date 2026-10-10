@@ -344,11 +344,29 @@ class ContinuousBatchingEngine:
     # Termination is now structural - see FCFSScheduler's policy docstring.
 
     def __init__(self, model, tokenizer, device, *,
-                 num_blocks: int = 4096, block_size: int = 16, max_active: int = 16,
+                 num_blocks: int | str = 4096, block_size: int = 16, max_active: int = 16,
                  prefill_chunk_size: int = 128,
                  prefill_attention: str | None = None,
                  decode_attention: str = "per_head",
                  verify_attention: str | None = None,
+                 # Served max context. Caps the warm-up's gathered-context buckets AND
+                 # refuses a request whose prompt + max_new_tokens exceeds it at `submit`,
+                 # so a shape warm-up did not capture can never be captured inside a live
+                 # step. None keeps the model's max_position_embeddings (bounded by the pool).
+                 max_model_len: int | None = None,
+                 # Graph set. Each captured graph is ~7.7 MiB x (layers / 28) of executable
+                 # outside the allocator, so count is the memory lever (part-4 notebook:
+                 # 215 graphs = 1.65 GB on Qwen3-0.6B). Chunk batches under a 128-token
+                 # budget are one or two rows; wider ones run eager rather than lazily
+                 # capturing. Measured cost of the lean choices at saturation (8 req/s,
+                 # 16 slots): -4% throughput, +7-16% tails; none below saturation.
+                 prefill_graph_rows: int | None = 4,
+                 fused_graph_prefill_rows: int = 4,
+                 fused_graph_regimes: tuple[int, ...] = (64, 128),
+                 # num_blocks="auto": size the pool from free device memory after the
+                 # weights, keeping `kv_reserve_bytes` for graphs and activations.
+                 kv_reserve_bytes: int = 1_500_000_000,
+                 kv_fraction: float = 0.95,
                  tiled_prefill: bool = False,
                  prefill_block_m: int | None = None,
                  prefill_block_n: int | None = None,
@@ -371,7 +389,12 @@ class ContinuousBatchingEngine:
                  speculation_depth: int = 3,
                  speculative_ngram_min_match: int = 2,
                  speculative_ngram_max_match: int = 4):
-        if min(num_blocks, block_size, max_active, prefill_chunk_size,
+        if num_blocks == "auto":
+            if not 0 < kv_fraction <= 1 or kv_reserve_bytes < 0:
+                raise ValueError("kv_fraction must be in (0, 1] and kv_reserve_bytes non-negative")
+        elif not isinstance(num_blocks, int):
+            raise ValueError("num_blocks must be an int or 'auto'")
+        if min(1 if num_blocks == "auto" else num_blocks, block_size, max_active, prefill_chunk_size,
                max_prefill_tokens_per_iteration) <= 0:
             raise ValueError("engine sizes and prefill budgets must be positive")
         if prefix_cache_blocks < 0:
@@ -514,7 +537,17 @@ class ContinuousBatchingEngine:
 
         ensure_supported(cfg)
         self.num_layers = cfg.num_hidden_layers
-        self.max_model_len = getattr(cfg, "max_position_embeddings", None)
+        self.max_model_len = (
+            int(max_model_len) if max_model_len is not None
+            else getattr(cfg, "max_position_embeddings", None)
+        )
+        if max_model_len is not None and max_model_len <= 0:
+            raise ValueError("max_model_len must be positive")
+        self.prefill_graph_rows = prefill_graph_rows
+        self.FUSED_PREFILL_ROW_LIMIT = int(fused_graph_prefill_rows)
+        self.fused_graph_regimes = tuple(fused_graph_regimes)
+        if not self.fused_graph_regimes:
+            raise ValueError("fused_graph_regimes needs at least one context length")
         # Step accounting: a prefill-carrying iteration and a decode-only iteration cost
         # very different amounts, and mixing them makes any latency percentile a blend.
         self.prefill_steps = 0
@@ -618,11 +651,21 @@ class ContinuousBatchingEngine:
         # `torch.zeros` raise a CUDA OOM whose message names neither the cause nor the fix.
         # The documented default (num_blocks=4096, block_size=16) is 7.5 GB of KV for
         # Qwen3-0.6B and cannot be built on an 8 GB card at all.
-        pool_bytes = (
-            2 * self.num_layers * num_blocks * block_size
-            * self.num_kv_heads * self.head_dim
-            * element_bytes
-        )
+        bytes_per_block = 2 * self.num_layers * block_size * self.num_kv_heads * self.head_dim * element_bytes
+        if num_blocks == "auto":
+            # Size from what is actually free once the weights are resident, less a reserve
+            # for graph executables and activations. An 8B at W4 leaves ~8.5 GB on a T4,
+            # which at 144 KiB/token is ~60,000 tokens; the number is printed, not guessed.
+            if torch.device(device).type != "cuda":
+                raise ValueError("num_blocks='auto' needs a CUDA device to size from")
+            free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+            budget = int(free_bytes * kv_fraction) - int(kv_reserve_bytes)
+            num_blocks = max(1, budget // bytes_per_block)
+            print(f"[engine] KV pool auto-sized: {num_blocks} blocks x {block_size} = "
+                  f"{num_blocks * block_size} tokens ({num_blocks * bytes_per_block / 1e9:.2f} GB) "
+                  f"from {free_bytes / 1e9:.2f} GB free, {kv_reserve_bytes / 1e9:.2f} GB reserved")
+        self.num_blocks_resolved = int(num_blocks)
+        pool_bytes = num_blocks * bytes_per_block
         if torch.device(device).type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
             if pool_bytes > free_bytes:
@@ -703,6 +746,12 @@ class ContinuousBatchingEngine:
         self._prefill_graphs = {}
         self._fused_graphs = {}
         self._prefill_graph_pool = None
+        # Replays per captured graph key, and every key captured outside warm-up. A graph
+        # that is never replayed is 7.7 MiB x (layers / 28) of memory for nothing; a key
+        # captured lazily is a ~150 ms stall inside a live step. Both are reported by
+        # key, so the eager set can be corrected from evidence rather than guessed.
+        self.graph_replays: dict[tuple, int] = {}
+        self.lazy_graph_capture_keys: list[tuple] = []
         # Graph captures taken while serving, i.e. shapes warmup did not cover. Each one
         # is two eager forwards plus device syncs inside a live step (~100-200 ms on the
         # T4), so a non-zero count after warmup is a tail-latency finding, not a detail.
@@ -992,6 +1041,15 @@ class ContinuousBatchingEngine:
             "decode_only_steps": self.decode_only_steps,
             "fused_steps": self.fused_steps,
             "lazy_graph_captures": self.lazy_graph_captures,
+            "graph_replays_total": sum(self.graph_replays.values()),
+            "graphs_captured": (len(self._decode_graphs) + len(self._prefill_graphs)
+                                + len(self._fused_graphs)),
+            "graphs_never_replayed": sum(
+                1 for keys, kind in ((self._decode_graphs, "decode"),
+                                     (self._prefill_graphs, "prefill"),
+                                     (self._fused_graphs, "fused"))
+                for key in keys if not self.graph_replays.get((kind,) + key)
+            ),
             "prefill_sdpa_calls": self.prefill_sdpa_calls,
             "prefill_chunked_calls": self.prefill_chunked_calls,
             "prefill_sdpa_tokens": self.prefill_sdpa_tokens,
@@ -1283,7 +1341,9 @@ class ContinuousBatchingEngine:
         self._set_attention(self.PREFILL_ATTN_NAME)
 
         count = len(plans)
-        row_bucket = self._prefill_row_bucket(count)
+        # Above `prefill_graph_rows` the chunk batch runs eager: warm-up captured no graph
+        # for it, and capturing one here would be the stall the warm-up exists to prevent.
+        row_bucket = self._prefill_row_bucket(count, self.prefill_graph_rows)
         use_graph = (
             self.prefill_cuda_graphs and row_bucket is not None
             and self.prefill_attention not in self._prefill_graph_unsupported
@@ -1301,10 +1361,13 @@ class ContinuousBatchingEngine:
             if graph is None:
                 # Capture stages inert rows of its own; the real batch is staged after.
                 self.lazy_graph_captures += 1
+                self.lazy_graph_capture_keys.append(("prefill",) + key)
                 graph = self._capture_prefill_graph(row_count, context_len)
             if graph is None:  # capture failed for this kind: fall back to eager
                 use_graph = False
                 row_count = count
+            else:
+                self._note_replay(("prefill",) + key)
         if not use_graph:
             width = max(n for _, n in plans)
             context_len = total_len
@@ -1565,7 +1628,24 @@ class ContinuousBatchingEngine:
         return request
 
     def submit(self, request: GenerationRequest) -> bool:
-        """Submit an externally-created request to the bounded online scheduler."""
+        """Submit an externally-created request to the bounded online scheduler.
+
+        A request that could grow past `max_model_len` is refused here, with the numbers,
+        rather than admitted. The cap is what the warm-up captured graphs for; admitting
+        past it would turn the cap into a lazy capture inside a live step - a ~150 ms
+        stall the retraction record is about - and a server should answer such a request
+        with a 4xx, not a slow success.
+        """
+        limit = self.max_model_len
+        if limit:
+            needed = int(request.prompt_token_count) + int(request.max_new_tokens)
+            if needed > limit:
+                raise ValueError(
+                    f"request {request.request_id!r} needs {needed} tokens "
+                    f"({request.prompt_token_count} prompt + {request.max_new_tokens} new) "
+                    f"but max_model_len is {limit}; raise max_model_len (and re-warm) or "
+                    f"shorten the request"
+                )
         return self.scheduler.submit(request)
 
     @property
@@ -1631,6 +1711,31 @@ class ContinuousBatchingEngine:
         config._attn_implementation = name
         if hasattr(config, "_attn_implementation_internal"):
             config._attn_implementation_internal = name
+
+    def _note_replay(self, key: tuple) -> None:
+        self.graph_replays[key] = self.graph_replays.get(key, 0) + 1
+
+    def graph_replay_report(self) -> dict:
+        """Which captured graphs earn their memory, and which shapes were captured live.
+
+        `never_replayed_keys` is the list to prune the eager set by; `lazy_capture_keys`
+        is the list to extend it by. Both are evidence about this workload, not policy.
+        """
+        captured = (
+            [("decode",) + key for key in self._decode_graphs]
+            + [("prefill",) + key for key in self._prefill_graphs]
+            + [("fused",) + key for key in self._fused_graphs]
+        )
+        never = [key for key in captured if not self.graph_replays.get(key)]
+        return {
+            "captured": len(captured),
+            "replayed_keys": len(captured) - len(never),
+            "never_replayed": len(never),
+            "never_replayed_keys": never[:64],
+            "replays_total": sum(self.graph_replays.values()),
+            "lazy_captures": len(self.lazy_graph_capture_keys),
+            "lazy_capture_keys": list(self.lazy_graph_capture_keys)[:64],
+        }
 
     def _graph_bucket(self, count: int) -> int | None:
         return next(
@@ -2067,8 +2172,11 @@ class ContinuousBatchingEngine:
             graph = self._fused_graphs.get(key)
             if graph is None:
                 self.lazy_graph_captures += 1
+                self.lazy_graph_capture_keys.append(("fused",) + key)
                 graph = self._capture_fused_graph(key)
             use_graph = graph is not None
+            if use_graph:
+                self._note_replay(("fused",) + key)
         if use_graph:
             decode_rows, prefill_rows = decode_bucket, prefill_bucket
         else:
@@ -2176,11 +2284,13 @@ class ContinuousBatchingEngine:
             if graph is None:
                 from engine.graphs import capture_paged_decode_graph
                 self.lazy_graph_captures += 1
+                self.lazy_graph_capture_keys.append(("decode",) + graph_key)
                 graph = capture_paged_decode_graph(
                     self, batch_size=graph_bucket_size, block_n=decode_block_n,
                     num_warps=decode_num_warps,
                 )
                 self._decode_graphs[graph_key] = graph
+            self._note_replay(("decode",) + graph_key)
             logits = graph.replay()
         else:
             _set_batch_ctx(context)
@@ -2296,6 +2406,8 @@ class ContinuousBatchingEngine:
                 contexts = self._warmup_context_buckets()
             pool_tokens = self.key_pool[0].shape[0] * self.block_size
             for rows in (1,) + self.cuda_graph_batch_sizes:
+                if self.prefill_graph_rows is not None and rows > self.prefill_graph_rows:
+                    continue   # wider chunk batches run eager; see `prefill_graph_rows`
                 for context_len in contexts:
                     if not self._shape_is_reachable(rows, context_len, pool_tokens):
                         continue
@@ -2313,7 +2425,7 @@ class ContinuousBatchingEngine:
             if self.fused_step and self.decode_cuda_graphs:
                 regimes = sorted({
                     select_paged_decode_config(length, 1, self.decode_attention)
-                    for length in (64, 128)
+                    for length in self.fused_graph_regimes
                 })
                 fused_rows = [
                     rows for rows in (1,) + self.cuda_graph_batch_sizes
@@ -2344,6 +2456,8 @@ class ContinuousBatchingEngine:
         self.reset()
         self.prefill_steps = self.decode_only_steps = self.fused_steps = 0
         self.lazy_graph_captures = 0   # captures during warmup are the point of warmup
+        self.lazy_graph_capture_keys.clear()
+        self.graph_replays.clear()      # replays during warmup are not evidence either
         self.last_step_prefill_tokens = self.last_step_decode_rows = 0
         self.prefill_sdpa_calls = self.prefill_chunked_calls = 0
         self.prefill_sdpa_tokens = self.prefill_chunked_tokens = 0
