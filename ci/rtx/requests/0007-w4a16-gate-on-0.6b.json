@@ -1,0 +1,15 @@
+{
+  "id": "0007-w4a16-gate-on-0.6b",
+  "description": "First launch of W4A16 in the model, on the 0.6B so it is cheap: the Triton dequant-GEMV against the reference over the same packed weights, the streaming loader against a real Hub checkpoint (meta build, per-tensor quantise, rotary re-init), and the engine's greedy tokens through the identity gate. Then check_hooks on the 0.6B at W4A16 with the pool auto-sized and a 4,096-token served max, which also records the graph replay report and device memory. If this is green, the Qwen3-8B Kaggle run is a scaling question, not a correctness one.",
+  "commands": [
+    "python -m pytest -q -p no:cacheprovider tests/kernels/test_w4a16_linear.py tests/quantization/",
+    "python scripts/check_hooks.py --model Qwen/Qwen3-0.6B --quantize w4a16 --num-blocks auto --max-model-len 4096 --max-active 8 --buckets 1 2 4 8 --out results/sm89/check_hooks_w4a16_0.6b.json"
+  ],
+  "timeout_minutes": 30,
+  "artifacts": [
+    "results/sm89/check_hooks_w4a16_0.6b.json"
+  ],
+  "requires_gpu_idle": true,
+  "depends_on": null,
+  "continue_on_error": false
+}
