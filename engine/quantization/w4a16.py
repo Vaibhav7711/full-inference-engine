@@ -77,6 +77,14 @@ class W4A16Linear(nn.Module):
         self.out_features = out_features
         self.group_size = group_size
         self.reference = False
+        # Rows at or above this go through cuBLAS over a dequantised fp16 tile instead of
+        # the Triton kernel. On sm_75 `tl.dot` lowers to scalar FMA (the tiled-prefill PTX
+        # dump: mma_sync = 0), so the kernel is bandwidth-bound only while M is small: at
+        # M = 16 the 8B's FFN is ~220 GFLOP per step, ~27 ms on FMA against a 15 ms
+        # weight-read floor, and at prefill widths it is hopeless. Above the threshold the
+        # weight is dequantised once per call (100 MB transient for the 8B's down_proj)
+        # and the tensor cores do the matmul; the bytes saved on the read are the same.
+        self.dense_threshold = 32
         factory = {"device": device}
         self.register_buffer("packed", torch.empty(out_features, in_features // 2, dtype=torch.uint8, **factory))
         self.register_buffer("scales", torch.empty(out_features, in_features // group_size,
@@ -109,7 +117,9 @@ class W4A16Linear(nn.Module):
         if not self.loaded:
             raise RuntimeError("W4A16Linear has no weights: load or quantize_from first")
         rows = x.reshape(-1, self.in_features)
-        if rows.device.type == "cuda" and not self.reference and kernel_available():
+        use_kernel = (rows.device.type == "cuda" and not self.reference and kernel_available()
+                      and rows.shape[0] < self.dense_threshold)
+        if use_kernel:
             from engine.kernels.w4a16_linear import w4a16_linear
 
             out = w4a16_linear(rows.to(torch.float16).contiguous(), self.packed, self.scales,

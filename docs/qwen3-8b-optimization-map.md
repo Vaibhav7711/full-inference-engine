@@ -167,6 +167,15 @@ standalone `w8a16_linear` (rejected at 0.6B on a harness with L2-resident weight
 becomes honest here by itself — a 100 MB weight per GEMM cannot be L2-resident, so the
 measurement finally sees the bytes it is supposed to save.
 
+**The T4 caveat, handled in code:** `tl.dot` lowers to scalar FMA on sm_75, so the Triton
+dequant-GEMV is bandwidth-bound only at small M. At M = 16 the FFN is ~220 GFLOP per step,
+~27 ms on FMA (~8 TFLOPS) against the 15 ms read floor; at prefill widths it is hopeless.
+`W4A16Linear` sends any call with M ≥ 32 to cuBLAS over a dequantised fp16 tile instead —
+tensor cores, same read bytes, one 100 MB transient per layer. The decode A/Bs at
+concurrency 8 sit below the threshold and measure the kernel; prefill measures cuBLAS. A
+sweep of `dense_threshold` on this card is a cheap follow-up: the crossover is a
+measurement and 32 is an estimate.
+
 ### 3.9 `lm_head` — 8% of bytes, untied
 
 `[4096 → 151,936]`, 1.25 GB fp16, read in full every decode step. **Have:** only last-position

@@ -30,13 +30,20 @@ def w4():
 
 @cuda
 @requires_cuda
-def test_installed_kernel_agrees_with_torch_over_the_same_packed_weights(w4):
+@pytest.mark.parametrize("shape, path", [((1, 8), "kernel"), ((2, 24), "dense")],
+                         ids=["M=8 triton kernel", "M=48 cuBLAS over dequantised fp16"])
+def test_installed_path_agrees_with_torch_over_the_same_packed_weights(w4, shape, path):
     from engine.quantization.w4a16 import kernel_available, reference_mode, w4a16_modules
 
     assert kernel_available(), "Triton kernel must be the live path on a CUDA box"
-    assert not any(m.reference for m in w4a16_modules(w4.model))
+    modules = w4a16_modules(w4.model)
+    assert not any(m.reference for m in modules)
+    rows = shape[0] * shape[1]
+    # Below the threshold the Triton GEMV runs; at or above it, cuBLAS over a dequantised
+    # tile (on sm_75 tl.dot is FMA, so wide batches must reach the tensor cores).
+    assert all((rows < m.dense_threshold) == (path == "kernel") for m in modules)
     torch.manual_seed(0)
-    ids = torch.randint(1000, 100_000, (2, 24), device=w4.device)
+    ids = torch.randint(1000, 100_000, shape, device=w4.device)
     with torch.inference_mode():
         kernel = w4.model(input_ids=ids, use_cache=False).logits.float()
         with reference_mode(w4.model):
