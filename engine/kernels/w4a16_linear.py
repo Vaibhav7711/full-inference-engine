@@ -117,53 +117,55 @@ def w4a16_linear(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tenso
 @triton.jit
 def _w4a16_gemv_kernel(
     x_ptr, w_ptr, scale_ptr, bias_ptr, out_ptr,
-    M, N, K,
+    N, K,
     stride_xm, stride_xk,
     stride_wn, stride_wk,
     stride_sn, stride_sg,
     stride_om, stride_on,
-    HAS_BIAS: tl.constexpr, M_PAD: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_BIAS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP: tl.constexpr, ZERO: tl.constexpr,
 ):
-    """Decode-width W4A16: `out[m, n] = sum_k x[m, k] * w[n, k]` for M <= M_PAD rows.
+    """Decode-width W4A16: one input row x BLOCK_N weight rows per program, no `tl.dot`.
 
-    No `tl.dot`: on sm_75 Triton lowers it to scalar FMA and the linear kernel runs
-    ~20x off the weight sweep. Each program owns BLOCK_N output rows, dequantises one
-    group's byte tile once, and applies it to every input row by a broadcast multiply
-    and a `tl.sum` over k, so weight bytes cross HBM once and the arithmetic is the
-    unavoidable M multiply-adds per weight.
+    On sm_75 Triton lowers `tl.dot` to scalar FMA and the tiled kernel ran the 8B's
+    decode step at 439 ms against an 18 ms weight sweep. This kernel is written for the
+    memory system instead: each iteration loads a [BLOCK_N, BLOCK_K/2] byte tile (8 KB at
+    the defaults, eight groups at once), dequantises it with a per-byte gathered scale,
+    and reduces against the matching gathered activations. `m` is the fastest grid axis,
+    so the programs for the same weight tile and different rows are launched together
+    and the tile crosses HBM once and L2 the other M - 1 times.
     """
-    pid_n = tl.program_id(0)
+    m = tl.program_id(0)
+    pid_n = tl.program_id(1)
     HALF: tl.constexpr = GROUP // 2
-    offs_m = tl.arange(0, M_PAD)
+    HALF_K: tl.constexpr = BLOCK_K // 2
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_h = tl.arange(0, HALF)
-    m_mask = offs_m < M
+    offs_j = tl.arange(0, HALF_K)               # byte j of the chunk: group j // HALF, slot j % HALF
     n_mask = offs_n < N
-    acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
-    for group in range(0, K // GROUP):
-        k0 = group * GROUP
+    group_in_chunk = offs_j // HALF
+    slot = offs_j % HALF
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for chunk in range(0, K // BLOCK_K):
+        k0 = chunk * BLOCK_K
+        g0 = chunk * (BLOCK_K // GROUP)
         packed = tl.load(
-            w_ptr + offs_n[:, None] * stride_wn + (group * HALF + offs_h[None, :]) * stride_wk,
+            w_ptr + offs_n[:, None] * stride_wn + (chunk * HALF_K + offs_j[None, :]) * stride_wk,
             mask=n_mask[:, None], other=ZERO,
-        )                                                                   # [BLOCK_N, HALF]
-        scale = tl.load(scale_ptr + offs_n * stride_sn + group * stride_sg, mask=n_mask, other=0.0)
-        w_lo = ((packed & 0x0F).to(tl.int8) - ZERO).to(tl.float16) * scale[:, None]
-        w_hi = ((packed >> 4).to(tl.int8) - ZERO).to(tl.float16) * scale[:, None]
-        x_lo = tl.load(
-            x_ptr + offs_m[:, None] * stride_xm + (k0 + offs_h[None, :]) * stride_xk,
-            mask=m_mask[:, None], other=0.0,
-        )                                                                   # [M_PAD, HALF]
-        x_hi = tl.load(
-            x_ptr + offs_m[:, None] * stride_xm + (k0 + HALF + offs_h[None, :]) * stride_xk,
-            mask=m_mask[:, None], other=0.0,
-        )
-        acc += tl.sum(x_lo[:, None, :].to(tl.float32) * w_lo[None, :, :].to(tl.float32), axis=2)
-        acc += tl.sum(x_hi[:, None, :].to(tl.float32) * w_hi[None, :, :].to(tl.float32), axis=2)
+        )                                                                   # [BLOCK_N, HALF_K] u8
+        scale = tl.load(
+            scale_ptr + offs_n[:, None] * stride_sn + (g0 + group_in_chunk[None, :]) * stride_sg,
+            mask=n_mask[:, None], other=0.0,
+        )                                                                   # [BLOCK_N, HALF_K] f16
+        k_lo = k0 + group_in_chunk * GROUP + slot
+        x_lo = tl.load(x_ptr + m * stride_xm + k_lo * stride_xk).to(tl.float32)          # [HALF_K]
+        x_hi = tl.load(x_ptr + m * stride_xm + (k_lo + HALF) * stride_xk).to(tl.float32)
+        w_lo = ((packed & 0x0F).to(tl.int8) - ZERO).to(tl.float16) * scale
+        w_hi = ((packed >> 4).to(tl.int8) - ZERO).to(tl.float16) * scale
+        acc += tl.sum(w_lo.to(tl.float32) * x_lo[None, :], axis=1)
+        acc += tl.sum(w_hi.to(tl.float32) * x_hi[None, :], axis=1)
     if HAS_BIAS:
-        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
-    tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
-             acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + m * stride_om + offs_n * stride_on, acc.to(out_ptr.dtype.element_ty), mask=n_mask)
 
 
 GEMV_MAX_ROWS = 8
@@ -171,7 +173,7 @@ GEMV_MAX_ROWS = 8
 
 def w4a16_gemv(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
                bias: torch.Tensor | None = None, *, group_size: int = GROUP_SIZE,
-               block_n: int = 32, num_warps: int = 4) -> torch.Tensor:
+               block_n: int = 16, block_k: int = 1024, num_warps: int = 4) -> torch.Tensor:
     """The decode-width path: `inputs [M <= 8, K]` x packed weights, no `tl.dot`."""
     M, K = inputs.shape
     N = packed.shape[0]
@@ -179,18 +181,19 @@ def w4a16_gemv(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
         raise ValueError(f"w4a16_gemv serves M <= {GEMV_MAX_ROWS}; got {M}")
     if K % group_size or packed.shape != (N, K // 2) or scales.shape != (N, K // group_size):
         raise ValueError("packed/scales do not match inputs with this group size")
-    m_pad = max(1, triton.next_power_of_2(M))
+    block_k = min(block_k, K)
+    if block_k % group_size or K % block_k:
+        raise ValueError(f"block_k {block_k} must be a multiple of the group and divide K={K}")
     output = torch.empty((M, N), dtype=inputs.dtype, device=inputs.device)
-    _w4a16_gemv_kernel[(triton.cdiv(N, block_n),)](
+    _w4a16_gemv_kernel[(M, triton.cdiv(N, block_n))](
         inputs, packed, scales, bias if bias is not None else output, output,
-        M, N, K,
+        N, K,
         inputs.stride(0), inputs.stride(1), packed.stride(0), packed.stride(1),
         scales.stride(0), scales.stride(1), output.stride(0), output.stride(1),
-        HAS_BIAS=bias is not None, M_PAD=m_pad, BLOCK_N=block_n,
+        HAS_BIAS=bias is not None, BLOCK_N=block_n, BLOCK_K=block_k,
         GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
     )
     return output
-
 
 @triton.jit
 def _w4_dequant_kernel(

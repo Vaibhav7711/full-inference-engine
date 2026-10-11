@@ -48,7 +48,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 8, 32, 128])
     parser.add_argument("--block-n", type=int, nargs="+", default=[64])
-    parser.add_argument("--gemv-block-n", type=int, nargs="+", default=[16, 32, 64])
+    parser.add_argument("--gemv", nargs="+", default=["16,1024,4", "32,1024,4", "16,2048,4", "32,512,8", "8,1024,4"],
+                        help="GEMV configs as block_n,block_k,num_warps")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     from engine.kernels.w4a16_format import quantize_weight_w4_grouped
@@ -71,9 +72,10 @@ def main() -> int:
                 timings[f"triton_dot_bn{block_n}"] = _time(
                     lambda: w4a16_linear(x, packed, scales, None, block_n=block_n, kernel="dot"))
             if m <= GEMV_MAX_ROWS:
-                for block_n in args.gemv_block_n:
-                    timings[f"triton_gemv_bn{block_n}"] = _time(
-                        lambda: w4a16_gemv(x, packed, scales, None, block_n=block_n))
+                for cfg in args.gemv:
+                    bn, bk, warps = (int(v) for v in cfg.split(","))
+                    timings[f"gemv_bn{bn}_bk{bk}_w{warps}"] = _time(
+                        lambda: w4a16_gemv(x, packed, scales, None, block_n=bn, block_k=bk, num_warps=warps))
             scratch = dense_scratch(device, n, k)
             timings["dequant_only"] = _time(lambda: w4_dequantize_into(scratch, packed, scales))
             timings["dense_dequant_cublas"] = _time(

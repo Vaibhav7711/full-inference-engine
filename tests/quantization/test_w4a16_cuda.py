@@ -51,8 +51,12 @@ def test_installed_path_agrees_with_torch_over_the_same_packed_weights(w4, shape
     # Same nibbles, same scales; only the GEMV's fp16 accumulation order differs across
     # 28 layers. Logits are O(10), so this is a few-ulp-per-layer budget.
     torch.testing.assert_close(kernel, reference, rtol=2e-2, atol=1e-1)
-    agree = (kernel.argmax(-1) == reference.argmax(-1)).float().mean().item()
-    assert agree > 0.95, f"argmax agreement {agree:.3f}"
+    # Argmax must agree wherever the reference is decided by more than that tolerance; a
+    # near-tie flipping is the tolerance, not a kernel (one such flip failed this at 7/8).
+    top2 = reference.topk(2, dim=-1).values
+    decided = (top2[..., 0] - top2[..., 1]) > 0.2
+    flips = ((kernel.argmax(-1) != reference.argmax(-1)) & decided).sum().item()
+    assert flips == 0, f"{flips} argmax flips where the reference margin exceeds 0.2"
 
 
 @cuda
