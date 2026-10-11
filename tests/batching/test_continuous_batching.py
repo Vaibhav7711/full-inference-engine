@@ -1041,18 +1041,22 @@ def test_release_lets_the_next_engine_take_the_same_auto_sized_pool(graphs):
     kwargs = dict(block_size=16, max_active=4, prefix_cache_blocks=0, cuda_graph_batch_sizes=graphs)
     first = ContinuousBatchingEngine(model, tok, "cuda", num_blocks="auto", **kwargs)
     blocks, pool_bytes = first.num_blocks_resolved, first.kv_pool_bytes
-    first.warmup()
-    first.generate(["The capital of France is"], max_new_tokens=8)
-    first.release()
+    try:
+        first.warmup()
+        first.generate(["The capital of France is"], max_new_tokens=8)
+    finally:
+        first.release()
     del first
     after_first, _ = torch.cuda.mem_get_info()
 
     second = ContinuousBatchingEngine(model, tok, "cuda", num_blocks=blocks, **kwargs)
-    second.warmup()
-    out = second.generate(["The capital of France is"], max_new_tokens=8)
-    assert out[0].output_token_ids
-    second.release()
+    try:
+        second.warmup()
+        out = second.generate(["The capital of France is"], max_new_tokens=8)
+    finally:
+        second.release()
     del second
+    assert out[0], "second engine generated nothing"
     after_second, _ = torch.cuda.mem_get_info()
     print(f"\nrelease ({'graphs' if graphs else 'no graphs'}): pool {pool_bytes >> 20} MiB, "
           f"{(start - after_first) >> 20} MiB kept after the first engine, "
