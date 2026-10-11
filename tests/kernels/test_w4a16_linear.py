@@ -135,3 +135,23 @@ def test_dense_path_dequantises_through_the_kernel_into_one_scratch():
     a.reference = b.reference = True
     torch.testing.assert_close(ya, a(x), rtol=0, atol=0)
     torch.testing.assert_close(yb, b(x), rtol=0, atol=0)
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("m", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("block_n", [16, 32, 64])
+def test_w4a16_gemv_matches_the_dequantised_reference(m, block_n):
+    from engine.kernels.w4a16_format import unpack_w4_reference
+
+    kernels = pytest.importorskip("engine.kernels.w4a16_linear")
+    torch.manual_seed(m)
+    k, n = 1024, 1000                                  # ragged N: the last program is masked
+    packed, scales = kernels.quantize_weight_w4_grouped(torch.randn(n, k, device="cuda", dtype=torch.float16))
+    bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = kernels.w4a16_gemv(x, packed, scales, bias, block_n=block_n)
+    expected = torch.nn.functional.linear(x.float(), unpack_w4_reference(packed, scales, k).float(), bias.float())
+    torch.testing.assert_close(out.float(), expected, rtol=2e-3, atol=2e-2)
+    auto = kernels.w4a16_linear(x, packed, scales, bias)          # "auto" routes M <= 8 here
+    assert torch.equal(auto, out)

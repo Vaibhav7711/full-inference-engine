@@ -74,10 +74,19 @@ def _w4a16_linear_kernel(
 
 def w4a16_linear(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
                  bias: torch.Tensor | None = None, *, group_size: int = GROUP_SIZE,
-                 block_m: int = 16, block_n: int = 64, num_warps: int = 4) -> torch.Tensor:
-    """`inputs [M, K] fp16` x dequantised `packed/scales` -> `[M, N]`, dequant in-kernel."""
+                 block_m: int = 16, block_n: int = 64, num_warps: int = 4,
+                 kernel: str = "auto") -> torch.Tensor:
+    """`inputs [M, K] fp16` x dequantised `packed/scales` -> `[M, N]`, dequant in-kernel.
+
+    `kernel`: "auto" takes the `tl.dot`-free GEMV for M <= 8 (decode) and the tiled
+    kernel above it; "gemv" / "dot" force one, for the benchmark and the tests.
+    """
     if inputs.ndim != 2 or packed.ndim != 2 or packed.dtype is not torch.uint8:
         raise ValueError("inputs must be 2D fp16 and packed weights 2D uint8")
+    if kernel not in {"auto", "gemv", "dot"}:
+        raise ValueError(f"kernel must be auto, gemv or dot; got {kernel!r}")
+    if kernel == "gemv" or (kernel == "auto" and inputs.shape[0] <= GEMV_MAX_ROWS):
+        return w4a16_gemv(inputs, packed, scales, bias, group_size=group_size)
     M, K = inputs.shape
     N, packed_k = packed.shape
     if group_size % 32 or group_size < 32:
@@ -100,6 +109,84 @@ def w4a16_linear(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tenso
         scales.stride(0), scales.stride(1),
         output.stride(0), output.stride(1),
         HAS_BIAS=bias is not None, BLOCK_M=block_m, BLOCK_N=block_n,
+        GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
+    )
+    return output
+
+
+@triton.jit
+def _w4a16_gemv_kernel(
+    x_ptr, w_ptr, scale_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_sn, stride_sg,
+    stride_om, stride_on,
+    HAS_BIAS: tl.constexpr, M_PAD: tl.constexpr, BLOCK_N: tl.constexpr,
+    GROUP: tl.constexpr, ZERO: tl.constexpr,
+):
+    """Decode-width W4A16: `out[m, n] = sum_k x[m, k] * w[n, k]` for M <= M_PAD rows.
+
+    No `tl.dot`: on sm_75 Triton lowers it to scalar FMA and the linear kernel runs
+    ~20x off the weight sweep. Each program owns BLOCK_N output rows, dequantises one
+    group's byte tile once, and applies it to every input row by a broadcast multiply
+    and a `tl.sum` over k, so weight bytes cross HBM once and the arithmetic is the
+    unavoidable M multiply-adds per weight.
+    """
+    pid_n = tl.program_id(0)
+    HALF: tl.constexpr = GROUP // 2
+    offs_m = tl.arange(0, M_PAD)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, HALF)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+    for group in range(0, K // GROUP):
+        k0 = group * GROUP
+        packed = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + (group * HALF + offs_h[None, :]) * stride_wk,
+            mask=n_mask[:, None], other=ZERO,
+        )                                                                   # [BLOCK_N, HALF]
+        scale = tl.load(scale_ptr + offs_n * stride_sn + group * stride_sg, mask=n_mask, other=0.0)
+        w_lo = ((packed & 0x0F).to(tl.int8) - ZERO).to(tl.float16) * scale[:, None]
+        w_hi = ((packed >> 4).to(tl.int8) - ZERO).to(tl.float16) * scale[:, None]
+        x_lo = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + (k0 + offs_h[None, :]) * stride_xk,
+            mask=m_mask[:, None], other=0.0,
+        )                                                                   # [M_PAD, HALF]
+        x_hi = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + (k0 + HALF + offs_h[None, :]) * stride_xk,
+            mask=m_mask[:, None], other=0.0,
+        )
+        acc += tl.sum(x_lo[:, None, :].to(tl.float32) * w_lo[None, :, :].to(tl.float32), axis=2)
+        acc += tl.sum(x_hi[:, None, :].to(tl.float32) * w_hi[None, :, :].to(tl.float32), axis=2)
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
+    tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+             acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
+
+
+GEMV_MAX_ROWS = 8
+
+
+def w4a16_gemv(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
+               bias: torch.Tensor | None = None, *, group_size: int = GROUP_SIZE,
+               block_n: int = 32, num_warps: int = 4) -> torch.Tensor:
+    """The decode-width path: `inputs [M <= 8, K]` x packed weights, no `tl.dot`."""
+    M, K = inputs.shape
+    N = packed.shape[0]
+    if M > GEMV_MAX_ROWS:
+        raise ValueError(f"w4a16_gemv serves M <= {GEMV_MAX_ROWS}; got {M}")
+    if K % group_size or packed.shape != (N, K // 2) or scales.shape != (N, K // group_size):
+        raise ValueError("packed/scales do not match inputs with this group size")
+    m_pad = max(1, triton.next_power_of_2(M))
+    output = torch.empty((M, N), dtype=inputs.dtype, device=inputs.device)
+    _w4a16_gemv_kernel[(triton.cdiv(N, block_n),)](
+        inputs, packed, scales, bias if bias is not None else output, output,
+        M, N, K,
+        inputs.stride(0), inputs.stride(1), packed.stride(0), packed.stride(1),
+        scales.stride(0), scales.stride(1), output.stride(0), output.stride(1),
+        HAS_BIAS=bias is not None, M_PAD=m_pad, BLOCK_N=block_n,
         GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
     )
     return output

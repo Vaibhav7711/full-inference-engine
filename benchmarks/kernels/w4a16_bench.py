@@ -48,10 +48,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 8, 32, 128])
     parser.add_argument("--block-n", type=int, nargs="+", default=[64])
+    parser.add_argument("--gemv-block-n", type=int, nargs="+", default=[16, 32, 64])
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     from engine.kernels.w4a16_format import quantize_weight_w4_grouped
-    from engine.kernels.w4a16_linear import w4_dequantize_into, w4a16_linear
+    from engine.kernels.w4a16_linear import GEMV_MAX_ROWS, w4_dequantize_into, w4a16_gemv, w4a16_linear
     from engine.quantization.w4a16 import dense_scratch
 
     device = torch.device("cuda")
@@ -67,8 +68,12 @@ def main() -> int:
             x = torch.randn(m, k, device=device, dtype=torch.float16)
             timings = {"fp16_cublas": _time(lambda: F.linear(x, weight))}
             for block_n in args.block_n:
-                timings[f"triton_gemv_bn{block_n}"] = _time(
-                    lambda: w4a16_linear(x, packed, scales, None, block_n=block_n))
+                timings[f"triton_dot_bn{block_n}"] = _time(
+                    lambda: w4a16_linear(x, packed, scales, None, block_n=block_n, kernel="dot"))
+            if m <= GEMV_MAX_ROWS:
+                for block_n in args.gemv_block_n:
+                    timings[f"triton_gemv_bn{block_n}"] = _time(
+                        lambda: w4a16_gemv(x, packed, scales, None, block_n=block_n))
             scratch = dense_scratch(device, n, k)
             timings["dequant_only"] = _time(lambda: w4_dequantize_into(scratch, packed, scales))
             timings["dense_dequant_cublas"] = _time(
@@ -84,8 +89,8 @@ def main() -> int:
         del weight, packed, scales
         torch.cuda.empty_cache()
     print("\nper decode/prefill step (36 layers + lm_head), ms:")
-    paths = sorted({p for _, p in per_step})
     for m in args.rows:
+        paths = sorted(p for (mm, p) in per_step if mm == m)
         print(f"  M={m:<4d} " + "  ".join(f"{p}={per_step[(m, p)]:8.1f}" for p in paths))
     if args.out:
         with open(args.out, "w") as handle:
