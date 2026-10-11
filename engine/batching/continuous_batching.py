@@ -805,9 +805,10 @@ class ContinuousBatchingEngine:
         working_set = 1_000_000_000
         quantised = 0
         for module in model.modules():
-            slab = getattr(module, "dense_slab_bytes", None)
-            if slab is not None:
-                quantised = 4 * slab      # int8 nibbles + fp16 tile + the matmul operands
+            scratch = getattr(module, "dense_scratch_bytes", None)
+            if scratch is not None:
+                # The persistent dequant scratch plus one slab's worth of torch transients.
+                quantised = scratch + 4 * module.dense_slab_bytes
                 break
         return int(graphs + working_set + quantised)
 

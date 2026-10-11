@@ -59,6 +59,23 @@ def kernel_available() -> bool:
     return _KERNEL
 
 
+_SCRATCH: dict[torch.device, torch.Tensor] = {}
+
+
+def dense_scratch(device: torch.device, out_features: int, in_features: int) -> torch.Tensor:
+    """A persistent fp16 buffer of at least `out x in` elements on `device`, viewed to shape.
+
+    One per device, grown to the largest tile asked for; every W4A16 dense call on the
+    device dequantises into it in turn, so no captured graph owns a dequantised tile.
+    """
+    needed = out_features * in_features
+    buffer = _SCRATCH.get(device)
+    if buffer is None or buffer.numel() < needed:
+        buffer = torch.empty(needed, dtype=torch.float16, device=device)
+        _SCRATCH[device] = buffer
+    return buffer[:needed].view(out_features, in_features)
+
+
 class W4A16Linear(nn.Module):
     """`nn.Linear` with 4-bit grouped weights, dequantised inside the matmul.
 
@@ -133,10 +150,23 @@ class W4A16Linear(nn.Module):
     # 8B's lm_head is 1.2 GB in fp16 and verification calls it with M >= 32 rows, so an
     # unbounded dequantise would take the KV pool's headroom in one transient.
     dense_slab_bytes: int = 32 << 20
+    # Tiles up to this size are dequantised by one Triton launch into a scratch buffer
+    # that persists per device (the 8B's largest projection, gate/up, is 100 MiB). Inside
+    # a captured graph that is two nodes and no allocation per projection; the torch
+    # slab loop it replaces was ~50 nodes and a private-pool allocation per slab.
+    dense_scratch_bytes: int = 256 << 20
 
     def _dense(self, rows: torch.Tensor) -> torch.Tensor:
         bias = None if self.bias is None else self.bias.to(rows.dtype)
         tile_bytes = 2 * self.out_features * self.in_features
+        if (rows.device.type == "cuda" and not self.reference and kernel_available()
+                and tile_bytes <= self.dense_scratch_bytes):
+            from engine.kernels.w4a16_linear import w4_dequantize_into
+
+            weight = w4_dequantize_into(
+                dense_scratch(rows.device, self.out_features, self.in_features),
+                self.packed, self.scales, group_size=self.group_size)
+            return F.linear(rows, weight.to(rows.dtype), bias)
         if tile_bytes <= self.dense_slab_bytes:
             return F.linear(rows, self.dequantized(rows.dtype), bias)
         slab = max(1, self.dense_slab_bytes // (2 * self.in_features))

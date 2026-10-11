@@ -100,3 +100,38 @@ def test_w4a16_linear_without_bias_and_with_a_ragged_m() -> None:
     reference = inputs @ w4.unpack_w4_reference(packed, scales, 512).T
     actual = kernels.w4a16_linear(inputs, packed, scales)
     torch.testing.assert_close(actual, reference, rtol=5e-3, atol=5e-3)
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("shape", [(1024, 1024), (3072, 1024), (12288, 4096), (1000, 256)])
+def test_w4_dequantize_into_is_bit_identical_to_the_reference(shape):
+    from engine.kernels.w4a16_format import unpack_w4_reference
+
+    kernels = pytest.importorskip("engine.kernels.w4a16_linear")
+    torch.manual_seed(3)
+    n, k = shape
+    packed, scales = kernels.quantize_weight_w4_grouped(torch.randn(n, k, device="cuda", dtype=torch.float16))
+    out = torch.full((n, k), float("nan"), device="cuda", dtype=torch.float16)
+    kernels.w4_dequantize_into(out, packed, scales)
+    assert torch.equal(out, unpack_w4_reference(packed, scales, k))
+
+
+@cuda
+@requires_cuda
+def test_dense_path_dequantises_through_the_kernel_into_one_scratch():
+    from engine.quantization.w4a16 import W4A16Linear, _SCRATCH, reference_mode
+
+    torch.manual_seed(4)
+    a = W4A16Linear(1024, 3072).cuda(); a.quantize_from(torch.randn(3072, 1024, device="cuda", dtype=torch.float16))
+    b = W4A16Linear(1024, 1024).cuda(); b.quantize_from(torch.randn(1024, 1024, device="cuda", dtype=torch.float16))
+    x = torch.randn(64, 1024, device="cuda", dtype=torch.float16)      # >= dense_threshold
+    before = torch.cuda.memory_allocated()
+    ya, yb = a(x), b(x)
+    scratch = _SCRATCH[x.device]
+    assert scratch.numel() == 3072 * 1024, "scratch is grown to the largest tile and shared"
+    a(x); b(x)
+    assert torch.cuda.memory_allocated() - before < 2 * (64 * 3072 * 2) + scratch.numel() * 2 + (1 << 20)
+    a.reference = b.reference = True
+    torch.testing.assert_close(ya, a(x), rtol=0, atol=0)
+    torch.testing.assert_close(yb, b(x), rtol=0, atol=0)

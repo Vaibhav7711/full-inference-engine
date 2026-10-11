@@ -103,3 +103,66 @@ def w4a16_linear(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tenso
         GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
     )
     return output
+
+
+@triton.jit
+def _w4_dequant_kernel(
+    w_ptr, scale_ptr, out_ptr,
+    N, K,
+    stride_wn, stride_wk,
+    stride_sn, stride_sg,
+    stride_on, stride_ok,
+    GROUP: tl.constexpr, ZERO: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """out[n, k] = (nibble(n, k) - ZERO) * scale[n, k // GROUP] over one group x BLOCK_N rows.
+
+    Grid (groups, cdiv(N, BLOCK_N)): one program dequantises one group of GROUP inputs for
+    BLOCK_N output rows - the byte tile is loaded once and split into its halves, like
+    the linear kernel, and the two halves are written to contiguous columns.
+    """
+    group = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    HALF: tl.constexpr = GROUP // 2
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, HALF)
+    n_mask = offs_n < N
+    packed = tl.load(
+        w_ptr + offs_n[:, None] * stride_wn + (group * HALF + offs_h[None, :]) * stride_wk,
+        mask=n_mask[:, None], other=ZERO,
+    )
+    scale = tl.load(scale_ptr + offs_n * stride_sn + group * stride_sg, mask=n_mask, other=0.0)
+    low = ((packed & 0x0F).to(tl.int8) - ZERO).to(tl.float16) * scale[:, None]
+    high = ((packed >> 4).to(tl.int8) - ZERO).to(tl.float16) * scale[:, None]
+    base = out_ptr + offs_n[:, None] * stride_on + (group * GROUP + offs_h[None, :]) * stride_ok
+    tl.store(base, low, mask=n_mask[:, None])
+    tl.store(base + HALF * stride_ok, high, mask=n_mask[:, None])
+
+
+def w4_dequantize_into(
+    out: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, *,
+    group_size: int = GROUP_SIZE, block_n: int = 64, num_warps: int = 4,
+) -> torch.Tensor:
+    """Dequantise `(packed, scales)` into `out` (fp16 `[N, K]`, caller-owned) in one launch.
+
+    The dense path of `W4A16Linear` runs inside captured graphs at prefill widths; done
+    with torch ops it was ~50 graph nodes per projection and a private-pool allocation
+    per slab, which on the 8B made each fused graph's executable ~10x the size. One
+    kernel into a persistent scratch is two nodes per projection and no allocation.
+    Bit-identical to `unpack_w4_reference`: integer times fp16 scale, rounded once.
+    """
+    N, K = out.shape
+    if out.dtype is not torch.float16 or packed.dtype is not torch.uint8:
+        raise ValueError("out must be fp16 and packed uint8")
+    if group_size % 2 or K % group_size or packed.shape != (N, K // 2):
+        raise ValueError(f"packed {tuple(packed.shape)} does not match out {tuple(out.shape)} "
+                         f"with group {group_size}")
+    if scales.shape != (N, K // group_size):
+        raise ValueError("scales must have shape [N, K // group_size]")
+    grid = (K // group_size, triton.cdiv(N, block_n))
+    _w4_dequant_kernel[grid](
+        packed, scales, out, N, K,
+        packed.stride(0), packed.stride(1), scales.stride(0), scales.stride(1),
+        out.stride(0), out.stride(1),
+        GROUP=group_size, ZERO=OFFSET, BLOCK_N=block_n, num_warps=num_warps,
+    )
+    return out
