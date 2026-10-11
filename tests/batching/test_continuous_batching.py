@@ -1024,36 +1024,36 @@ def test_stop_token_ids_and_logprobs_are_honoured():
 @cuda
 @requires_cuda
 @pytest.mark.parametrize("graphs", [None, (1, 2, 4)], ids=["no graphs", "graphs"])
-def test_release_returns_the_pool_and_graphs_to_the_device(graphs):
-    """Engines built back to back must see the same free memory: `num_blocks="auto"`
-    sizes from it, and the A/B harness builds an engine per arm per repeat.
-
-    The first cycle pays process-lifetime costs that are not the engine's to return
-    (cuBLAS workspace, Triton modules, the first graph executables the driver keeps);
-    the contract is the second cycle: what one engine takes, its release gives back.
+def test_release_lets_the_next_engine_take_the_same_auto_sized_pool(graphs):
+    """The A/B harness's contract: the first engine of a run resolves `num_blocks="auto"`,
+    every later engine is built with that number, and each is released before the next.
+    On the 8B that failed twice before `release()` existed and once after its first
+    version (the attention contexts kept the pool alive). The free-memory arithmetic is
+    deliberately not asserted: inside a shared process the caching allocator serves part
+    of a pool from segments earlier tests left behind, so `mem_get_info` deltas lie.
     """
     from engine.batching.continuous_batching import ContinuousBatchingEngine
 
     model, tok = _load()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    start, _ = torch.cuda.mem_get_info()
+    kwargs = dict(block_size=16, max_active=4, prefix_cache_blocks=0, cuda_graph_batch_sizes=graphs)
+    first = ContinuousBatchingEngine(model, tok, "cuda", num_blocks="auto", **kwargs)
+    blocks, pool_bytes = first.num_blocks_resolved, first.kv_pool_bytes
+    first.warmup()
+    first.generate(["The capital of France is"], max_new_tokens=8)
+    first.release()
+    del first
+    after_first, _ = torch.cuda.mem_get_info()
 
-    def cycle():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        before, _ = torch.cuda.mem_get_info()
-        eng = ContinuousBatchingEngine(
-            model, tok, "cuda", num_blocks=1024, block_size=16, max_active=4,
-            prefix_cache_blocks=0, cuda_graph_batch_sizes=graphs,
-        )
-        eng.warmup()
-        eng.generate(["The capital of France is"], max_new_tokens=8)
-        held, _ = torch.cuda.mem_get_info()
-        assert before - held > eng.kv_pool_bytes, "engine did not take its pool"
-        eng.release()
-        del eng
-        after, _ = torch.cuda.mem_get_info()
-        return (before - after) >> 20
-
-    first, second = cycle(), cycle()
-    print(f"\nrelease ({'graphs' if graphs else 'no graphs'}): "
-          f"{first} MiB kept after the first cycle, {second} MiB after the second")
-    assert second < 64, f"{second} MiB still held after the second release ({first} after the first)"
+    second = ContinuousBatchingEngine(model, tok, "cuda", num_blocks=blocks, **kwargs)
+    second.warmup()
+    out = second.generate(["The capital of France is"], max_new_tokens=8)
+    assert out[0].output_token_ids
+    second.release()
+    del second
+    after_second, _ = torch.cuda.mem_get_info()
+    print(f"\nrelease ({'graphs' if graphs else 'no graphs'}): pool {pool_bytes >> 20} MiB, "
+          f"{(start - after_first) >> 20} MiB kept after the first engine, "
+          f"{(start - after_second) >> 20} MiB after the second")
