@@ -1781,6 +1781,43 @@ class ContinuousBatchingEngine:
         if torch.device(self.device).type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
+            self._report_survivors()
+
+    def _report_survivors(self, floor_bytes: int = 32 << 20) -> None:
+        """Name what is still resident after release(): large CUDA tensors and who holds them.
+
+        Printed, not raised: the model's own weights legitimately survive. The point is
+        the next line in the log when a pool does not come back, so the holder is read
+        from the run rather than guessed at from the source.
+        """
+        import gc
+
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        free, _ = torch.cuda.mem_get_info(torch.device(self.device))
+        weights = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        weights += sum(b.numel() * b.element_size() for b in self.model.buffers())
+        print(f"[engine] released: allocated {allocated / 1e9:.2f} GB (weights {weights / 1e9:.2f}), "
+              f"reserved {reserved / 1e9:.2f} GB, device free {free / 1e9:.2f} GB")
+        if allocated - weights < floor_bytes * 4:
+            return
+        params = {id(p) for p in self.model.parameters()} | {id(b) for b in self.model.buffers()}
+        survivors = []
+        for obj in gc.get_objects():
+            try:
+                if (isinstance(obj, torch.Tensor) and obj.is_cuda and id(obj) not in params
+                        and obj.untyped_storage().nbytes() >= floor_bytes):
+                    survivors.append(obj)
+            except Exception:  # noqa: BLE001 - exotic tensor subclasses during a GC walk
+                continue
+        survivors.sort(key=lambda t: -t.untyped_storage().nbytes())
+        total = sum(t.untyped_storage().nbytes() for t in survivors)
+        print(f"[engine] {len(survivors)} CUDA tensors >= {floor_bytes >> 20} MiB survive release, "
+              f"{total / 1e9:.2f} GB in all")
+        for tensor in survivors[:6]:
+            holders = [type(r).__name__ for r in gc.get_referrers(tensor) if r is not survivors][:5]
+            print(f"[engine]   {tuple(tensor.shape)} {str(tensor.dtype).removeprefix('torch.')} "
+                  f"{tensor.untyped_storage().nbytes() >> 20} MiB held by {holders}")
 
     def graph_replay_report(self) -> dict:
         """Which captured graphs earn their memory, and which shapes were captured live.

@@ -593,7 +593,7 @@ def main() -> int:
             continue
         engine.warmup()  # the gate checks tokens, not first-use cost; always warm here
         identity[label] = engine.generate(IDENTITY_PROMPTS, max_new_tokens=48)
-        engine.release()
+        engine.release()   # prints what survives; the next engine is sized from what is free
         del engine
     labels = list(makers)
     if len(labels) < 2:
