@@ -44,7 +44,7 @@ def main() -> int:
                "gate": gate, "repeats": r.get("repeats")}
         for m in KEY:
             row[m.split(".")[-1]] = r["comparison"].get(m, "")
-        base = r["arm_settings"][0]
+        base = list(r["arm_settings"])[0]
         summary = r["arms"][base]["summary"]
         row["baseline_itl_p50_ms"] = round(summary["latency.itl_p50"]["median"], 1)
         row["baseline_decode_step_ms"] = round(summary["step_timing.decode_step_p50_ms"]["median"], 1)
