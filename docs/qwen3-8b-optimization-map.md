@@ -238,3 +238,55 @@ sm_80), so the comparison is fair in both directions and worth running at matche
 
 Every prediction above is falsifiable by one setting in `benchmarks/reliability/ab.py`.
 Write the result beside the prediction, whichever way it goes.
+
+## 6. Measured, first pass (Kaggle T4, 2026-10-12)
+
+Everything above was written before the run. This is what the card said, in the order it
+said it; raw files under `results/sm75/qwen3-8b/`.
+
+### 6.1 The decode step is the W4A16 projection kernel, and the prediction had the wrong kernel
+
+The map budgeted the W4A16 FFN as a bandwidth sweep (§3.8: 15 ms of weights per step) and
+sent M ≥ 32 to cuBLAS because `tl.dot` is scalar FMA on sm_75. The first 8B A/B measured a
+**439 ms decode GPU step at a mean batch of 5.5** — 25× the sweep — and the per-projection
+benchmark (`benchmarks/kernels/w4a16_bench.py`, 36 layers + `lm_head` summed per step) put
+the `tl.dot` dequant-GEMV at **488 ms/step at M = 1**, at any tile. On this card that kernel
+is not bandwidth-bound at small M; it is FMA-bound at every M. Four kernel iterations later:
+
+| path, per decode step | M = 1 | M = 2 | M = 4 | M = 8 |
+|---|---:|---:|---:|---:|
+| packed-weight sweep floor, 258 GB/s | 18 | 18 | 18 | 18 |
+| fp16 cuBLAS over the same weights (reference; does not fit) | 65 | 73 | 74 | 74 |
+| `tl.dot` dequant-GEMV, the kernel the map assumed | 488 | 478 | 448 | 446 |
+| broadcast-`tl.sum` GEMV, m fastest in the grid, bn4/bk1024 | **47** | **79** | ~150 | ~290 |
+| dequant kernel into scratch + cuBLAS (`dense`) | 183 | 189 | **187** | **187** |
+
+- The GEMV is bound by per-byte arithmetic, not bytes: it scales +35 ms per row. Removing the
+  integer-to-float conversions (nibble OR'd into the mantissa of fp16 1024.0) bought 10%; a
+  dequantise-once 3D-product variant lost at every M (672 ms at M = 8; Triton compiles the
+  broadcast-reduce badly). `W4A16Linear` therefore routes M ≤ 3 to the GEMV and M ≥ 4 to the
+  dense path — the measured crossover, replacing the estimated 32.
+- The dense path is flat at 187 ms because the dequant kernel writes 15.1 GB of fp16 per
+  step (120 ms, 63% of the write bandwidth) before cuBLAS reads it (65 ms). That is the
+  prefill step's cost too: **201 ms per 128-token chunk**, dequant 60% of it.
+- Inside captured graphs the dense path must be one launch into a persistent scratch, not a
+  torch slab loop: with the loop, each fused graph's executable was ~10× larger and the two
+  gate engines left 3.66 GB of graph executables behind (`release()` diagnostics); with the
+  kernel, 1.09 GB, steady across engines.
+
+### 6.2 What §4 projected against what the first A/B measured (`fused_step`, chat, concurrency 8)
+
+| | projected (§4) | measured |
+|---|---:|---:|
+| decode step, batch ~6 | ~24 ms | 221 ms (dense path 187 + attention) |
+| decode-only step, batch ≤ 3 | ~18 ms | 47 ms (GEMV) |
+| prefill, 128-token chunk | ~50 ms (¼ of the 512 row) | 201 ms |
+| resident memory | 3.9 GB weights + pool | 11.9 GB used of 14.9; 4.56 GB pool = 32,448 KV tokens |
+| graphs | lean set | 103 captured (8 decode, 15 prefill, 80 fused), 1.09 GB |
+| identity gate | — | passes: both arms match the torch reference over the same packed weights, all prompts |
+| `fused_step` direction | flips to a win | +16% delivered tokens, ITL p99 −22%, TTFT −7%, ITL p50 flat (1 × 15 s) |
+
+The §4 table assumed a bandwidth-bound W4A16 GEMV that this card does not have from Triton.
+The structural predictions (fused step flips; graphs shrink in share) are the ones still
+being tested by the full plan.
+

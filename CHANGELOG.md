@@ -44,8 +44,17 @@ reference pinned by CPU tests and a CUDA test that runs on first boot; the gate 
   transients). FP8 CUDA tests skip below sm_89 for the engine's own reason (Triton has no
   `float8e4nv` there). INT8 recompute is held to the stock gate's horizon, not bit
   identity: prefill-shaped GEMM rounding flips an INT8 bin once in 96 tokens on T4.
+- **W4A16 decode kernels, measured on T4 at the 8B shapes** (`benchmarks/kernels/w4a16_bench.py`):
+  the `tl.dot` dequant-GEMV ran the decode step at 439 ms (488 ms/step at M = 1 in isolation,
+  FMA-bound at every M). Replaced for decode widths by a `tl.sum` GEMV with one row per
+  program and m fastest in the grid: 47 ms at M = 1, 79 at M = 2 (fp16 cuBLAS over the same
+  weights would be 65). `W4A16Linear` routes M ≤ 3 there and M ≥ 4 to a single-launch
+  dequant kernel into a persistent scratch + cuBLAS (flat 187 ms; the scratch also keeps
+  captured fused graphs at ~10 MiB each instead of ~45). Both kernels dequantise by mantissa
+  insertion, no int-to-float conversion. `ContinuousBatchingEngine.release()` returns the pool
+  and reports what survives; `ab.py` resolves `num_blocks="auto"` once per run.
 - `docs/qwen3-8b-optimization-map.md`: every stage of Qwen3-8B on a T4 with bytes, FLOPs
-  and a prediction per optimization, written before the run.
+  and a prediction per optimization, written before the run; §6 is what the card measured.
 
 ## v0.1.0-beta — 2026-09-24
 

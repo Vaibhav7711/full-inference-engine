@@ -1,0 +1,791 @@
+{
+  "model": {
+    "model_type": "qwen3",
+    "class": "Qwen3ForCausalLM",
+    "geometry": {
+      "num_layers": 36,
+      "hidden_size": 4096,
+      "num_q_heads": 32,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "vocab_size": 151936,
+      "max_position_embeddings": 40960,
+      "gqa_group": 4
+    },
+    "kv_bytes_per_token": 147456,
+    "mlp_modules": 36,
+    "norm_modules": 145,
+    "rope_module": "transformers.models.qwen3.modeling_qwen3",
+    "unsupported_reason": null
+  },
+  "backends": {
+    "device": "Tesla T4 (sm_75, 15.6 GB, 40 SMs, 4 MB L2)",
+    "measured": true,
+    "defaults": {
+      "decode_attention": "per_head",
+      "prefill_attention": "sdpa",
+      "dtype": "float16"
+    },
+    "reasons": {
+      "decode_attention": "T4 A/B: gqa 0.95-1.06x (L2 already dedups the group read)",
+      "prefill_attention": "T4 A/B: sdpa -40%/-66% step vs per_token; tiled has no mma.sync on sm_75",
+      "dtype": "Turing has no bf16 tensor cores",
+      "verify_attention": "unmeasured for verification on sm_75: in-place paged kernel, no prefix gather; A/B with `--setting verify_kernel`"
+    },
+    "decode_backends": [
+      {
+        "name": "flash",
+        "available": false,
+        "reason": "flash_attn is not installed (pip install flash-attn, sm_80+ wheels)",
+        "priority": 80,
+        "graph_safe": false,
+        "summary": "flash_attn_with_kvcache over the pages; splits internally, GQA native.",
+        "tags": [
+          "flash-attn",
+          "paged",
+          "sm80+"
+        ]
+      },
+      {
+        "name": "gqa",
+        "available": false,
+        "reason": "written for a GQA group of exactly 2, not 4",
+        "priority": 10,
+        "graph_safe": true,
+        "summary": "Triton, one program per (row, KV head), K/V tile shared by the group. Measured 0.95-1.06x on the T4: L2 already serves the second read.",
+        "tags": [
+          "triton",
+          "paged",
+          "negative-result"
+        ]
+      },
+      {
+        "name": "per_head",
+        "available": true,
+        "reason": null,
+        "priority": 50,
+        "graph_safe": true,
+        "summary": "Triton, one program per (row, query head); the measured baseline.",
+        "tags": [
+          "triton",
+          "paged",
+          "int8-capable"
+        ]
+      },
+      {
+        "name": "split_k",
+        "available": true,
+        "reason": null,
+        "priority": 20,
+        "graph_safe": true,
+        "summary": "Triton FlashDecoding: the key range split across programs, then merged. For small batches and long contexts, where the per-head grid is too narrow.",
+        "tags": [
+          "triton",
+          "paged",
+          "unmeasured"
+        ]
+      }
+    ],
+    "prefill_backends": [
+      {
+        "name": "flash",
+        "available": false,
+        "reason": "flash_attn is not installed (pip install flash-attn, sm_80+ wheels)",
+        "priority": 80,
+        "graph_safe": false,
+        "summary": "flash_attn_with_kvcache with causal=True over the pages: no gather, no mask.",
+        "tags": [
+          "flash-attn",
+          "paged",
+          "sm80+"
+        ]
+      },
+      {
+        "name": "flash_dense",
+        "available": false,
+        "reason": "flash_attn is not installed (pip install flash-attn, sm_80+ wheels)",
+        "priority": 45,
+        "graph_safe": false,
+        "summary": "Gather 16-token pages, then run dense flash_attn_func with native GQA.",
+        "tags": [
+          "flash-attn",
+          "gather",
+          "sm80+"
+        ]
+      },
+      {
+        "name": "per_token",
+        "available": true,
+        "reason": null,
+        "priority": 30,
+        "graph_safe": true,
+        "summary": "Triton, one program per (row, head, query token), reads pages in place. The only chunked path that works with an INT8 pool.",
+        "tags": [
+          "triton",
+          "paged",
+          "int8-capable"
+        ]
+      },
+      {
+        "name": "sdpa",
+        "available": true,
+        "reason": null,
+        "priority": 50,
+        "graph_safe": true,
+        "summary": "Gather the prefix pages, then torch SDPA (memory-efficient backend). The T4 default: -40%/-66% step vs per_token, token-identical to stock.",
+        "tags": [
+          "torch",
+          "gather"
+        ]
+      },
+      {
+        "name": "tiled",
+        "available": false,
+        "reason": "tl.dot does not reach the tensor cores on sm_75",
+        "priority": 40,
+        "graph_safe": true,
+        "summary": "Triton FlashAttention structure with tl.dot over paged K/V. Needs sm_80+ to reach the tensor cores; an explicit candidate gated by prefill_attention_ab.py --ptx-only and the RTX A/B.",
+        "tags": [
+          "triton",
+          "paged",
+          "sm80+"
+        ]
+      }
+    ]
+  },
+  "quantization": "w4a16",
+  "quantization_report": {
+    "replaced": 253,
+    "by_kind": {
+      "attention": 144,
+      "mlp": 108,
+      "lm_head": 1
+    },
+    "fp16_mib": 14435,
+    "packed_mib": 3722,
+    "ratio": 3.88,
+    "skipped": []
+  },
+  "warmup_s": 65.80222293099996,
+  "warmup": {
+    "rounds": 8,
+    "graphs": 8,
+    "prefill_graphs": 15,
+    "fused_graphs": 80,
+    "prefill_graph_unsupported": {},
+    "prefill_graph_eager_reason": null,
+    "decode_graph_eager_reason": null,
+    "prefill_sdpa_calls": 4,
+    "prefill_chunked_calls": 23
+  },
+  "captured_graphs": [
+    [
+      1,
+      64,
+      4
+    ],
+    [
+      1,
+      128,
+      4
+    ],
+    [
+      2,
+      64,
+      4
+    ],
+    [
+      2,
+      128,
+      4
+    ],
+    [
+      4,
+      64,
+      4
+    ],
+    [
+      4,
+      128,
+      4
+    ],
+    [
+      8,
+      64,
+      4
+    ],
+    [
+      8,
+      128,
+      4
+    ]
+  ],
+  "graph_replay_report": {
+    "captured": 103,
+    "replayed_keys": 1,
+    "never_replayed": 102,
+    "never_replayed_keys": [
+      [
+        "decode",
+        1,
+        64,
+        4
+      ],
+      [
+        "decode",
+        1,
+        128,
+        4
+      ],
+      [
+        "decode",
+        2,
+        64,
+        4
+      ],
+      [
+        "decode",
+        2,
+        128,
+        4
+      ],
+      [
+        "decode",
+        4,
+        64,
+        4
+      ],
+      [
+        "decode",
+        4,
+        128,
+        4
+      ],
+      [
+        "decode",
+        8,
+        128,
+        4
+      ],
+      [
+        "prefill",
+        1,
+        "sdpa",
+        256
+      ],
+      [
+        "prefill",
+        2,
+        "sdpa",
+        256
+      ],
+      [
+        "prefill",
+        4,
+        "sdpa",
+        256
+      ],
+      [
+        "prefill",
+        1,
+        "sdpa",
+        512
+      ],
+      [
+        "prefill",
+        1,
+        "sdpa",
+        1024
+      ],
+      [
+        "prefill",
+        1,
+        "sdpa",
+        2048
+      ],
+      [
+        "prefill",
+        1,
+        "sdpa",
+        4096
+      ],
+      [
+        "prefill",
+        2,
+        "sdpa",
+        512
+      ],
+      [
+        "prefill",
+        2,
+        "sdpa",
+        1024
+      ],
+      [
+        "prefill",
+        2,
+        "sdpa",
+        2048
+      ],
+      [
+        "prefill",
+        2,
+        "sdpa",
+        4096
+      ],
+      [
+        "prefill",
+        4,
+        "sdpa",
+        512
+      ],
+      [
+        "prefill",
+        4,
+        "sdpa",
+        1024
+      ],
+      [
+        "prefill",
+        4,
+        "sdpa",
+        2048
+      ],
+      [
+        "prefill",
+        4,
+        "sdpa",
+        4096
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        256,
+        64,
+        4
+      ],
+      [
+        "fused",
+        4,
+        2,
+        "sdpa",
+        256,
+        64,
+        4
+      ],
+      [
+        "fused",
+        8,
+        2,
+        "sdpa",
+        256,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        256,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        256,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        512,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        512,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        1024,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        1024,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        2048,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        2048,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        4096,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        1,
+        "sdpa",
+        4096,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        256,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        256,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        512,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        512,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        1024,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        1024,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        2048,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        2048,
+        128,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        4096,
+        64,
+        4
+      ],
+      [
+        "fused",
+        1,
+        2,
+        "sdpa",
+        4096,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        256,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        256,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        512,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        512,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        1024,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        1024,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        2048,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        2048,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        4096,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        1,
+        "sdpa",
+        4096,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        256,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        512,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        512,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        1024,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        1024,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        2048,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        2048,
+        128,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        4096,
+        64,
+        4
+      ],
+      [
+        "fused",
+        2,
+        2,
+        "sdpa",
+        4096,
+        128,
+        4
+      ]
+    ],
+    "replays_total": 7,
+    "lazy_captures": 0,
+    "lazy_capture_keys": []
+  },
+  "memory": {
+    "allocated_mib": 9623,
+    "reserved_mib": 10528,
+    "device_used_mib": 11889,
+    "device_total_mib": 14912,
+    "kv_pool_blocks": 2028,
+    "kv_pool_tokens": 32448,
+    "kv_pool_mib": 4563
+  },
+  "last_step_timing_ms": {
+    "host_stage_ms": 0.257,
+    "sync_ms": 218.105,
+    "decode_gpu_ms": 218.995
+  },
+  "git": {
+    "commit": "a96bb3c1a0c312d68c65bd2dae4d786ad08bc591",
+    "short": "a96bb3c",
+    "branch": "HEAD",
+    "dirty": false
+  },
+  "environment": {
+    "timestamp_utc": "2026-10-12T03:51:22.949443+00:00",
+    "hardware": {
+      "gpu": "Tesla T4",
+      "compute_capability": "7.5",
+      "multiprocessor_count": 40,
+      "total_memory_bytes": 15636037632,
+      "framework_bf16_supported": true,
+      "native_bf16_tensor_cores": false
+    },
+    "software": {
+      "python": "3.13.15",
+      "torch": "2.11.0+cu128",
+      "cuda": "12.8",
+      "transformers": "5.16.1",
+      "triton": "3.6.0"
+    }
+  },
+  "clocks": {
+    "clocks.sm": 1560.0,
+    "clocks.mem": 5000.0,
+    "clocks.max.sm": 1590.0,
+    "power.draw": 36.84,
+    "power.limit": 70.0,
+    "temperature.gpu": 78.0,
+    "clocks_throttle_reasons.active": "0x0000000000000004"
+  },
+  "problems": []
+}
