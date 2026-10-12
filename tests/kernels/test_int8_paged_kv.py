@@ -138,3 +138,56 @@ def test_int8_paged_prefill_stays_close_to_fp16() -> None:
     valid_reference = torch.cat([fp16[row, :, :length].reshape(-1) for row, length in enumerate(lengths.tolist())])
     relative_error = (valid.float() - valid_reference.float()).abs().mean() / valid_reference.float().abs().mean().clamp_min(1e-5)
     assert relative_error.item() < 0.03, f"INT8 paged prefill relative error {relative_error.item():.4f}"
+
+
+@cuda
+@requires_cuda
+def test_int8_chunked_prefill_replay_matches_fp16_pages_and_attention() -> None:
+    """The engine's chunked sequence, replayed on the kernels: three 16-token chunks of one
+    request (starts 0 / 16 / 32, the last partial) written with the INT8 and the fp16
+    prefill writers into the 0.6B's geometry, then INT8 paged prefill attention for the
+    second and third chunks against the fp16 kernel over the same content. The engine-level
+    localisation test saw 16-token-chunk INT8 pages reconstruct with 3.9x error while
+    single-chunk pages were fine; this says whether the kernels do it on their own.
+    """
+    from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
+    from engine.kernels.kv_write import write_prefill_kv_batched
+    from engine.kernels.paged_prefill import paged_prefill
+
+    torch.manual_seed(5)
+    q_heads, kv_heads, dim, block_size, blocks = 16, 8, 128, 16, 8
+    chunks = [(0, 16), (16, 16), (32, 13)]
+    total = 45
+    tables = torch.tensor([[5, 2, 7]], device="cuda", dtype=torch.int32)
+    key_all = torch.randn(1, kv_heads, total, dim, device="cuda", dtype=torch.float16)
+    value_all = torch.randn_like(key_all)
+    fp16_k = torch.zeros(blocks, block_size, kv_heads, dim, device="cuda", dtype=torch.float16)
+    fp16_v = torch.zeros_like(fp16_k)
+    int8_k = torch.zeros(blocks, block_size, kv_heads, dim, device="cuda", dtype=torch.int8)
+    int8_v = torch.zeros_like(int8_k)
+    ks = torch.zeros(blocks, block_size, kv_heads, device="cuda", dtype=torch.float16)
+    vs = torch.zeros_like(ks)
+    for start, length in chunks:
+        key = key_all[:, :, start:start + 16].contiguous()      # padded to the chunk width
+        value = value_all[:, :, start:start + 16].contiguous()
+        starts = torch.tensor([start], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
+        write_prefill_kv_batched(key, value, fp16_k, fp16_v, tables, lengths, starts)
+        write_prefill_int8_kv_batched(key, value, int8_k, int8_v, ks, vs, tables, lengths, starts)
+    torch.cuda.synchronize()
+    flat = lambda pages: pages[tables[0]].reshape(-1, kv_heads, dim)[:total].float()
+    for name, ref, q, sc in (("K", fp16_k, int8_k, ks), ("V", fp16_v, int8_v, vs)):
+        deq = (q[tables[0]].float() * sc[tables[0]].float()[..., None]).reshape(-1, kv_heads, dim)[:total]
+        per_token = ((deq - flat(ref)).abs() / flat(ref).abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax(dim=(1, 2))
+        print(f"\nchunked INT8 writer, {name} per-token error: {[round(e, 3) for e in per_token.tolist()]}")
+        assert per_token.max().item() < 0.02, f"{name}: INT8 pages wrong after chunked writes"
+
+    for start, length in chunks[1:]:
+        query = torch.randn(1, q_heads, 16, dim, device="cuda", dtype=torch.float16)
+        starts = torch.tensor([start], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
+        ref = paged_prefill(query, fp16_k, fp16_v, tables, starts, lengths)[0, :, :length].float()
+        out = paged_prefill_int8(query, int8_k, int8_v, ks, vs, tables, starts, lengths)[0, :, :length].float()
+        per_token = ((out - ref).abs() / ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax(dim=(0, 2))
+        print(f"INT8 paged prefill, chunk at {start}: per-token error vs fp16 {[round(e, 3) for e in per_token.tolist()]}")
+        assert per_token.max().item() < 0.05, f"INT8 prefill attention wrong for the chunk at {start}"

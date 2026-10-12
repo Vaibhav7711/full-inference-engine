@@ -1117,7 +1117,20 @@ def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
                 errors.append(((q - ref).abs() / scale).amax().item())
             worst[(chunk, which)] = max(errors)
             print(f"\nint8 {which} vs fp16 pages, chunk {chunk}: worst per-layer relative error "
-                  f"{max(errors):.4f} at layer {errors.index(max(errors))}; median {sorted(errors)[len(errors)//2]:.4f}")
+                  f"{max(errors):.4f} at layer {errors.index(max(errors))}; median {sorted(errors)[len(errors)//2]:.4f}; "
+                  f"layers 0-3: {[round(e, 4) for e in errors[:4]]}")
+            # Layer 0's K/V do not depend on attention: a bad layer 0 is the writer, a
+            # good layer 0 with a bad layer 1 is the INT8 prefill attention. Per position
+            # says which chunk (16-token chunks, 16-token blocks).
+            ref, q = got["fp16"][index][0], got["int8"][index][0]
+            scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+            per_token = ((q - ref).abs() / scale).amax(dim=(1, 2))
+            print(f"  layer 0 {which} per-token error: {[round(e, 3) for e in per_token.tolist()]}")
+            if engine_layers := len(got["fp16"][index]) > 1:
+                ref, q = got["fp16"][index][1], got["int8"][index][1]
+                scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+                per_token = ((q - ref).abs() / scale).amax(dim=(1, 2))
+                print(f"  layer 1 {which} per-token error: {[round(e, 3) for e in per_token.tolist()]}")
 
     reference, margins = _stock_reference(_LoadedShim(model, tok), list(IDENTITY_PROMPTS), 16)
     for chunk in (4096, 16):
