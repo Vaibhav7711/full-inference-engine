@@ -50,6 +50,8 @@ def main() -> int:
     parser.add_argument("--block-n", type=int, nargs="+", default=[64])
     parser.add_argument("--gemv", nargs="+", default=["4,1024,4", "8,512,4", "4,2048,4", "8,1024,2"],
                         help="GEMV configs as block_n,block_k,num_warps (M <= GEMV_MAX_ROWS)")
+    parser.add_argument("--dequant", nargs="+", default=["32,4", "128,4", "64,8", "64,2", "256,8", "16,2"],
+                        help="dequant kernel configs as block_n,num_warps (timed at the first M only)")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     from engine.kernels.w4a16_format import quantize_weight_w4_grouped
@@ -79,6 +81,11 @@ def main() -> int:
                         lambda: w4a16_gemv(x, packed, scales, None, block_n=bn, block_k=bk, num_warps=warps))
             scratch = dense_scratch(device, n, k)
             timings["dequant_only"] = _time(lambda: w4_dequantize_into(scratch, packed, scales))
+            if m == args.rows[0]:          # the dequant does not depend on M; sweep it once
+                for cfg in args.dequant:
+                    bn, warps = (int(v) for v in cfg.split(","))
+                    timings[f"dq_bn{bn}_w{warps}"] = _time(
+                        lambda: w4_dequantize_into(scratch, packed, scales, block_n=bn, num_warps=warps))
             timings["dense_dequant_cublas"] = _time(
                 lambda: F.linear(x, w4_dequantize_into(scratch, packed, scales)))
             floor_ms = packed_mib * 2**20 / 258e9 * 1e3
