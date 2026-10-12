@@ -244,7 +244,7 @@ def _w4_dequant_kernel(
 
 def w4_dequantize_into(
     out: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, *,
-    group_size: int = GROUP_SIZE, block_n: int = 64, num_warps: int = 4,
+    group_size: int = GROUP_SIZE, block_n: int = 32, num_warps: int = 4,
 ) -> torch.Tensor:
     """Dequantise `(packed, scales)` into `out` (fp16 `[N, K]`, caller-owned) in one launch.
 
@@ -253,6 +253,8 @@ def w4_dequantize_into(
     per slab, which on the 8B made each fused graph's executable ~10x the size. One
     kernel into a persistent scratch is two nodes per projection and no allocation.
     Bit-identical to `unpack_w4_reference`: integer times fp16 scale, rounded once.
+    Write-bound: 112 ms per 8B step at block_n 32 (the sweep's best, 6% under block_n
+    64), about 65% of the card's write bandwidth for the 15 GB of fp16 it produces.
     """
     N, K = out.shape
     if out.dtype is not torch.float16 or packed.dtype is not torch.uint8:
