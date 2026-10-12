@@ -1140,81 +1140,74 @@ def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
                 per_token = ((q - ref).abs() / scale).amax(dim=(1, 2))
                 print(f"  layer 1 {which} per-token error: {[round(e, 3) for e in per_token.tolist()]}")
 
-    # In situ: capture layer 0's attention inputs on the first 16-token chunk in both
-    # engines, and the INT8 kernel's output, then check (a) the INT8 engine hands the
-    # kernel the same query/key/scaling as the fp16 engine, (b) the kernel's in-situ output
-    # equals torch attention over that query and the dequantised pages.
+    # In situ, both engines, chunks of 16 and 128 on a ~300-token prompt: layer 0's
+    # attention output against torch over the fp16 key/value the engine passed in (INT8
+    # may differ by its ~1% quantisation, fp16 by nothing), and layer 1's query compared
+    # across engines. The INT8 kernel was already exact against torch in situ; this asks
+    # the same of the fp16 path, which was only ever assumed correct.
     import engine.batching.continuous_batching as cb
-    import engine.kernels.int8_paged_kv as int8_kernels
+    long_ids = tok(" ".join(IDENTITY_PROMPTS) * 6, return_tensors="pt").input_ids[0].tolist()
+    assert len(long_ids) > 128, len(long_ids)
+    original_attention = cb._prefill_attention
     captured = {}
-    original_attention, original_int8 = cb._prefill_attention, int8_kernels.paged_prefill_int8
 
     def spy_attention(ctx, layer_idx, query, key, value, scaling):
-        if layer_idx == 0 and "query" not in captured.setdefault(ctx.kv_dtype, {}):
-            captured[ctx.kv_dtype].update(query=query.detach().clone(), key=key.detach().clone(),
-                                          scaling=scaling, starts=ctx.start_positions.clone(),
-                                          chunk_lens=ctx.chunk_lens.clone())
-        return original_attention(ctx, layer_idx, query, key, value, scaling)
-
-    def spy_int8(query, kp, vp, ks, vs, tables, starts, chunk_lens, **kw):
-        out = original_int8(query, kp, vp, ks, vs, tables, starts, chunk_lens, **kw)
-        if "out" not in captured.setdefault("int8", {}):
-            captured["int8"].update(out=out.detach().clone(), kernel_query=query.detach().clone(),
-                                    kernel_kw=dict(kw), kernel_starts=starts.clone(),
-                                    kernel_chunk_lens=chunk_lens.clone(),
-                                    pages=(kp[tables[0]].clone(), vp[tables[0]].clone(),
-                                           ks[tables[0]].clone(), vs[tables[0]].clone()))
+        out = original_attention(ctx, layer_idx, query, key, value, scaling)
+        slot = captured.setdefault(ctx.kv_dtype, {})
+        if layer_idx in (0, 1) and layer_idx not in slot:
+            slot[layer_idx] = dict(query=query.detach().clone(), key=key.detach().clone(),
+                                   value=value.detach().clone(), scaling=scaling, out=out.detach().clone(),
+                                   width=int(ctx.chunk_lens[0]))
         return out
 
-    cb._prefill_attention, int8_kernels.paged_prefill_int8 = spy_attention, spy_int8
-    try:
+    def torch_attention(entry):
+        q, k, v = entry["query"][0].float(), entry["key"][0].float(), entry["value"][0].float()
+        group = q.shape[0] // k.shape[0]
+        k, v = k.repeat_interleave(group, dim=0), v.repeat_interleave(group, dim=0)
+        width = entry["width"]
+        scores = torch.einsum("hqd,hkd->hqk", q[:, :width], k[:, :width]) * entry["scaling"]
+        causal = torch.ones(width, width, device=q.device, dtype=torch.bool).tril()
+        return torch.einsum("hqk,hkd->hqd", scores.masked_fill(~causal[None], float("-inf")).softmax(-1), v[:, :width])
+
+    for chunk in (16, 128):
+        captured.clear()
+        cb._prefill_attention = spy_attention
+        try:
+            for dtype in ("int8", "fp16"):
+                eng = ContinuousBatchingEngine(
+                    model, tok, "cuda", num_blocks=256, block_size=16, max_active=1,
+                    prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
+                    kv_cache_dtype=dtype, prefix_cache_blocks=0,
+                )
+                request = _admit(eng, f"spy-{dtype}-{chunk}", long_ids, 4)
+                eng.prefill_chunks([(request, chunk)])
+                eng.release()
+        finally:
+            cb._prefill_attention = original_attention
         for dtype in ("int8", "fp16"):
-            eng = ContinuousBatchingEngine(
-                model, tok, "cuda", num_blocks=256, block_size=16, max_active=1,
-                prefill_chunk_size=16, max_prefill_tokens_per_iteration=16,
-                kv_cache_dtype=dtype, prefix_cache_blocks=0,
-            )
-            request = _admit(eng, f"spy-{dtype}", token_ids, 4)
-            eng.prefill_chunks([(request, 16)])
-            eng.release()
-    finally:
-        cb._prefill_attention, int8_kernels.paged_prefill_int8 = original_attention, original_int8
-    a, b = captured["int8"], captured["fp16"]
-    print(f"\nin situ, layer 0, first chunk: query equal across engines {torch.equal(a['query'], b['query'])}, "
-          f"key equal {torch.equal(a['key'], b['key'])}, scaling {a['scaling']} vs {b['scaling']}, "
-          f"starts {a['starts'].tolist()} vs {b['starts'].tolist()}, chunk_lens {a['chunk_lens'].tolist()} vs {b['chunk_lens'].tolist()}")
-    print(f"  kernel saw: query shape {tuple(a['kernel_query'].shape)} equal to engine query "
-          f"{torch.equal(a['kernel_query'], a['query'])}, kwargs {a['kernel_kw']}, starts {a['kernel_starts'].tolist()}, "
-          f"chunk_lens {a['kernel_chunk_lens'].tolist()}")
-    kp, vp, ks, vs = a["pages"]
-    kv_heads, dim = kp.shape[-2], kp.shape[-1]
-    k = (kp.float() * ks.float()[..., None]).reshape(-1, kv_heads, dim)[:16]
-    v = (vp.float() * vs.float()[..., None]).reshape(-1, kv_heads, dim)[:16]
-    q = a["kernel_query"][0].float()                                   # [q_heads, 16, dim]
-    group = q.shape[0] // kv_heads
-    k_h = k.permute(1, 0, 2).repeat_interleave(group, dim=0)           # [q_heads, 16, dim]
-    v_h = v.permute(1, 0, 2).repeat_interleave(group, dim=0)
-    scores = torch.einsum("hqd,hkd->hqk", q, k_h) * a["kernel_kw"].get("scale", dim ** -0.5)
-    causal = torch.ones(16, 16, device="cuda", dtype=torch.bool).tril()
-    ref = torch.einsum("hqk,hkd->hqd", scores.masked_fill(~causal[None], float("-inf")).softmax(-1), v_h)
-    got = a["out"][0].float()
-    err = ((got - ref).abs() / ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax(dim=(0, 2))
-    print(f"  INT8 kernel in-situ output vs torch over the captured query and pages, per token: {[round(e, 3) for e in err.tolist()]}")
-    key_from_engine = a["key"][0].float().permute(1, 0, 2)              # [16, kv_heads, dim]
-    page_err = ((k - key_from_engine).abs() / key_from_engine.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax().item()
-    print(f"  dequantised K pages vs the key the engine passed in: worst relative error {page_err:.4f}")
+            entry = captured[dtype][0]
+            ref = torch_attention(entry)
+            got = entry["out"][0, :, :entry["width"]].float()
+            err = ((got - ref).abs() / ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax(dim=(0, 2))
+            print(f"\nchunk {chunk}, {dtype} engine, layer 0 attention output vs torch over its own key/value, "
+                  f"per token (first 16): {[round(e, 3) for e in err.tolist()[:16]]}  worst {err.max().item():.3f}")
+        q8, q16 = captured["int8"][1]["query"][0].float(), captured["fp16"][1]["query"][0].float()
+        dq = ((q8 - q16).abs() / q16.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax(dim=(0, 2))
+        print(f"chunk {chunk}: layer 1 query, INT8 engine vs fp16 engine, per token (first 16): "
+              f"{[round(e, 3) for e in dq.tolist()[:16]]}")
 
     reference, margins = _stock_reference(_LoadedShim(model, tok), list(IDENTITY_PROMPTS), 16)
-    for chunk in (4096, 16):
-        eng = ContinuousBatchingEngine(
-            model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
-            prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
-            kv_cache_dtype="int8", prefix_cache_blocks=0,
-        )
-        outputs = eng.generate(list(IDENTITY_PROMPTS), max_new_tokens=16)
-        eng.release()
-        print(f"int8 greedy vs stock reference, chunk {chunk}: first divergence per prompt "
-              f"{_first_divergence(outputs, reference, margins)}")
+    for chunk in (4096, 128, 16):
+        for dtype in ("fp16", "int8"):
+            eng = ContinuousBatchingEngine(
+                model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
+                prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
+                kv_cache_dtype=dtype, prefix_cache_blocks=0,
+            )
+            outputs = eng.generate(list(IDENTITY_PROMPTS), max_new_tokens=16)
+            eng.release()
+            print(f"{dtype} greedy vs stock reference, chunk {chunk}: first divergence per prompt "
+                  f"{_first_divergence(outputs, reference, margins)}")
     # Per-token INT8 reconstruction is bounded by half a step of 127 per row max.
     for key, error in worst.items():
         assert error < 0.02, f"{key}: INT8 pages reconstruct with {error:.3f} relative error - layout fault"
