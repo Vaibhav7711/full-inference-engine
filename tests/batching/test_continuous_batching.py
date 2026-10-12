@@ -1065,161 +1065,94 @@ def test_release_lets_the_next_engine_take_the_same_auto_sized_pool(graphs):
 
 @cuda
 @requires_cuda
-def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
-    """Where INT8 KV goes wrong, if it does: the pages, the single-chunk path, or the
-    multi-chunk path. The 8B plan refused `kv_dtype`: int8 diverged at tokens 0-2 on three
-    prompts of four, and the 0.6B had shown the same at tokens 0/7/8/12. Per-token scales
-    put the reconstruction error at ~1/127 of the row max, which cannot move a decided
-    argmax at token 0, so a divergence there is a layout or indexing fault, not rounding.
-    This prints per-layer reconstruction error for K and V over a prompt prefetched in one
-    chunk and in 16-token chunks, and the first divergence per chunking.
+def test_per_token_kv_quantisation_is_unsound_for_qwen3_keys_and_the_engine_says_so():
+    """Why `kv_cache_dtype="int8"` fails the stock gate on Qwen3 (0.6B: tokens 0/7/8/12; 8B:
+    2/0/1/1), established on the engine's own layer-0 tensors rather than by reading kernels.
+
+    Qwen3's `k_norm` leaves a few key channels two orders of magnitude above the rest (0.6B
+    layer 0: 408 and 158 against a median channel of 4.8). Per-token absmax scaling then
+    has a step of ~3.2, 65% of K's components quantise to 0 or +-1, and attention over the
+    pages is wrong from the first token that attends to more than itself. The kernels are
+    exact for the scheme (in situ output equals torch over the dequantised pages to 4e-4);
+    the scheme is the fault. V is smooth and quantises fine; K needs per-channel scales
+    (KIVI-style) - measured here as 0.027 against 1.12 - and FP8 E4M3 per token has the
+    same disease (0.26). `docs/qwen3-8b-optimization-map.md` section 6.4.
     """
-    from benchmarks.reliability.ab import IDENTITY_PROMPTS, _first_divergence, _stock_reference
+    import engine.batching.continuous_batching as cb
+    from benchmarks.reliability.ab import IDENTITY_PROMPTS
     from engine.batching.continuous_batching import ContinuousBatchingEngine
 
     model, tok = _load()
-    prompt = IDENTITY_PROMPTS[0]
-    token_ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
+    token_ids = tok(IDENTITY_PROMPTS[0], return_tensors="pt").input_ids[0].tolist()
+    original, captured = cb._prefill_attention, {}
 
-    def pages(engine, request):
-        table = list(request.block_table)
-        length = request.allocation.sequence_length
-        keys, values = [], []
-        for layer in range(engine.num_layers):
-            k = engine.key_pool[layer][table].reshape(-1, engine.num_kv_heads, engine.head_dim)[:length]
-            v = engine.value_pool[layer][table].reshape(-1, engine.num_kv_heads, engine.head_dim)[:length]
-            if engine.key_scale_pool is not None:
-                ks = engine.key_scale_pool[layer][table].reshape(-1, engine.num_kv_heads)[:length]
-                vs = engine.value_scale_pool[layer][table].reshape(-1, engine.num_kv_heads)[:length]
-                k = k.float() * ks.float()[..., None]
-                v = v.float() * vs.float()[..., None]
-            keys.append(k.float()); values.append(v.float())
-        return keys, values
-
-    worst = {}
-    for chunk in (4096, 16):
-        got = {}
-        # INT8 first this time: in every failing run so far the INT8 engine was the second
-        # engine built on the shared model. A second fp16 engine is built last and compared
-        # with the first: if fp16 differs from fp16, the fault is state carried between
-        # engines (patches, contexts, release), not INT8.
-        for label, dtype in (("int8", "int8"), ("fp16", "fp16"), ("fp16_again", "fp16")):
-            eng = ContinuousBatchingEngine(
-                model, tok, "cuda", num_blocks=256, block_size=16, max_active=1,
-                prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
-                kv_cache_dtype=dtype, prefix_cache_blocks=0,
-            )
-            request = _admit(eng, f"{label}-{chunk}", token_ids, 4)   # > 1: keep the allocation live after prefill
-            while request.remaining_prefill_tokens:
-                eng.prefill_chunks([(request, min(chunk, request.remaining_prefill_tokens))])
-            got[label] = pages(eng, request)
-            eng.release()
-        for which, index in (("K", 0), ("V", 1)):
-            drift = max(((b - a).abs() / a.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax().item()
-                        for a, b in zip(got["fp16"][index], got["fp16_again"][index]))
-            print(f"\nfp16 engine #2 vs fp16 engine #1, {which} pages, chunk {chunk}: worst relative difference {drift:.4f}")
-        for which, index in (("K", 0), ("V", 1)):
-            errors = []
-            for layer, (ref, q) in enumerate(zip(got["fp16"][index], got["int8"][index])):
-                scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
-                errors.append(((q - ref).abs() / scale).amax().item())
-            worst[(chunk, which)] = max(errors)
-            print(f"\nint8 {which} vs fp16 pages, chunk {chunk}: worst per-layer relative error "
-                  f"{max(errors):.4f} at layer {errors.index(max(errors))}; median {sorted(errors)[len(errors)//2]:.4f}; "
-                  f"layers 0-3: {[round(e, 4) for e in errors[:4]]}")
-            # Layer 0's K/V do not depend on attention: a bad layer 0 is the writer, a
-            # good layer 0 with a bad layer 1 is the INT8 prefill attention. Per position
-            # says which chunk (16-token chunks, 16-token blocks).
-            ref, q = got["fp16"][index][0], got["int8"][index][0]
-            scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
-            per_token = ((q - ref).abs() / scale).amax(dim=(1, 2))
-            print(f"  layer 0 {which} per-token error: {[round(e, 3) for e in per_token.tolist()]}")
-            if engine_layers := len(got["fp16"][index]) > 1:
-                ref, q = got["fp16"][index][1], got["int8"][index][1]
-                scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
-                per_token = ((q - ref).abs() / scale).amax(dim=(1, 2))
-                print(f"  layer 1 {which} per-token error: {[round(e, 3) for e in per_token.tolist()]}")
-
-    # In situ, INT8 engine, layer 0, first chunk of 16: every tensor before and after the
-    # call. Two earlier captures disagreed - the kernel's output equalled torch over the
-    # dequantised pages (cloned before the call) yet differed from torch over key/value
-    # cloned after it - which reads as the INT8 path modifying its inputs in place.
-    import engine.batching.continuous_batching as cb
-    original_attention = cb._prefill_attention
-    captured = {}
-
-    def spy_attention(ctx, layer_idx, query, key, value, scaling):
-        before = (query.detach().clone(), key.detach().clone(), value.detach().clone())
-        out = original_attention(ctx, layer_idx, query, key, value, scaling)
-        if ctx.kv_dtype == "int8" and layer_idx == 0 and "out" not in captured:
+    def spy(ctx, layer_idx, query, key, value, scaling):
+        out = original(ctx, layer_idx, query, key, value, scaling)
+        if layer_idx == 0 and "out" not in captured:
             table = ctx.block_tables[0]
-            kp, vp = ctx.key_pool[0][table], ctx.value_pool[0][table]
-            ks, vs = ctx.key_scale_pool[0][table], ctx.value_scale_pool[0][table]
-            captured.update(before=before, after=(query.detach().clone(), key.detach().clone(), value.detach().clone()),
-                            out=out.detach().clone(), scaling=scaling, width=int(ctx.chunk_lens[0]),
+            kp, vp, ks, vs = (pool[0][table] for pool in (ctx.key_pool, ctx.value_pool, ctx.key_scale_pool, ctx.value_scale_pool))
+            captured.update(q=query[0].float(), k=key[0].float(), v=value[0].float(), out=out[0].float(),
+                            scaling=scaling, width=int(ctx.chunk_lens[0]),
                             k_deq=(kp.float() * ks.float()[..., None]).reshape(-1, kp.shape[-2], kp.shape[-1]),
                             v_deq=(vp.float() * vs.float()[..., None]).reshape(-1, vp.shape[-2], vp.shape[-1]))
         return out
 
-    def torch_attention(q, k, v, scaling, width):
-        q, k, v = q[0].float(), k[0].float(), v[0].float()
-        group = q.shape[0] // k.shape[0]
-        k, v = k.repeat_interleave(group, dim=0), v.repeat_interleave(group, dim=0)
-        scores = torch.einsum("hqd,hkd->hqk", q[:, :width], k[:, :width]) * scaling
-        causal = torch.ones(width, width, device=q.device, dtype=torch.bool).tril()
-        return torch.einsum("hqk,hkd->hqd", scores.masked_fill(~causal[None], float("-inf")).softmax(-1), v[:, :width])
-
-    def rel(a, b):
-        return ((a.float() - b.float()).abs() / b.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax().item()
-
-    cb._prefill_attention = spy_attention
+    cb._prefill_attention = spy
     try:
         eng = ContinuousBatchingEngine(
             model, tok, "cuda", num_blocks=256, block_size=16, max_active=1,
             prefill_chunk_size=16, max_prefill_tokens_per_iteration=16,
             kv_cache_dtype="int8", prefix_cache_blocks=0,
         )
-        request = _admit(eng, "spy-int8", token_ids, 4)
+        assert eng.kv_quantisation_warning, "the engine must say per-token K quantisation is unsound here"
+        request = _admit(eng, "int8", token_ids, 4)
         eng.prefill_chunks([(request, 16)])
         eng.release()
     finally:
-        cb._prefill_attention = original_attention
-    (q0, k0, v0), (q1, k1, v1) = captured["before"], captured["after"]
-    width, scaling, out = captured["width"], captured["scaling"], captured["out"]
-    print(f"\nINT8 in situ, layer 0: query modified in place {not torch.equal(q0, q1)}, key {not torch.equal(k0, k1)}, "
-          f"value {not torch.equal(v0, v1)}")
-    kd, vd = captured["k_deq"][:width], captured["v_deq"][:width]
-    print(f"  dequantised K pages vs key before {rel(kd, k0[0].permute(1, 0, 2)[:width]):.4f}, "
-          f"V pages vs value before {rel(vd, v0[0].permute(1, 0, 2)[:width]):.4f}")
-    got = out[0, :, :width]
-    print(f"  out vs torch(query, key, value before): {rel(got, torch_attention(q0, k0, v0, scaling, width)):.4f}")
-    kd_h = kd.permute(1, 0, 2)[None]; vd_h = vd.permute(1, 0, 2)[None]
-    print(f"  out vs torch(query, dequantised pages): {rel(got, torch_attention(q0, kd_h, vd_h, scaling, width)):.4f}")
-    print(f"  out shape {tuple(out.shape)}, query shape {tuple(q0.shape)}, out stride {out.stride()}, "
-          f"out is_contiguous {out.is_contiguous()}")
-    import os
-    dump = os.environ.get("RUN")
-    if dump:
-        torch.save({"q": q0.cpu(), "k": k0.cpu(), "v": v0.cpu(), "out": out.cpu(), "k_deq": captured["k_deq"].cpu(),
-                    "v_deq": captured["v_deq"].cpu(), "scaling": scaling, "width": width},
-                   os.path.join(dump, "int8_layer0_capture.pt"))
-        print(f"  saved tensors to {dump}/int8_layer0_capture.pt")
+        cb._prefill_attention = original
+    w, sc = captured["width"], captured["scaling"]
+    q, k, v = captured["q"][:, :w], captured["k"][:, :w], captured["v"][:, :w]
 
-    reference, margins = _stock_reference(_LoadedShim(model, tok), list(IDENTITY_PROMPTS), 16)
-    for chunk in (4096, 128, 16):
-        for dtype in ("fp16", "int8"):
-            eng = ContinuousBatchingEngine(
-                model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
-                prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
-                kv_cache_dtype=dtype, prefix_cache_blocks=0,
-            )
-            outputs = eng.generate(list(IDENTITY_PROMPTS), max_new_tokens=16)
-            eng.release()
-            print(f"{dtype} greedy vs stock reference, chunk {chunk}: first divergence per prompt "
-                  f"{_first_divergence(outputs, reference, margins)}")
-    # Per-token INT8 reconstruction is bounded by half a step of 127 per row max.
-    for key, error in worst.items():
-        assert error < 0.02, f"{key}: INT8 pages reconstruct with {error:.3f} relative error - layout fault"
+    def attention(k_, v_):
+        g = q.shape[0] // k_.shape[0]
+        kk, vv = k_.repeat_interleave(g, 0), v_.repeat_interleave(g, 0)
+        scores = torch.einsum("hqd,hkd->hqk", q, kk) * sc
+        causal = torch.ones(w, w, device=q.device, dtype=torch.bool).tril()
+        return torch.einsum("hqk,hkd->hqd", scores.masked_fill(~causal[None], float("-inf")).softmax(-1), vv)
+
+    def per_token(x):
+        step = x.abs().amax(-1, keepdim=True).clamp_min(1e-8) / 127
+        return torch.round(x / step).clamp(-127, 127) * step
+
+    def per_channel(x, group=16):
+        out = x.clone()
+        for t0 in range(0, x.shape[1], group):
+            step = x[:, t0:t0 + group].abs().amax(1, keepdim=True).clamp_min(1e-8) / 127
+            out[:, t0:t0 + group] = torch.round(x[:, t0:t0 + group] / step).clamp(-127, 127) * step
+        return out
+
+    reference = attention(k, v)
+    err = lambda o: ((o - reference).abs() / reference.abs().amax(-1, keepdim=True).clamp_min(1e-6)).amax().item()
+    channel_max = k.abs().amax(dim=(0, 1))
+    outlier_ratio = (channel_max.max() / channel_max.median()).item()
+    destroyed = ((k.abs() / (k.abs().amax(-1, keepdim=True) / 127)) <= 1).float().mean().item()
+    pages = attention(captured["k_deq"][:w].permute(1, 0, 2), captured["v_deq"][:w].permute(1, 0, 2))
+    results = {
+        "K outlier ratio (max channel / median channel)": round(outlier_ratio, 1),
+        "fraction of K components at |q| <= 1 under per-token INT8": round(destroyed, 3),
+        "attention error, K and V per-token INT8 (engine scheme)": round(err(attention(per_token(k), per_token(v))), 4),
+        "attention error, kernel output in situ": round(err(captured["out"][:, :w]), 4),
+        "attention error, kernel output vs torch over its own pages": round(
+            ((captured["out"][:, :w] - pages).abs() / pages.abs().amax(-1, keepdim=True).clamp_min(1e-6)).amax().item(), 4),
+        "attention error, V per-token INT8 only": round(err(attention(k, per_token(v))), 4),
+        "attention error, K per-channel INT8 (16-token groups) + V per-token": round(err(attention(per_channel(k), per_token(v))), 4),
+    }
+    print("\n" + "\n".join(f"  {name}: {value}" for name, value in results.items()))
+    assert outlier_ratio > 20, "the premise: Qwen3 keys have outlier channels"
+    assert results["attention error, kernel output vs torch over its own pages"] < 0.01, "the kernel is exact for its scheme"
+    assert results["attention error, K and V per-token INT8 (engine scheme)"] > 0.1, "per-token INT8 K is the fault"
+    assert results["attention error, V per-token INT8 only"] < 0.02
+    assert results["attention error, K per-channel INT8 (16-token groups) + V per-token"] < 0.05
 
 
 class _LoadedShim:

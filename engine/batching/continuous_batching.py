@@ -650,6 +650,22 @@ class ContinuousBatchingEngine:
         else:
             dtype = next(model.parameters()).dtype
         element_bytes = 1 if kv_cache_dtype in {"int8", "fp8"} else torch.finfo(dtype).bits // 8
+        # Per-token absmax scaling of K is unsound for models with a key norm: Qwen3's
+        # k_norm leaves a few key channels ~100x the rest (0.6B layer 0: 408 and 158 vs a
+        # median of 4.8), the INT8 step is then ~3 and 65% of K's components quantise to
+        # 0 or +-1; FP8 E4M3 per token loses the small channels the same way. Measured on
+        # the engine's own tensors: attention error 1.12 against 0.0075 for V alone and
+        # 0.027 with per-channel K scales (docs/qwen3-8b-optimization-map.md, 6.4). The
+        # pool is still built - the A/B gate is what refuses - but the reason is on record.
+        self.kv_quantisation_warning = None
+        if kv_cache_dtype in {"int8", "fp8"} and any(
+                name.endswith("k_norm.weight") for name, _ in model.named_parameters()):
+            self.kv_quantisation_warning = (
+                f"kv_cache_dtype={kv_cache_dtype!r} scales K per token, and this model has a key "
+                f"norm (k_norm): a few key channels dominate the per-token absmax and the rest "
+                f"quantise to nothing. Expect the stock-token gate to fail. K needs per-channel "
+                f"scales here (not implemented); V per token is fine.")
+            print(f"[engine] WARNING {self.kv_quantisation_warning}")
         # Refuse a pool that cannot be allocated, with the arithmetic, rather than letting
         # `torch.zeros` raise a CUDA OOM whose message names neither the cause nor the fix.
         # The documented default (num_blocks=4096, block_size=16) is 7.5 GB of KV for

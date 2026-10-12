@@ -308,7 +308,7 @@ another's chunks). Long profile: ~1,800-token prompts, TTFT ~22 s.
 | `triton_rmsnorm` chat | shrinks ~3× in share | −2.8% ITL (±1.7%), decode −1.7%, prefill −1.6% | As predicted. |
 | `triton_rope`, `triton_swiglu` | unresolved | unresolved | As predicted. |
 | `decode_split_k` long | batch-1 / long only | unresolved at batch 4, 1.7k context | Consistent; batch 1 was not in the plan. |
-| `kv_dtype` long | INT8 resolves | **refused by the stock gate**: int8 diverges at tokens 2/0/1/1 | A fault, not rounding: per-token INT8 cannot move a decided argmax at token 0. The 0.6B showed it too (0/7/8/12). Localisation test added. |
+| `kv_dtype` long | INT8 resolves | **refused by the stock gate**: int8 diverges at tokens 2/0/1/1 | Not a kernel fault: per-token K quantisation is unsound for QK-norm models. §6.4. |
 
 Follow-ups from the same session (`results/sm75/qwen3-8b/plan/`, same protocol):
 
@@ -323,4 +323,45 @@ predicted way with larger magnitudes than at 0.6B. The absolute level — 18 tok
 concurrency 8 — is set by the dense path's 120 ms dequant on every step at M ≥ 4 and on
 every prefill chunk; §6.1 has the kernel table. The two cheapest follow-ups are a larger
 prefill chunk and exact-row graph buckets; both are one A/B each.
+
+### 6.4 Why quantised KV fails on Qwen3, measured on the engine's own tensors
+
+The plan's `kv_dtype` arm was refused by the stock gate on the 8B (divergence at tokens
+2/0/1/1) as it had been on the 0.6B (0/7/8/12). Eight localisation runs later, the kernels
+were exact at every step - writer, paged prefill attention, decode attention, each against a
+torch reference, and the INT8 prefill output in situ equals torch over its own dequantised
+pages to 4e-4 - and the fault is the scheme. Layer 0 of the 0.6B, first 16 tokens of a prompt
+(`tests/batching/test_continuous_batching.py::test_per_token_kv_quantisation_is_unsound_for_qwen3_keys_and_the_engine_says_so`):
+
+| | |
+|---|---:|
+| K per-channel absmax, top channels | 408, 158, 28, 12, 12, 11 |
+| K median channel absmax | 4.8 |
+| per-token INT8 step (absmax / 127) | ~3.2 |
+| fraction of K components quantised to 0 or ±1 | **65%** |
+| V absmax | 1.4 |
+
+Attention output error against fp16, same query, same 16 tokens (max over heads and tokens, relative to the row max):
+
+| scheme | error |
+|---|---:|
+| K and V per-token INT8 (the engine's INT8 path) | **1.12** |
+| the INT8 kernel's output recorded in situ | 1.12 (identical: the kernel is exact for its scheme) |
+| V per-token INT8, K fp16 | 0.0075 |
+| K per-channel INT8 over 16-token groups (KIVI), V per-token | **0.027** |
+| K and V FP8 E4M3 per-token (the sm_89 path) | 0.26 |
+
+Qwen3's `k_norm` scales key channels by a learned per-channel weight and leaves two of them
+two orders of magnitude above the rest; a per-token absmax scale is set by those two and the
+other 126 channels - which carry most of the dot product - round away. The scores are
+large (|q|·|k| in the hundreds before the 1/√d), so the softmax is sharp and any key error
+of that size picks different tokens. That is why the single-chunk path only drifted at tokens
+7-8 (prefill attention ran on fp16 states through SDPA; only decode read INT8 pages) while
+the chunked path was wrong at token 0 (prefill attention read the pages).
+
+Consequences for the map: §3.5/§3.6's "INT8 KV halves the KV bytes" holds for V and not for
+K on this family; the sound version is per-channel K scales over a token group - a writer and
+two attention kernels with a `[blocks, heads, head_dim]`-per-group scale layout - which is the
+follow-up, not a parameter. The 0.6B attribution's "INT8 unresolved" was this too. The engine
+now says so at construction (`kv_quantisation_warning`) for any model with a `k_norm`.
 

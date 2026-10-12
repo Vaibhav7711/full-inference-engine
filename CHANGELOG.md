@@ -53,6 +53,12 @@ reference pinned by CPU tests and a CUDA test that runs on first boot; the gate 
   captured fused graphs at ~10 MiB each instead of ~45). Both kernels dequantise by mantissa
   insertion, no int-to-float conversion. `ContinuousBatchingEngine.release()` returns the pool
   and reports what survives; `ab.py` resolves `num_blocks="auto"` once per run.
+- **Per-token KV quantisation is unsound for QK-norm models** (`kv_cache_dtype="int8"`/`"fp8"`
+  on Qwen3): the kernels are exact, the scheme is not - Qwen3's `k_norm` leaves two key channels
+  ~100x the rest, 65% of K's components quantise to 0 or ±1 and attention is wrong from the first
+  token that attends to more than itself (error 1.12 vs 0.0075 for V alone, 0.027 with
+  per-channel K scales). The engine warns at construction (`kv_quantisation_warning`); the A/B
+  gate keeps refusing it. Measured in `docs/qwen3-8b-optimization-map.md` §6.4.
 - `docs/qwen3-8b-optimization-map.md`: every stage of Qwen3-8B on a T4 with bytes, FLOPs
   and a prediction per optimization, written before the run; §6 is what the card measured.
 
