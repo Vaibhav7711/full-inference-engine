@@ -96,10 +96,10 @@ class W4A16Linear(nn.Module):
         self.reference = False
         # Rows at or above this go to cuBLAS over a tile the Triton dequant kernel writes
         # into a persistent scratch; below it the dequant-GEMV runs. Measured on T4 at
-        # the 8B shapes (benchmarks/kernels/w4a16_bench.py): the GEMV is 52 ms/step at
-        # M = 1 and ~43 ms per further row (bound by per-byte arithmetic, sm_75 has no
-        # tensor-core path from Triton), the dense path is flat at ~187 ms, so they cross
-        # at M = 3. The read bytes saved by 4-bit weights are the same on both paths.
+        # the 8B shapes (benchmarks/kernels/w4a16_bench.py): the GEMV is 47 ms/step at
+        # M = 1, 79 at M = 2, ~35 ms per further row (bound by per-byte arithmetic; sm_75
+        # has no tensor-core path from Triton), the dense path is flat at ~187 ms, so
+        # they cross at M = 4. The read bytes saved by 4-bit weights are the same on both.
         self.dense_threshold = GEMV_MAX_ROWS + 1
         factory = {"device": device}
         self.register_buffer("packed", torch.empty(out_features, in_features // 2, dtype=torch.uint8, **factory))

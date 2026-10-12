@@ -179,13 +179,14 @@ def _w4a16_gemv_kernel(
 
 def w4a16_gemv(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
                bias: torch.Tensor | None = None, *, group_size: int = GROUP_SIZE,
-               block_n: int = 8, block_k: int = 1024, num_warps: int = 4) -> torch.Tensor:
+               block_n: int = 4, block_k: int = 1024, num_warps: int = 4) -> torch.Tensor:
     """The decode-width path: `inputs [M <= GEMV_MAX_ROWS, K]` x packed weights, no `tl.dot`.
 
-    T4, 8B shapes: 52 ms/step at M = 1 (fp16 cuBLAS over the same weights would be 65)
-    and about 43 ms more per extra row - the kernel is bound by per-byte arithmetic,
-    not bandwidth - so from M = 3 the dense path (dequant kernel + cuBLAS, flat at any
-    M) is cheaper and `w4a16_linear` routes there. The defaults are the measured best.
+    T4, 8B shapes, per step: 47 ms at M = 1 (fp16 cuBLAS over the same weights would
+    be 65), 79 ms at M = 2, about +35 ms per further row - bound by per-byte arithmetic,
+    not bandwidth - while the dense path (dequant kernel + cuBLAS) is flat at 187 ms,
+    so from M = 4 W4A16Linear routes there. The defaults are the measured best
+    (benchmarks/kernels/w4a16_bench.py, Triton 3.6, torch 2.11).
     """
     M, K = inputs.shape
     N = packed.shape[0]

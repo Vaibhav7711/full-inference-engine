@@ -24,7 +24,7 @@ import torch
 GROUP_SIZE = 128
 # Decode rows served by the dequant-GEMV; above this W4A16Linear takes cuBLAS over a
 # dequantised tile (measured crossover on T4 at the 8B shapes, see w4a16_linear).
-GEMV_MAX_ROWS = 2
+GEMV_MAX_ROWS = 3
 Q_MAX = 7.0
 OFFSET = 8
 

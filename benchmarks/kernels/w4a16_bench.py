@@ -46,7 +46,7 @@ def _time(fn, iters: int = 20) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, nargs="+", default=[1, 2, 4, 8, 32, 128])
+    parser.add_argument("--rows", type=int, nargs="+", default=[1, 2, 3, 4, 8, 32, 128])
     parser.add_argument("--block-n", type=int, nargs="+", default=[64])
     parser.add_argument("--gemv", nargs="+", default=["4,1024,4", "8,512,4", "4,2048,4", "8,1024,2"],
                         help="GEMV configs as block_n,block_k,num_warps (M <= GEMV_MAX_ROWS)")

@@ -30,8 +30,8 @@ def w4():
 
 @cuda
 @requires_cuda
-@pytest.mark.parametrize("shape, path", [((1, 2), "kernel"), ((2, 24), "dense")],
-                         ids=["M=2 triton GEMV", "M=48 cuBLAS over dequantised fp16"])
+@pytest.mark.parametrize("shape, path", [((1, 3), "kernel"), ((2, 24), "dense")],
+                         ids=["M=3 triton GEMV", "M=48 cuBLAS over dequantised fp16"])
 def test_installed_path_agrees_with_torch_over_the_same_packed_weights(w4, shape, path):
     from engine.quantization.w4a16 import kernel_available, reference_mode, w4a16_modules
 
