@@ -168,31 +168,107 @@ def _w4a16_gemv_kernel(
     tl.store(out_ptr + m * stride_om + offs_n * stride_on, acc.to(out_ptr.dtype.element_ty), mask=n_mask)
 
 
+@triton.jit
+def _w4a16_gemv_rows_kernel(
+    x_ptr, w_ptr, scale_ptr, bias_ptr, out_ptr,
+    M, N, K,
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_sn, stride_sg,
+    stride_om, stride_on,
+    HAS_BIAS: tl.constexpr, M_PAD: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP: tl.constexpr, ZERO: tl.constexpr,
+):
+    """2 <= M <= 8 rows at once: dequantise a [BLOCK_N, BLOCK_K] tile once, apply to all rows.
+
+    The one-row kernel re-dequantises per row, and at M = 8 that arithmetic (about 60
+    ops per weight) is what bounds a T4, not bandwidth: 293 ms/step measured. Here the
+    product `x[m, k] * w[n, k]` is formed as a [M_PAD, BLOCK_N, BLOCK_K/2] fp32 tile and
+    reduced over k, so the tile must stay small: 8 x 8 x 64 is 4K registers' worth. The
+    first version of this idea used 16-64 rows x 64 and spilled.
+    """
+    pid_n = tl.program_id(0)
+    HALF: tl.constexpr = GROUP // 2
+    HALF_K: tl.constexpr = BLOCK_K // 2
+    offs_m = tl.arange(0, M_PAD)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_j = tl.arange(0, HALF_K)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    group_in_chunk = offs_j // HALF
+    slot = offs_j % HALF
+    acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+    for chunk in range(0, K // BLOCK_K):
+        k0 = chunk * BLOCK_K
+        g0 = chunk * (BLOCK_K // GROUP)
+        packed = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + (chunk * HALF_K + offs_j[None, :]) * stride_wk,
+            mask=n_mask[:, None], other=ZERO,
+        )
+        scale = tl.load(
+            scale_ptr + offs_n[:, None] * stride_sn + (g0 + group_in_chunk[None, :]) * stride_sg,
+            mask=n_mask[:, None], other=0.0,
+        )
+        k_lo = k0 + group_in_chunk * GROUP + slot                                     # [HALF_K]
+        x_lo = tl.load(x_ptr + offs_m[:, None] * stride_xm + k_lo[None, :] * stride_xk,
+                       mask=m_mask[:, None], other=0.0).to(tl.float32)             # [M_PAD, HALF_K]
+        x_hi = tl.load(x_ptr + offs_m[:, None] * stride_xm + (k_lo[None, :] + HALF) * stride_xk,
+                       mask=m_mask[:, None], other=0.0).to(tl.float32)
+        w_lo = (((packed & 0x0F).to(tl.int8) - ZERO).to(tl.float16) * scale).to(tl.float32)
+        w_hi = (((packed >> 4).to(tl.int8) - ZERO).to(tl.float16) * scale).to(tl.float32)
+        acc += tl.sum(x_lo[:, None, :] * w_lo[None, :, :], axis=2)
+        acc += tl.sum(x_hi[:, None, :] * w_hi[None, :, :], axis=2)
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
+    tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+             acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None] & n_mask[None, :])
+
+
 GEMV_MAX_ROWS = 8
 
 
 def w4a16_gemv(inputs: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
                bias: torch.Tensor | None = None, *, group_size: int = GROUP_SIZE,
-               block_n: int = 16, block_k: int = 1024, num_warps: int = 4) -> torch.Tensor:
-    """The decode-width path: `inputs [M <= 8, K]` x packed weights, no `tl.dot`."""
+               block_n: int | None = None, block_k: int | None = None, num_warps: int | None = None,
+               rows_kernel: bool | None = None) -> torch.Tensor:
+    """The decode-width path: `inputs [M <= 8, K]` x packed weights, no `tl.dot`.
+
+    M = 1 takes the one-row kernel (T4, 8B shapes: 54 ms/step at block_n 8, block_k
+    1024); 2 <= M <= 8 the rows kernel, which dequantises each tile once. The defaults
+    are the measured ones; the keyword overrides exist for the benchmark.
+    """
     M, K = inputs.shape
     N = packed.shape[0]
     if M > GEMV_MAX_ROWS:
         raise ValueError(f"w4a16_gemv serves M <= {GEMV_MAX_ROWS}; got {M}")
     if K % group_size or packed.shape != (N, K // 2) or scales.shape != (N, K // group_size):
         raise ValueError("packed/scales do not match inputs with this group size")
+    use_rows = (M > 1) if rows_kernel is None else rows_kernel
+    if block_n is None:
+        block_n = 8
+    if block_k is None:
+        block_k = 128 if use_rows else 1024
+    if num_warps is None:
+        num_warps = 4
     block_k = min(block_k, K)
     if block_k % group_size or K % block_k:
         raise ValueError(f"block_k {block_k} must be a multiple of the group and divide K={K}")
     output = torch.empty((M, N), dtype=inputs.dtype, device=inputs.device)
-    _w4a16_gemv_kernel[(M, triton.cdiv(N, block_n))](
-        inputs, packed, scales, bias if bias is not None else output, output,
-        N, K,
-        inputs.stride(0), inputs.stride(1), packed.stride(0), packed.stride(1),
-        scales.stride(0), scales.stride(1), output.stride(0), output.stride(1),
-        HAS_BIAS=bias is not None, BLOCK_N=block_n, BLOCK_K=block_k,
-        GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
-    )
+    common = (inputs, packed, scales, bias if bias is not None else output, output)
+    strides = (inputs.stride(0), inputs.stride(1), packed.stride(0), packed.stride(1),
+               scales.stride(0), scales.stride(1), output.stride(0), output.stride(1))
+    if use_rows:
+        _w4a16_gemv_rows_kernel[(triton.cdiv(N, block_n),)](
+            *common, M, N, K, *strides,
+            HAS_BIAS=bias is not None, M_PAD=max(2, triton.next_power_of_2(M)),
+            BLOCK_N=block_n, BLOCK_K=block_k, GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
+        )
+    else:
+        _w4a16_gemv_kernel[(M, triton.cdiv(N, block_n))](
+            *common, N, K, *strides,
+            HAS_BIAS=bias is not None, BLOCK_N=block_n, BLOCK_K=block_k,
+            GROUP=group_size, ZERO=OFFSET, num_warps=num_warps,
+        )
     return output
 
 @triton.jit

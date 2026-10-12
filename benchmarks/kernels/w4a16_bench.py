@@ -46,10 +46,13 @@ def _time(fn, iters: int = 20) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, nargs="+", default=[1, 8, 32, 128])
+    parser.add_argument("--rows", type=int, nargs="+", default=[1, 2, 4, 8, 32, 128])
     parser.add_argument("--block-n", type=int, nargs="+", default=[64])
-    parser.add_argument("--gemv", nargs="+", default=["16,1024,4", "32,1024,4", "16,2048,4", "32,512,8", "8,1024,4"],
-                        help="GEMV configs as block_n,block_k,num_warps")
+    parser.add_argument("--gemv", nargs="+", default=["row,8,1024,4", "row,8,512,4", "row,4,1024,4", "row,8,1024,2"],
+                        help="M=1 configs as kind,block_n,block_k,num_warps (kind: row|rows)")
+    parser.add_argument("--gemv-rows", nargs="+",
+                        default=["rows,8,128,4", "rows,8,256,4", "rows,16,128,4", "rows,8,128,2", "row,8,1024,4"],
+                        help="2 <= M <= 8 configs as kind,block_n,block_k,num_warps")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     from engine.kernels.w4a16_format import quantize_weight_w4_grouped
@@ -72,10 +75,13 @@ def main() -> int:
                 timings[f"triton_dot_bn{block_n}"] = _time(
                     lambda: w4a16_linear(x, packed, scales, None, block_n=block_n, kernel="dot"))
             if m <= GEMV_MAX_ROWS:
-                for cfg in args.gemv:
-                    bn, bk, warps = (int(v) for v in cfg.split(","))
-                    timings[f"gemv_bn{bn}_bk{bk}_w{warps}"] = _time(
-                        lambda: w4a16_gemv(x, packed, scales, None, block_n=bn, block_k=bk, num_warps=warps))
+                timings["gemv_default"] = _time(lambda: w4a16_gemv(x, packed, scales, None))
+                for cfg in (args.gemv if m == 1 else args.gemv_rows):
+                    kind, bn, bk, warps = cfg.split(",")
+                    bn, bk, warps = int(bn), int(bk), int(warps)
+                    timings[f"{kind}_bn{bn}_bk{bk}_w{warps}"] = _time(
+                        lambda: w4a16_gemv(x, packed, scales, None, block_n=bn, block_k=bk,
+                                           num_warps=warps, rows_kernel=(kind == "rows")))
             scratch = dense_scratch(device, n, k)
             timings["dequant_only"] = _time(lambda: w4_dequantize_into(scratch, packed, scales))
             timings["dense_dequant_cublas"] = _time(
