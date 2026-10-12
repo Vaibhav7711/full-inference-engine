@@ -61,6 +61,7 @@ reference pinned by CPU tests and a CUDA test that runs on first boot; the gate 
   gate keeps refusing it. Measured in `docs/qwen3-8b-optimization-map.md` §6.4.
 - `docs/qwen3-8b-optimization-map.md`: every stage of Qwen3-8B on a T4 with bytes, FLOPs
   and a prediction per optimization, written before the run; §6 is what the card measured.
+  §7: parked on the T4 - the W4 step needs a CUDA `mma.sync` GEMM Triton cannot emit on sm_75.
 
 ## v0.1.0-beta — 2026-09-24
 

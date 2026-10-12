@@ -365,3 +365,14 @@ two attention kernels with a `[blocks, heads, head_dim]`-per-group scale layout 
 follow-up, not a parameter. The 0.6B attribution's "INT8 unresolved" was this too. The engine
 now says so at construction (`kv_quantisation_warning`) for any model with a `k_norm`.
 
+## 7. Verdict (2026-10-12): not pursued further on the T4
+
+Qwen3-8B at W4A16 serves correctly on one T4 (11.9 GB resident, 32k KV tokens, every A/B
+arm passing the stock-token gate), and the scheduling predictions of this map held. The
+numbers do not: 18-22 tok/s at concurrency 8, TTFT 3-9 s, because every step at batch >= 4
+and every prefill chunk pays a 120 ms fp16 round-trip of the weights (the dense path), and
+the only way past it is a CUDA `mma.sync` W4 GEMM - Triton emits no tensor-core code on
+sm_75. That kernel is a different project from this engine. The 8B is parked on this card;
+the kernels, harness, results and section 6 stay as the record. On sm_89 the existing tiled
+W4A16 kernel would run near bandwidth unchanged, which is where this model belongs.
+
