@@ -30,8 +30,8 @@ def w4():
 
 @cuda
 @requires_cuda
-@pytest.mark.parametrize("shape, path", [((1, 8), "kernel"), ((2, 24), "dense")],
-                         ids=["M=8 triton kernel", "M=48 cuBLAS over dequantised fp16"])
+@pytest.mark.parametrize("shape, path", [((1, 2), "kernel"), ((2, 24), "dense")],
+                         ids=["M=2 triton GEMV", "M=48 cuBLAS over dequantised fp16"])
 def test_installed_path_agrees_with_torch_over_the_same_packed_weights(w4, shape, path):
     from engine.quantization.w4a16 import kernel_available, reference_mode, w4a16_modules
 
@@ -39,8 +39,8 @@ def test_installed_path_agrees_with_torch_over_the_same_packed_weights(w4, shape
     modules = w4a16_modules(w4.model)
     assert not any(m.reference for m in modules)
     rows = shape[0] * shape[1]
-    # Below the threshold the Triton GEMV runs; at or above it, cuBLAS over a dequantised
-    # tile (on sm_75 tl.dot is FMA, so wide batches must reach the tensor cores).
+    # Below the threshold the Triton GEMV runs; at or above it, cuBLAS over a tile the
+    # dequant kernel writes (measured crossover at M = 3 on T4, see W4A16Linear).
     assert all((rows < m.dense_threshold) == (path == "kernel") for m in modules)
     torch.manual_seed(0)
     ids = torch.randint(1000, 100_000, shape, device=w4.device)

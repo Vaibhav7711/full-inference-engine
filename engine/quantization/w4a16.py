@@ -37,7 +37,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from engine.kernels.w4a16_format import (
-    GROUP_SIZE, quantize_weight_w4_grouped, unpack_w4_reference, weight_bytes,
+    GEMV_MAX_ROWS, GROUP_SIZE, quantize_weight_w4_grouped, unpack_w4_reference, weight_bytes,
 )
 
 ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
@@ -85,23 +85,13 @@ class W4A16Linear(nn.Module):
     `F.linear`, which is the arithmetic the kernel is tested against.
     """
 
-    def __init__(self, in_features: int, out_features: int, *, group_size: int = GROUP_SIZE,
-                 bias: bool = False, device=None):
-        super().__init__()
-        if in_features % group_size:
-            raise ValueError(f"in_features {in_features} is not a multiple of group_size {group_size}")
-        self.in_features = in_features
-        self.out_features = out_features
-        self.group_size = group_size
-        self.reference = False
-        # Rows at or above this go through cuBLAS over a dequantised fp16 tile instead of
-        # the Triton kernel. On sm_75 `tl.dot` lowers to scalar FMA (the tiled-prefill PTX
-        # dump: mma_sync = 0), so the kernel is bandwidth-bound only while M is small: at
-        # M = 16 the 8B's FFN is ~220 GFLOP per step, ~27 ms on FMA against a 15 ms
-        # weight-read floor, and at prefill widths it is hopeless. Above the threshold the
-        # weight is dequantised once per call (100 MB transient for the 8B's down_proj)
-        # and the tensor cores do the matmul; the bytes saved on the read are the same.
-        self.dense_threshold = 32
+        # Rows at or above this go to cuBLAS over a tile the Triton dequant kernel writes
+        # into a persistent scratch; below it the dequant-GEMV runs. Measured on T4 at
+        # the 8B shapes (benchmarks/kernels/w4a16_bench.py): the GEMV is 52 ms/step at
+        # M = 1 and ~43 ms per further row (bound by per-byte arithmetic, sm_75 has no
+        # tensor-core path from Triton), the dense path is flat at ~187 ms, so they cross
+        # at M = 3. The read bytes saved by 4-bit weights are the same on both paths.
+        self.dense_threshold = GEMV_MAX_ROWS + 1
         factory = {"device": device}
         self.register_buffer("packed", torch.empty(out_features, in_features // 2, dtype=torch.uint8, **factory))
         self.register_buffer("scales", torch.empty(out_features, in_features // group_size,
