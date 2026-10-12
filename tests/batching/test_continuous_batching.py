@@ -1061,3 +1061,84 @@ def test_release_lets_the_next_engine_take_the_same_auto_sized_pool(graphs):
     print(f"\nrelease ({'graphs' if graphs else 'no graphs'}): pool {pool_bytes >> 20} MiB, "
           f"{(start - after_first) >> 20} MiB kept after the first engine, "
           f"{(start - after_second) >> 20} MiB after the second")
+
+
+@cuda
+@requires_cuda
+def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
+    """Where INT8 KV goes wrong, if it does: the pages, the single-chunk path, or the
+    multi-chunk path. The 8B plan refused `kv_dtype`: int8 diverged at tokens 0-2 on three
+    prompts of four, and the 0.6B had shown the same at tokens 0/7/8/12. Per-token scales
+    put the reconstruction error at ~1/127 of the row max, which cannot move a decided
+    argmax at token 0, so a divergence there is a layout or indexing fault, not rounding.
+    This prints per-layer reconstruction error for K and V over a prompt prefetched in one
+    chunk and in 16-token chunks, and the first divergence per chunking.
+    """
+    from benchmarks.reliability.ab import IDENTITY_PROMPTS, _first_divergence, _stock_reference
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    prompt = IDENTITY_PROMPTS[0]
+    token_ids = tok(prompt, return_tensors="pt").input_ids[0].tolist()
+
+    def pages(engine, request):
+        table = list(request.block_table)
+        length = request.allocation.sequence_length
+        keys, values = [], []
+        for layer in range(engine.num_layers):
+            k = engine.key_pool[layer][table].reshape(-1, engine.num_kv_heads, engine.head_dim)[:length]
+            v = engine.value_pool[layer][table].reshape(-1, engine.num_kv_heads, engine.head_dim)[:length]
+            if engine.key_scale_pool is not None:
+                ks = engine.key_scale_pool[layer][table].reshape(-1, engine.num_kv_heads)[:length]
+                vs = engine.value_scale_pool[layer][table].reshape(-1, engine.num_kv_heads)[:length]
+                k = k.float() * ks.float()[..., None]
+                v = v.float() * vs.float()[..., None]
+            keys.append(k.float()); values.append(v.float())
+        return keys, values
+
+    worst = {}
+    for chunk in (4096, 16):
+        got = {}
+        for dtype in ("fp16", "int8"):
+            eng = ContinuousBatchingEngine(
+                model, tok, "cuda", num_blocks=256, block_size=16, max_active=1,
+                prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
+                kv_cache_dtype=dtype, prefix_cache_blocks=0,
+            )
+            request = _admit(eng, f"{dtype}-{chunk}", token_ids, 1)
+            while request.remaining_prefill_tokens:
+                eng.prefill_chunks([(request, min(chunk, request.remaining_prefill_tokens))])
+            got[dtype] = pages(eng, request)
+            eng.release()
+        for which, index in (("K", 0), ("V", 1)):
+            errors = []
+            for layer, (ref, q) in enumerate(zip(got["fp16"][index], got["int8"][index])):
+                scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+                errors.append(((q - ref).abs() / scale).amax().item())
+            worst[(chunk, which)] = max(errors)
+            print(f"\nint8 {which} vs fp16 pages, chunk {chunk}: worst per-layer relative error "
+                  f"{max(errors):.4f} at layer {errors.index(max(errors))}; median {sorted(errors)[len(errors)//2]:.4f}")
+
+    reference, margins = _stock_reference(_LoadedShim(model, tok), list(IDENTITY_PROMPTS), 16)
+    for chunk in (4096, 16):
+        eng = ContinuousBatchingEngine(
+            model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
+            prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
+            kv_cache_dtype="int8", prefix_cache_blocks=0,
+        )
+        outputs = eng.generate(list(IDENTITY_PROMPTS), max_new_tokens=16)
+        eng.release()
+        print(f"int8 greedy vs stock reference, chunk {chunk}: first divergence per prompt "
+              f"{_first_divergence(outputs, reference, margins)}")
+    # Per-token INT8 reconstruction is bounded by half a step of 127 per row max.
+    for key, error in worst.items():
+        assert error < 0.02, f"{key}: INT8 pages reconstruct with {error:.3f} relative error - layout fault"
+
+
+class _LoadedShim:
+    """What `_stock_reference` needs of a LoadedModel: model, tokenizer, device, quantization."""
+
+    def __init__(self, model, tokenizer):
+        self.model, self.tokenizer = model, tokenizer
+        self.device = next(model.parameters()).device
+        self.quantization = None

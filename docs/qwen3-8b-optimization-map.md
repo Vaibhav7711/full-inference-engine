@@ -290,3 +290,30 @@ The §4 table assumed a bandwidth-bound W4A16 GEMV that this card does not have 
 The structural predictions (fused step flips; graphs shrink in share) are the ones still
 being tested by the full plan.
 
+### 6.3 The plan, measured (nine settings, 2 × 30 s per arm, concurrency 8, closed loop)
+
+Raw: `results/sm75/qwen3-8b/plan/`; table: `python scripts/qwen3_8b_results_table.py results/sm75/qwen3-8b/plan --md`.
+Baseline operating point for the chat profile: ITL p50 ~335 ms, decode step ~230 ms at a mean
+batch of 4.2 (the dense path), prefill step ~341 ms (a 128-token chunk plus the step's decode
+rows, fused), ~18 tok/s aggregate, TTFT ~5 s (eight ~650-token prompts queued behind one
+another's chunks). Long profile: ~1,800-token prompts, TTFT ~22 s.
+
+| setting | predicted (§3) | measured | reading |
+|---|---|---|---|
+| `fused_step` chat | large win | **ITL p50 −26%** (454 → 335 ms), p99 −16%, +14% tokens, prefill step −25% | A loss at 0.6B, a win at 8B: the saving scaled with weight bytes, the overhead did not. The prediction's mechanism was right even though its kernel was wrong. |
+| `fused_step` long | large win | +16% tokens, TTFT −19% (±22%), ITL unresolved (±47%) | Same direction; the long profile's spread is prefill-dominated. |
+| `prefill_chunk` long (32 vs 128) | trade far sharper | chunk 32: **TTFT +229%** (21.6 → 71 s), −39% tokens, ITL p99 −46% | Every chunk pays the 120 ms dequant regardless of size, so small chunks are ruinous here. The next question is 512. |
+| `cuda_graphs` chat | ~1.3× | **graphs cost 10–20%**: tokens 597 → 545, ITL p99 +23%, decode step 94 → 230 ms | Reversal with a mechanism: buckets 1/2/4/8 pad 1–3 decode rows to 4 or 8, crossing the GEMV → dense threshold. Eager ran the GEMV. Launch overhead, which graphs remove, is nothing next to 50–200 ms kernels. `graph_buckets_exact` tests the fix. |
+| `prefix_cache` chat | grows | unresolved (±1%) | Wrong. Prefill cost here is per chunk, not per token, so reused tokens save little; worth re-testing once chunks are larger. |
+| `triton_rmsnorm` chat | shrinks ~3× in share | −2.8% ITL (±1.7%), decode −1.7%, prefill −1.6% | As predicted. |
+| `triton_rope`, `triton_swiglu` | unresolved | unresolved | As predicted. |
+| `decode_split_k` long | batch-1 / long only | unresolved at batch 4, 1.7k context | Consistent; batch 1 was not in the plan. |
+| `kv_dtype` long | INT8 resolves | **refused by the stock gate**: int8 diverges at tokens 2/0/1/1 | A fault, not rounding: per-token INT8 cannot move a decided argmax at token 0. The 0.6B showed it too (0/7/8/12). Localisation test added. |
+
+Two of nine predictions were wrong in kind (`cuda_graphs`, `prefix_cache`), one setting
+exposed a bug, and the two that the map rested on (`fused_step`, `prefill_chunk`) went the
+predicted way with larger magnitudes than at 0.6B. The absolute level — 18 tok/s at
+concurrency 8 — is set by the dense path's 120 ms dequant on every step at M ≥ 4 and on
+every prefill chunk; §6.1 has the kernel table. The two cheapest follow-ups are a larger
+prefill chunk and exact-row graph buckets; both are one A/B each.
+

@@ -166,6 +166,15 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("separate_gate_up", {"fuse_mlp_gate_up": False}),
         ("fused_gate_up", {"fuse_mlp_gate_up": True}),
     ],
+    # 8B on T4: buckets 1/2/4/8 pad a batch of 1-3 decode rows to 4 or 8, which on W4A16
+    # crosses the GEMV -> dense threshold (47-115 ms -> 187 ms per step); the eager arm
+    # ran the GEMV and won by 10-20%. A bucket per row count keeps the kernel choice
+    # honest under graphs. Heaviest graph set first so the auto-sized pool fits all arms.
+    "graph_buckets_exact": [
+        ("buckets_every_row", {"cuda_graph_batch_sizes": (1, 2, 3, 4, 5, 6, 7, 8)}),
+        ("buckets_1248", {"cuda_graph_batch_sizes": (1, 2, 4, 8)}),
+        ("graphs_off", {"cuda_graph_batch_sizes": None}),
+    ],
     # Phase 7 vs Phase 8: one exact-width bucket against padded power-of-two buckets.
     "graph_buckets_padded": [
         ("exact_bucket", lambda max_active: {"cuda_graph_batch_sizes": (max_active,)}),
