@@ -1197,6 +1197,13 @@ def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
     print(f"  out vs torch(query, dequantised pages): {rel(got, torch_attention(q0, kd_h, vd_h, scaling, width)):.4f}")
     print(f"  out shape {tuple(out.shape)}, query shape {tuple(q0.shape)}, out stride {out.stride()}, "
           f"out is_contiguous {out.is_contiguous()}")
+    import os
+    dump = os.environ.get("RUN")
+    if dump:
+        torch.save({"q": q0.cpu(), "k": k0.cpu(), "v": v0.cpu(), "out": out.cpu(), "k_deq": captured["k_deq"].cpu(),
+                    "v_deq": captured["v_deq"].cpu(), "scaling": scaling, "width": width},
+                   os.path.join(dump, "int8_layer0_capture.pt"))
+        print(f"  saved tensors to {dump}/int8_layer0_capture.pt")
 
     reference, margins = _stock_reference(_LoadedShim(model, tok), list(IDENTITY_PROMPTS), 16)
     for chunk in (4096, 128, 16):
