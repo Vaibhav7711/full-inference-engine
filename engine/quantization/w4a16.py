@@ -85,6 +85,15 @@ class W4A16Linear(nn.Module):
     `F.linear`, which is the arithmetic the kernel is tested against.
     """
 
+    def __init__(self, in_features: int, out_features: int, *, group_size: int = GROUP_SIZE,
+                 bias: bool = False, device=None):
+        super().__init__()
+        if in_features % group_size:
+            raise ValueError(f"in_features {in_features} is not a multiple of group_size {group_size}")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.reference = False
         # Rows at or above this go to cuBLAS over a tile the Triton dequant kernel writes
         # into a persistent scratch; below it the dequant-GEMV runs. Measured on T4 at
         # the 8B shapes (benchmarks/kernels/w4a16_bench.py): the GEMV is 52 ms/step at
