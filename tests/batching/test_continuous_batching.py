@@ -1105,7 +1105,7 @@ def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
                 prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
                 kv_cache_dtype=dtype, prefix_cache_blocks=0,
             )
-            request = _admit(eng, f"{dtype}-{chunk}", token_ids, 1)
+            request = _admit(eng, f"{dtype}-{chunk}", token_ids, 4)   # > 1: keep the allocation live after prefill
             while request.remaining_prefill_tokens:
                 eng.prefill_chunks([(request, min(chunk, request.remaining_prefill_tokens))])
             got[dtype] = pages(eng, request)

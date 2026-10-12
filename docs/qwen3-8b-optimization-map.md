@@ -310,6 +310,13 @@ another's chunks). Long profile: ~1,800-token prompts, TTFT ~22 s.
 | `decode_split_k` long | batch-1 / long only | unresolved at batch 4, 1.7k context | Consistent; batch 1 was not in the plan. |
 | `kv_dtype` long | INT8 resolves | **refused by the stock gate**: int8 diverges at tokens 2/0/1/1 | A fault, not rounding: per-token INT8 cannot move a decided argmax at token 0. The 0.6B showed it too (0/7/8/12). Localisation test added. |
 
+Follow-ups from the same session (`results/sm75/qwen3-8b/plan/`, same protocol):
+
+| setting | measured | reading |
+|---|---|---|
+| `graph_buckets_exact` chat (every row / 1-2-4-8 / off) | decode-only step 217 → 125 ms with exact rows; ITL and tokens identical to 1/2/4/8 (627 both); graphs off: ITL p99 −18%, +3.5% tokens | The mechanism was right and does not matter at this operating point: nearly every step is fused and prefill-carrying at batch ~4.8, dense either way. The residual graph cost is fused-graph padding of chunk tokens to the 64/128 regimes. On this card at 8B, graphs are a mild net cost. |
+| `prefill_chunk_large` long (128 vs 512) | chunk 512: **TTFT 19.1 → 8.8 s**, **+22% tokens**, ITL p50 flat, ITL p99 +118% (a 532 ms prefill step) | The amortisation §6.1 implies: the per-chunk dequant is fixed, so bigger chunks buy throughput and TTFT at the cost of the decode tail. 512 is the better serving default here; 128 the better tail. |
+
 Two of nine predictions were wrong in kind (`cuda_graphs`, `prefix_cache`), one setting
 exposed a bug, and the two that the map rested on (`fused_step`, `prefill_chunk`) went the
 predicted way with larger magnitudes than at 0.6B. The absolute level — 18 tok/s at

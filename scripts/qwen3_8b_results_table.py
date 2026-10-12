@@ -23,6 +23,8 @@ PREDICTED = {
     ("triton_rope", "chat"):    "unresolved",
     ("triton_swiglu", "chat"):  "unresolved",
     ("decode_split_k", "long"): "batch-1/long-context only",
+    ("graph_buckets_exact", "chat"): "exact-row buckets recover the GEMV under graphs",
+    ("prefill_chunk_large", "long"): "512 amortises the per-chunk dequant: TTFT and tokens up, ITL tail down",
 }
 KEY = ["step_timing.expected_gap_ms", "latency.itl_p50", "latency.itl_p99", "latency.ttft_p50",
        "step_timing.decode_step_p50_ms", "step_timing.prefill_step_p50_ms", "delivered_tokens"]
