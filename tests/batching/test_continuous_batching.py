@@ -1099,17 +1099,25 @@ def test_int8_kv_localisation_against_fp16_pages_and_greedy_reference():
     worst = {}
     for chunk in (4096, 16):
         got = {}
-        for dtype in ("fp16", "int8"):
+        # INT8 first this time: in every failing run so far the INT8 engine was the second
+        # engine built on the shared model. A second fp16 engine is built last and compared
+        # with the first: if fp16 differs from fp16, the fault is state carried between
+        # engines (patches, contexts, release), not INT8.
+        for label, dtype in (("int8", "int8"), ("fp16", "fp16"), ("fp16_again", "fp16")):
             eng = ContinuousBatchingEngine(
                 model, tok, "cuda", num_blocks=256, block_size=16, max_active=1,
                 prefill_chunk_size=chunk, max_prefill_tokens_per_iteration=chunk,
                 kv_cache_dtype=dtype, prefix_cache_blocks=0,
             )
-            request = _admit(eng, f"{dtype}-{chunk}", token_ids, 4)   # > 1: keep the allocation live after prefill
+            request = _admit(eng, f"{label}-{chunk}", token_ids, 4)   # > 1: keep the allocation live after prefill
             while request.remaining_prefill_tokens:
                 eng.prefill_chunks([(request, min(chunk, request.remaining_prefill_tokens))])
-            got[dtype] = pages(eng, request)
+            got[label] = pages(eng, request)
             eng.release()
+        for which, index in (("K", 0), ("V", 1)):
+            drift = max(((b - a).abs() / a.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax().item()
+                        for a, b in zip(got["fp16"][index], got["fp16_again"][index]))
+            print(f"\nfp16 engine #2 vs fp16 engine #1, {which} pages, chunk {chunk}: worst relative difference {drift:.4f}")
         for which, index in (("K", 0), ("V", 1)):
             errors = []
             for layer, (ref, q) in enumerate(zip(got["fp16"][index], got["int8"][index])):
