@@ -191,3 +191,68 @@ def test_int8_chunked_prefill_replay_matches_fp16_pages_and_attention() -> None:
         per_token = ((out - ref).abs() / ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)).amax(dim=(0, 2))
         print(f"INT8 paged prefill, chunk at {start}: per-token error vs fp16 {[round(e, 3) for e in per_token.tolist()]}")
         assert per_token.max().item() < 0.05, f"INT8 prefill attention wrong for the chunk at {start}"
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("start, length", [(0, 16), (16, 16), (32, 13)])
+def test_paged_prefill_kernels_match_a_torch_causal_reference(start, length) -> None:
+    """Both paged prefill kernels against plain torch attention, not against each other.
+
+    The engine-level INT8 localisation found layer-1 pages wrong from position 1 of the
+    first chunk while layer 0 was exact: the attention output is wrong for every token
+    that attends more than itself. The INT8 kernel agreed with the fp16 paged kernel in
+    the replay test, so if a convention is wrong (causal mask, position base, scale) it is
+    shared. On T4 the fp16 engine's default prefill backend is SDPA over gathered pages,
+    which is why only the INT8 path - the one path that runs the Triton paged prefill
+    kernel there - showed it.
+    """
+    from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
+    from engine.kernels.kv_write import write_prefill_kv_batched
+    from engine.kernels.paged_prefill import paged_prefill
+
+    torch.manual_seed(start + 1)
+    q_heads, kv_heads, dim, block_size, blocks, total = 16, 8, 128, 16, 8, 45
+    tables = torch.tensor([[5, 2, 7]], device="cuda", dtype=torch.int32)
+    key_all = torch.randn(1, kv_heads, total, dim, device="cuda", dtype=torch.float16)
+    value_all = torch.randn_like(key_all)
+    fp16_k = torch.zeros(blocks, block_size, kv_heads, dim, device="cuda", dtype=torch.float16)
+    fp16_v = torch.zeros_like(fp16_k)
+    int8_k = torch.zeros(blocks, block_size, kv_heads, dim, device="cuda", dtype=torch.int8)
+    int8_v = torch.zeros_like(int8_k)
+    ks = torch.zeros(blocks, block_size, kv_heads, device="cuda", dtype=torch.float16)
+    vs = torch.zeros_like(ks)
+    for s, n in [(0, 16), (16, 16), (32, 13)]:
+        if s > start:
+            break
+        key = key_all[:, :, s:s + 16].contiguous()
+        value = value_all[:, :, s:s + 16].contiguous()
+        starts = torch.tensor([s], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([n], device="cuda", dtype=torch.int32)
+        write_prefill_kv_batched(key, value, fp16_k, fp16_v, tables, lengths, starts)
+        write_prefill_int8_kv_batched(key, value, int8_k, int8_v, ks, vs, tables, lengths, starts)
+    query = torch.randn(1, q_heads, 16, dim, device="cuda", dtype=torch.float16)
+    starts = torch.tensor([start], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([length], device="cuda", dtype=torch.int32)
+    scale = dim ** -0.5
+
+    # Reference: token t of the chunk (absolute position start + t) attends positions
+    # 0 .. start + t inclusive; GQA maps q head h to kv head h // (q_heads // kv_heads).
+    group = q_heads // kv_heads
+    k_ref = key_all[0].float().repeat_interleave(group, dim=0)      # [q_heads, total, dim]
+    v_ref = value_all[0].float().repeat_interleave(group, dim=0)
+    scores = torch.einsum("hqd,hkd->hqk", query[0].float(), k_ref) * scale
+    positions = torch.arange(total, device="cuda")
+    allowed = positions[None, :] <= (start + torch.arange(16, device="cuda"))[:, None]
+    scores = scores.masked_fill(~allowed[None], float("-inf"))
+    reference = torch.einsum("hqk,hkd->hqd", scores.softmax(-1), v_ref)[:, :length]
+
+    fp16 = paged_prefill(query, fp16_k, fp16_v, tables, starts, lengths, scale=scale)[0, :, :length].float()
+    int8 = paged_prefill_int8(query, int8_k, int8_v, ks, vs, tables, starts, lengths, scale=scale)[0, :, :length].float()
+    norm = reference.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    err16 = ((fp16 - reference).abs() / norm).amax(dim=(0, 2))
+    err8 = ((int8 - reference).abs() / norm).amax(dim=(0, 2))
+    print(f"\nchunk at {start}: fp16 paged prefill per-token error vs torch {[round(e, 3) for e in err16.tolist()]}")
+    print(f"chunk at {start}: INT8 paged prefill per-token error vs torch {[round(e, 3) for e in err8.tolist()]}")
+    assert err16.max().item() < 0.02, "fp16 paged prefill disagrees with torch causal attention"
+    assert err8.max().item() < 0.05, "INT8 paged prefill disagrees with torch causal attention"
