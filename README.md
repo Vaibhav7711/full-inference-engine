@@ -15,8 +15,9 @@ structurally, so Llama-style checkpoints work without new code.
 
 Every optimization here was either measured to win on a Tesla T4 or RTX 4060 with
 interleaved A/B runs and a stock-Transformers token-identity gate, or is recorded as a
-negative result with the numbers. The RTX 4060 release evidence is in
-`docs/rtx4060-final-evaluation.md`.
+negative result with the numbers. The complete Ada investigation—including INT8 KV,
+W8A16, 4B-AWQ, accepted/rejected kernels and raw-evidence links—is in
+`docs/rtx4060-ada-sm89-complete-report.md`.
 
 ## Status (2026-09-21, Tesla T4, Qwen3-0.6B fp16, chat workload ~656-token prompts)
 
@@ -35,14 +36,16 @@ decode reads (L2 already dedups), prefix cache and INT8 KV on these workloads.
 Serving surface: OpenAI-compatible `/v1/completions` and `/v1/chat/completions` (with
 streaming, `usage`, logprobs, stop strings), per-request sampling (temperature, top-p,
 top-k, min-p, penalties, seeds, stop tokens), Prometheus `/metrics`, health/readiness,
-graceful drain. Not yet: speculative decoding in the batched path, quantized weights,
-multi-GPU, structured output. See "Roadmap".
+graceful drain. Measured opt-in profiles now include W8A16 weights, calibrated INT8 KV and
+a Qwen3-4B-AWQ INT4 path. Not yet: speculative decoding in the batched path, multi-GPU or
+structured output. See "Roadmap".
 
 On the measured RTX 4060, direct FlashAttention prefill wins for long-context FP16 with
 256-token pages; Flash decode and dense-gather Flash over 16-token pages lose end to end.
-The Ada policy therefore keeps graphed Triton `per_head` decode and selects Flash prefill
-only when compatible page geometry is explicitly chosen. See the final evaluation for the
-0.6B/1.7B numbers and every rejected arm.
+The Ada policy therefore keeps graphed Triton `per_head` decode, uses tiled prefill for
+normal 16-token pages, and selects Flash prefill only when compatible page geometry is
+explicitly chosen. See the complete report for the 0.6B/1.7B/4B numbers and every rejected
+arm.
 
 ## Portability
 
@@ -78,6 +81,8 @@ python scripts/check_hooks.py      # warmup captures every graph; step phases re
 uvicorn engine.server.api:create_app --factory --port 8000
 # Measured RTX 4060 long-context configuration:
 uvicorn engine.server.api:create_rtx4060_flash_app --factory --port 8000
+# Measured general RTX 4060 optimized profile (Qwen3-1.7B by default):
+uvicorn 'engine.server.api:create_rtx4060_optimized_app' --factory --port 8000
 curl -N localhost:8000/generate/stream -d '{"prompt":"Explain KV caching.","max_new_tokens":64}'
 
 # or the OpenAI-compatible surface, with any OpenAI client pointed at /v1
@@ -154,7 +159,7 @@ benchmarks/  reliability (soak, A/B, sweep), kernels, batching, server, quantiza
 tests/       CPU tests + `-m cuda` gates mirroring engine/
 docs/        architecture.md · optimization-journal.md · checkpoint.md · t4-reevaluation-plan.md ·
              design-decisions.md · understanding-journal.md · rtx4060-plan.md ·
-             rtx4060-final-evaluation.md
+             rtx4060-final-evaluation.md · rtx4060-ada-sm89-complete-report.md
 results/t4/  transcribed T4 measurements
 scripts/     check_hooks, token_margins, Kaggle/Colab setup, the T4 notebook
 ```
@@ -165,9 +170,9 @@ Tier 1 (serving): **done** - batched sampling, OpenAI-compatible routes, Prometh
 Tier 2 (portability): **done** - backend registry, per-device policy, model-family
 discovery, split-K decode and FlashAttention-2 backends. The sm_89 policy is measured;
 unrecognized devices remain explicitly labelled unmeasured (`docs/rtx4060-plan.md`).
-Tier 3 (performance): **Flash prefill measured on RTX 4060**; next, use Nsight on the live
-decode step to re-derive coalescing/tile/block regimes, then integrate weight-only INT8/INT4
-and batched speculative decoding behind the same correctness and A/B gates.
+Tier 3 (performance): **Ada pass substantially complete** - Nsight-guided paged kernels,
+tiled/Flash prefill policy, smoothed INT8 KV, W8A16 and 4B-AWQ are measured. N-gram
+speculative decoding has a positive batch-1 probe but is not integrated.
 Tier 4: second model family end to end, CPU/GPU step overlap, structured output.
 
 ## Correctness policy

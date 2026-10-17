@@ -113,3 +113,112 @@ def load_model(
         dtype=resolved_dtype,
         device=device,
     )
+
+
+def load_awq_tinygemm_model(model_path: str, *, triton_prefill_rows: int | None = 64,
+                            dequant_rows: int | None = 192) -> LoadedModel:
+    """Load a local GEMM-format AWQ checkpoint through native PyTorch INT4.
+
+    This experimental path avoids an external AWQ runtime and never materializes the
+    full FP16 model. Packed weights are repacked one projection at a time, keeping a
+    4B checkpoint within an 8 GB card's loading budget.
+
+    ``triton_prefill_rows``: projections with at least this many rows use the Triton
+    int4pack GEMM over the same packed buffers (RTX 4060 Qwen3-4B-AWQ A/B: prefill GPU
+    -46%, fused step -34%, ITL p99 -33%); decode keeps tinygemm. ``None`` restores
+    tinygemm everywhere. From ``dequant_rows`` rows (whole-prompt prefill) the weight is
+    dequantized to FP16 scratch and multiplied by cuBLAS, 1.8x the fused kernel at 2048.
+    """
+    import json
+    from pathlib import Path
+
+    from accelerate import init_empty_weights
+    from accelerate.utils import set_module_tensor_to_device
+    from safetensors import safe_open
+    from transformers import AutoConfig
+
+    from engine.quantization.awq_tinygemm import AWQTinyGemmLinear, repack_awq_to_tinygemm
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    root = Path(model_path)
+    config = AutoConfig.from_pretrained(root, local_files_only=True)
+    quantization = getattr(config, "quantization_config", None)
+    if not isinstance(quantization, dict) or quantization.get("quant_method") != "awq" \
+            or quantization.get("bits") != 4 or quantization.get("group_size") != 128 \
+            or quantization.get("version", "").lower() != "gemm":
+        raise ValueError("native loader requires a 4-bit, group-128, GEMM-format AWQ checkpoint")
+    delattr(config, "quantization_config")
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config)
+
+    index_path = root / "model.safetensors.index.json"
+    if index_path.is_file():
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        files = sorted({root / filename for filename in weight_map.values()})
+    else:
+        files = [root / "model.safetensors"]
+    if not files or any(not path.is_file() for path in files):
+        raise FileNotFoundError("AWQ safetensors checkpoint is incomplete")
+
+    quantized: dict[str, dict[str, tuple[Path, str]]] = {}
+    ordinary: list[tuple[Path, str]] = []
+    for path in files:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                suffix = key.rsplit(".", 1)[-1]
+                if suffix in {"qweight", "qzeros", "scales"}:
+                    quantized.setdefault(key.rsplit(".", 1)[0], {})[suffix] = (path, key)
+                else:
+                    ordinary.append((path, key))
+
+    device = torch.device("cuda")
+    for name, parts in quantized.items():
+        if set(parts) != {"qweight", "qzeros", "scales"}:
+            raise ValueError(f"incomplete AWQ projection {name}")
+        scale_path, scale_key = parts["scales"]
+        with safe_open(scale_path, framework="pt", device="cpu") as handle:
+            groups, out_features = handle.get_slice(scale_key).get_shape()
+        in_features = groups * 128
+        parent_name, attribute = name.rsplit(".", 1)
+        parent = model.get_submodule(parent_name)
+        setattr(parent, attribute, AWQTinyGemmLinear(
+            in_features, out_features, group_size=128, device=device,
+        ))
+
+    for path, key in ordinary:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            value = handle.get_tensor(key)
+        set_module_tensor_to_device(model, key, device, value=value, dtype=torch.float16)
+
+    for name, parts in quantized.items():
+        tensors = {}
+        for part, (path, key) in parts.items():
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                tensors[part] = handle.get_tensor(key).to(device)
+        packed, qparams = repack_awq_to_tinygemm(
+            tensors["qweight"], tensors["qzeros"], tensors["scales"],
+        )
+        module = model.get_submodule(name)
+        module.packed_weight.copy_(packed)
+        module.scale_and_zero.copy_(qparams)
+        del tensors, packed, qparams
+
+    for name, buffer in list(model.named_buffers()):
+        if buffer.device.type != "cuda":
+            set_module_tensor_to_device(model, name, device, value=buffer)
+    model.lm_head.weight = model.model.embed_tokens.weight
+    model.config._weight_only_int4_backend = "tinygemm"
+    from engine.quantization.awq_tinygemm import install_int4pack_prefill
+    install_int4pack_prefill(model, triton_prefill_rows, dequant_rows)
+    missing_meta = [name for name, parameter in model.named_parameters() if parameter.device.type == "meta"]
+    if missing_meta:
+        raise RuntimeError(f"unloaded model parameters: {missing_meta[:5]}")
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(root, local_files_only=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return LoadedModel(
+        model_name=str(root), requested_revision=None, resolved_revision=None,
+        model=model, tokenizer=tokenizer, dtype=torch.float16, device=device,
+    )

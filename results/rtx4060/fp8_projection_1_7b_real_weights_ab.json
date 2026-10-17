@@ -1,0 +1,277 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.14.0+cu130",
+  "scope": "Layer-0 checkpoint weights at qwen3_1_7b projection shapes; per-call CUDA events, no model serving or AWQ packing",
+  "rows": [
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.03788800165057182,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.037936000153422356,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.03891199827194214,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.03891199827194214,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "q_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.056384000927209854,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 128,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.023552000522613525,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.020623999647796154,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.021503999829292297,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.020639999769628048,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.03174399957060814,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 128,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.1024479977786541,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.12185599654912949,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.1228799968957901,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.12185599654912949,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.14336000382900238,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 128,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.10342399775981903,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.12390399724245071,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.12390399724245071,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.12851200252771378,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    },
+    {
+      "shape": "down_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.1531520038843155,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 128,
+      "mode": "fp8_dynamic",
+      "error": "RuntimeError('CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling `cublasLtMatmulAlgoGetHeuristic( ltHandle, computeDesc.descriptor(), Adesc.descriptor(), Bdesc.descriptor(), Cdesc.descriptor(), Ddesc.descriptor(), preference.descriptor(), 1, &heuristicResult, &returnedResult)`')"
+    }
+  ],
+  "config": {
+    "batches": "1,4,8,16,128",
+    "geometry": "qwen3_1_7b",
+    "modes": "fp16,fp8_dynamic",
+    "real_weights": true,
+    "warmup": 10,
+    "repeats": 50,
+    "include_lm_head": false,
+    "output": "results/rtx4060/fp8_projection_1_7b_real_weights_ab.json"
+  }
+}

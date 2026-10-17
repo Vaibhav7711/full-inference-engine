@@ -1,0 +1,519 @@
+{
+  "setting": "idle_prefill",
+  "repeats": 3,
+  "model": "Qwen/Qwen3-0.6B",
+  "dtype": "torch.float16",
+  "config": {
+    "duration_s": 10.0,
+    "arrival_rate_per_s": 20.0,
+    "concurrency": 1,
+    "shared_prefixes": 3,
+    "prefix_tokens": [
+      1024,
+      2048
+    ],
+    "suffix_tokens": [
+      64,
+      512
+    ],
+    "max_new_tokens": [
+      1,
+      64
+    ],
+    "cancel_probability": 0.02,
+    "seed": 100,
+    "max_steps": 500000,
+    "sample_every_steps": 25,
+    "instrument": true,
+    "num_blocks": 1024,
+    "block_size": 16,
+    "max_active": 1,
+    "max_waiting_requests": 64,
+    "prefix_cache_blocks": 64,
+    "cuda_graph_batch_sizes": [
+      1
+    ]
+  },
+  "arm_settings": {
+    "chunked_idle": {
+      "num_blocks": 1024,
+      "block_size": 16,
+      "max_active": 1,
+      "max_waiting_requests": 64,
+      "prefix_cache_blocks": 64,
+      "cuda_graph_batch_sizes": [
+        1
+      ],
+      "idle_prefill_tokens": null
+    },
+    "whole_prompt_idle": {
+      "num_blocks": 1024,
+      "block_size": 16,
+      "max_active": 1,
+      "max_waiting_requests": 64,
+      "prefix_cache_blocks": 64,
+      "cuda_graph_batch_sizes": [
+        1
+      ],
+      "idle_prefill_tokens": 4096
+    }
+  },
+  "prompt_profile": "long",
+  "mean_prompt_tokens": 1824.0,
+  "environment": {
+    "timestamp_utc": "2026-10-17T08:57:20.769506+00:00",
+    "hardware": {
+      "gpu": "NVIDIA GeForce RTX 4060",
+      "compute_capability": "8.9",
+      "multiprocessor_count": 24,
+      "total_memory_bytes": 8183349248,
+      "framework_bf16_supported": true,
+      "native_bf16_tensor_cores": true
+    },
+    "software": {
+      "python": "3.14.4",
+      "torch": "2.14.0+cu130",
+      "cuda": "13.0",
+      "transformers": "5.17.0",
+      "triton": "3.8.0"
+    }
+  },
+  "git": {
+    "commit": "19b1fc7ab08f017e2e156dc977ac5bc1efacdd72",
+    "short": "19b1fc7",
+    "branch": "main",
+    "dirty": true
+  },
+  "clocks_before": {
+    "clocks.sm": 2730.0,
+    "clocks.mem": 8251.0,
+    "clocks.max.sm": 3105.0,
+    "power.draw": "[N/A]",
+    "power.limit": 115.0,
+    "temperature.gpu": 56.0,
+    "clocks_throttle_reasons.active": "0x0000000000000000"
+  },
+  "clocks_after": {
+    "clocks.sm": 2670.0,
+    "clocks.mem": 8251.0,
+    "clocks.max.sm": 3105.0,
+    "power.draw": "[N/A]",
+    "power.limit": 115.0,
+    "temperature.gpu": 70.0,
+    "clocks_throttle_reasons.active": "0x0000000000000004"
+  },
+  "token_identity": {
+    "identical": true,
+    "drifted_arms": [],
+    "first_divergence_vs_stock": {
+      "chunked_idle": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "whole_prompt_idle": [
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "ties_vs_stock": {
+      "chunked_idle": [
+        "prompt 0 @ 4 (margin 0.0000)",
+        "prompt 1 @ 18 (margin 0.0000)"
+      ],
+      "whole_prompt_idle": [
+        "prompt 0 @ 4 (margin 0.0000)",
+        "prompt 1 @ 18 (margin 0.0000)"
+      ]
+    },
+    "tie_margin": 0.02,
+    "early_divergence_arms": [],
+    "gate_overridden": false
+  },
+  "order": "interleaved",
+  "arms": {
+    "chunked_idle": {
+      "label": "chunked_idle",
+      "runs": 3,
+      "ok": true,
+      "summary": {
+        "latency.itl_p50": {
+          "n": 3,
+          "median": 6.427942,
+          "min": 6.240358,
+          "max": 6.494895,
+          "spread": 0.039598521579690675
+        },
+        "latency.itl_p99": {
+          "n": 3,
+          "median": 7.188611,
+          "min": 6.975181,
+          "max": 7.31634,
+          "spread": 0.04745826419039787
+        },
+        "latency.itl_samples": {
+          "n": 3,
+          "median": 988.0,
+          "min": 972.0,
+          "max": 1118.0,
+          "spread": 0.14777327935222673
+        },
+        "latency.ttft_p50": {
+          "n": 3,
+          "median": 121.605878,
+          "min": 98.85933,
+          "max": 132.658099,
+          "spread": 0.27793696781663785
+        },
+        "latency.total_queue_p50": {
+          "n": 3,
+          "median": 0.040736,
+          "min": 0.036201,
+          "max": 0.041309,
+          "spread": 0.1253927729772192
+        },
+        "waste_ratio": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "delivered_tokens": {
+          "n": 3,
+          "median": 1042.0,
+          "min": 1013.0,
+          "max": 1167.0,
+          "spread": 0.14779270633397312
+        },
+        "peak_kv_utilization": {
+          "n": 3,
+          "median": 0.15640273704789834,
+          "min": 0.14076246334310852,
+          "max": 0.17204301075268819,
+          "spread": 0.2
+        },
+        "mean_decode_batch": {
+          "n": 3,
+          "median": 1.0,
+          "min": 1.0,
+          "max": 1.0,
+          "spread": 0.0
+        },
+        "mean_context_tokens": {
+          "n": 3,
+          "median": 1800.0555555555557,
+          "min": 1522.6875,
+          "max": 1917.078947368421,
+          "spread": 0.2190995973158723
+        },
+        "step_timing.decode_step_p50_ms": {
+          "n": 3,
+          "median": 6.423210999855655,
+          "min": 6.232759000113219,
+          "max": 6.492347000403242,
+          "spread": 0.040414054636513826
+        },
+        "step_timing.prefill_step_p50_ms": {
+          "n": 3,
+          "median": 9.79594399996131,
+          "min": 9.544398999878467,
+          "max": 9.90270700003748,
+          "spread": 0.03657717930609122
+        },
+        "step_timing.prefill_step_fraction": {
+          "n": 3,
+          "median": 0.2565982404692082,
+          "min": 0.22237474262182566,
+          "max": 0.28602620087336245,
+          "spread": 0.24805882587170336
+        },
+        "step_timing.prefill_penalty_p50_ms": {
+          "n": 3,
+          "median": 3.3727330001056544,
+          "min": 3.311639999765248,
+          "max": 3.410359999634238,
+          "spread": 0.029270031118946493
+        },
+        "step_timing.expected_gap_ms": {
+          "n": 3,
+          "median": 7.367439375675957,
+          "min": 6.9691840927171596,
+          "max": 7.387901006436094,
+          "spread": 0.056833438643737355
+        },
+        "step_timing.prefill_share_of_gap": {
+          "n": 3,
+          "median": 0.11877836119858483,
+          "min": 0.10566876736309902,
+          "max": 0.1305770076967778,
+          "spread": 0.2097035190781496
+        },
+        "step_timing.host_stage_ms_p50": {
+          "n": 3,
+          "median": 0.05408899983194715,
+          "min": 0.053481000122701516,
+          "max": 0.05538100003832369,
+          "spread": 0.03512728875603941
+        },
+        "step_timing.decode_gpu_ms_p50": {
+          "n": 3,
+          "median": 6.339583873748779,
+          "min": 6.143807888031006,
+          "max": 6.403103828430176,
+          "spread": 0.040901097857995644
+        },
+        "step_timing.prefill_gpu_ms_p50": {
+          "n": 3,
+          "median": 9.666496276855469,
+          "min": 9.411904335021973,
+          "max": 9.691167831420898,
+          "spread": 0.028889836441314057
+        },
+        "step_timing.fused_gpu_ms_p50": {
+          "n": 0
+        },
+        "step_timing.sync_ms_p50": {
+          "n": 3,
+          "median": 6.324954999854526,
+          "min": 6.126653999899645,
+          "max": 6.388979999883304,
+          "spread": 0.041474761478886825
+        },
+        "step_timing.lazy_graph_captures": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "latency.itl_p999": {
+          "n": 3,
+          "median": 7.383634,
+          "min": 7.319679,
+          "max": 7.396019,
+          "spread": 0.01033908235429872
+        }
+      },
+      "violations": [],
+      "coverage_gaps": [
+        "no admission rejection occurred",
+        "no preemption occurred: pool was not under pressure"
+      ]
+    },
+    "whole_prompt_idle": {
+      "label": "whole_prompt_idle",
+      "runs": 3,
+      "ok": true,
+      "summary": {
+        "latency.itl_p50": {
+          "n": 3,
+          "median": 6.431889,
+          "min": 6.344208,
+          "max": 6.514698,
+          "spread": 0.026506987294090435
+        },
+        "latency.itl_p99": {
+          "n": 3,
+          "median": 7.274192,
+          "min": 7.233408,
+          "max": 7.287924,
+          "spread": 0.007494440619659263
+        },
+        "latency.itl_samples": {
+          "n": 3,
+          "median": 1099.0,
+          "min": 998.0,
+          "max": 1197.0,
+          "spread": 0.181073703366697
+        },
+        "latency.ttft_p50": {
+          "n": 3,
+          "median": 82.388603,
+          "min": 66.341396,
+          "max": 86.091795,
+          "spread": 0.23972246501133174
+        },
+        "latency.total_queue_p50": {
+          "n": 3,
+          "median": 0.036714,
+          "min": 0.036119,
+          "max": 0.037817,
+          "spread": 0.04624938715476399
+        },
+        "waste_ratio": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "delivered_tokens": {
+          "n": 3,
+          "median": 1156.0,
+          "min": 1073.0,
+          "max": 1257.0,
+          "spread": 0.15916955017301038
+        },
+        "peak_kv_utilization": {
+          "n": 3,
+          "median": 0.13294232649071358,
+          "min": 0.12512218963831867,
+          "max": 0.13391984359726294,
+          "spread": 0.06617647058823524
+        },
+        "mean_decode_batch": {
+          "n": 3,
+          "median": 1.0,
+          "min": 1.0,
+          "max": 1.0,
+          "spread": 0.0
+        },
+        "mean_context_tokens": {
+          "n": 3,
+          "median": 1821.7045454545455,
+          "min": 1583.938775510204,
+          "max": 1930.6744186046512,
+          "spread": 0.19033582803512786
+        },
+        "step_timing.decode_step_p50_ms": {
+          "n": 3,
+          "median": 6.42511799969725,
+          "min": 6.312246000106825,
+          "max": 6.507189999865659,
+          "spread": 0.03034092132907442
+        },
+        "step_timing.prefill_step_p50_ms": {
+          "n": 3,
+          "median": 10.799776000112615,
+          "min": 10.469134000004487,
+          "max": 74.54603299993323,
+          "spread": 5.933169261960672
+        },
+        "step_timing.prefill_step_fraction": {
+          "n": 3,
+          "median": 0.06854531607006854,
+          "min": 0.06005459508644222,
+          "max": 0.07508250825082509,
+          "spread": 0.21924055538705237
+        },
+        "step_timing.prefill_penalty_p50_ms": {
+          "n": 3,
+          "median": 4.374658000415366,
+          "min": 4.156887999897663,
+          "max": 68.03884300006757,
+          "spread": 14.602731229299396
+        },
+        "step_timing.expected_gap_ms": {
+          "n": 3,
+          "median": 6.753578295107975,
+          "min": 6.597181201927685,
+          "max": 10.59323516638473,
+          "spread": 0.5916943270431363
+        },
+        "step_timing.prefill_share_of_gap": {
+          "n": 3,
+          "median": 0.04863500222521272,
+          "min": 0.04319044651033729,
+          "max": 0.3857221238215522,
+          "spread": 7.0429045263545635
+        },
+        "step_timing.host_stage_ms_p50": {
+          "n": 3,
+          "median": 0.053916000069875736,
+          "min": 0.053406999995786464,
+          "max": 0.05605200021818746,
+          "spread": 0.04905779766624092
+        },
+        "step_timing.decode_gpu_ms_p50": {
+          "n": 3,
+          "median": 6.339615821838379,
+          "min": 6.210912227630615,
+          "max": 6.416575908660889,
+          "spread": 0.03244103220290004
+        },
+        "step_timing.prefill_gpu_ms_p50": {
+          "n": 3,
+          "median": 10.514816284179688,
+          "min": 10.322336196899414,
+          "max": 73.57097625732422,
+          "spread": 6.015192120435525
+        },
+        "step_timing.fused_gpu_ms_p50": {
+          "n": 0
+        },
+        "step_timing.sync_ms_p50": {
+          "n": 3,
+          "median": 6.324007999864989,
+          "min": 6.195332999823222,
+          "max": 6.400218000180757,
+          "spread": 0.032397966663215705
+        },
+        "step_timing.lazy_graph_captures": {
+          "n": 3,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "latency.itl_p999": {
+          "n": 3,
+          "median": 7.507066,
+          "min": 7.368987,
+          "max": 7.548458,
+          "spread": 0.023906943138637702
+        }
+      },
+      "violations": [],
+      "coverage_gaps": [
+        "no admission rejection occurred",
+        "no preemption occurred: pool was not under pressure",
+        "states reached but never cancelled from: ['WAITING', 'PREFILLING']",
+        "states reached but never cancelled from: ['WAITING']"
+      ]
+    }
+  },
+  "comparison": {
+    "step_timing.expected_gap_ms": "unresolved: -8.3% median change is within 59.2% run-to-run spread",
+    "step_timing.prefill_share_of_gap": "unresolved: -59.1% median change is within 704.3% run-to-run spread",
+    "latency.itl_p50": "unresolved: +0.1% median change is within 4.0% run-to-run spread",
+    "latency.itl_p99": "unresolved: +1.2% median change is within 4.7% run-to-run spread",
+    "latency.itl_p999": "unresolved: +1.7% median change is within 2.4% run-to-run spread",
+    "latency.ttft_p50": "-32.2% (spread 27.8%)",
+    "step_timing.decode_step_p50_ms": "unresolved: +0.0% median change is within 4.0% run-to-run spread",
+    "step_timing.prefill_step_p50_ms": "unresolved: +10.2% median change is within 593.3% run-to-run spread",
+    "step_timing.prefill_step_fraction": "-73.3% (spread 24.8%)",
+    "step_timing.prefill_penalty_p50_ms": "unresolved: +29.7% median change is within 1460.3% run-to-run spread",
+    "waste_ratio": "baseline is zero",
+    "step_timing.host_stage_ms_p50": "unresolved: -0.3% median change is within 4.9% run-to-run spread",
+    "step_timing.decode_gpu_ms_p50": "unresolved: +0.0% median change is within 4.1% run-to-run spread",
+    "step_timing.prefill_gpu_ms_p50": "unresolved: +8.8% median change is within 601.5% run-to-run spread",
+    "step_timing.fused_gpu_ms_p50": "no data",
+    "step_timing.sync_ms_p50": "unresolved: -0.0% median change is within 4.1% run-to-run spread",
+    "step_timing.lazy_graph_captures": "baseline is zero"
+  },
+  "comparisons": {
+    "whole_prompt_idle": {
+      "step_timing.expected_gap_ms": "unresolved: -8.3% median change is within 59.2% run-to-run spread",
+      "step_timing.prefill_share_of_gap": "unresolved: -59.1% median change is within 704.3% run-to-run spread",
+      "latency.itl_p50": "unresolved: +0.1% median change is within 4.0% run-to-run spread",
+      "latency.itl_p99": "unresolved: +1.2% median change is within 4.7% run-to-run spread",
+      "latency.itl_p999": "unresolved: +1.7% median change is within 2.4% run-to-run spread",
+      "latency.ttft_p50": "-32.2% (spread 27.8%)",
+      "step_timing.decode_step_p50_ms": "unresolved: +0.0% median change is within 4.0% run-to-run spread",
+      "step_timing.prefill_step_p50_ms": "unresolved: +10.2% median change is within 593.3% run-to-run spread",
+      "step_timing.prefill_step_fraction": "-73.3% (spread 24.8%)",
+      "step_timing.prefill_penalty_p50_ms": "unresolved: +29.7% median change is within 1460.3% run-to-run spread",
+      "waste_ratio": "baseline is zero",
+      "step_timing.host_stage_ms_p50": "unresolved: -0.3% median change is within 4.9% run-to-run spread",
+      "step_timing.decode_gpu_ms_p50": "unresolved: +0.0% median change is within 4.1% run-to-run spread",
+      "step_timing.prefill_gpu_ms_p50": "unresolved: +8.8% median change is within 601.5% run-to-run spread",
+      "step_timing.fused_gpu_ms_p50": "no data",
+      "step_timing.sync_ms_p50": "unresolved: -0.0% median change is within 4.1% run-to-run spread",
+      "step_timing.lazy_graph_captures": "baseline is zero"
+    }
+  }
+}

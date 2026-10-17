@@ -1,0 +1,161 @@
+{
+  "config": {
+    "seq_lens": "1024,4096",
+    "batches": "1,8",
+    "per_head_configs": "128x4",
+    "split_configs": "64x2",
+    "splits": "8",
+    "prefetch_value": true,
+    "warmup": 15,
+    "rounds": 100,
+    "max_error": 0.002,
+    "output": "results/rtx4060/paged_decode_prefetch_v_ab.json"
+  },
+  "environment": {
+    "timestamp_utc": "2026-10-15T09:54:03.611159+00:00",
+    "hardware": {
+      "gpu": "NVIDIA GeForce RTX 4060",
+      "compute_capability": "8.9",
+      "multiprocessor_count": 24,
+      "total_memory_bytes": 8183349248,
+      "framework_bf16_supported": true,
+      "native_bf16_tensor_cores": true
+    },
+    "software": {
+      "python": "3.14.4",
+      "torch": "2.14.0+cu130",
+      "cuda": "13.0",
+      "transformers": "5.17.0",
+      "triton": "3.8.0"
+    }
+  },
+  "git": {
+    "commit": "19b1fc7ab08f017e2e156dc977ac5bc1efacdd72",
+    "short": "19b1fc7",
+    "branch": "main",
+    "dirty": true
+  },
+  "device": "NVIDIA GeForce RTX 4060",
+  "rows": [
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "arm": "per_head_128x4",
+      "median_ms": 0.043007999658584595,
+      "min_ms": 0.01945599913597107,
+      "max_ms": 0.20582400262355804,
+      "speedup_vs_128x4": 1.0,
+      "max_abs_diff": 0.0
+    },
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "arm": "split8_64x2",
+      "median_ms": 0.05632000043988228,
+      "min_ms": 0.011264000087976456,
+      "max_ms": 0.19251200556755066,
+      "speedup_vs_128x4": 0.7636363516099876,
+      "max_abs_diff": 4.76837158203125e-07
+    },
+    {
+      "batch": 1,
+      "seq_len": 1024,
+      "arm": "split8_64x2_prefetch_v",
+      "median_ms": 0.05632000043988228,
+      "min_ms": 0.01228800043463707,
+      "max_ms": 1.4847999811172485,
+      "speedup_vs_128x4": 0.7636363516099876,
+      "max_abs_diff": 4.76837158203125e-07
+    },
+    {
+      "batch": 8,
+      "seq_len": 1024,
+      "arm": "per_head_128x4",
+      "median_ms": 0.1523360013961792,
+      "min_ms": 0.13926400244235992,
+      "max_ms": 0.4055039882659912,
+      "speedup_vs_128x4": 1.0,
+      "max_abs_diff": 0.0
+    },
+    {
+      "batch": 8,
+      "seq_len": 1024,
+      "arm": "split8_64x2",
+      "median_ms": 0.1730560064315796,
+      "min_ms": 0.130048006772995,
+      "max_ms": 1.6302080154418945,
+      "speedup_vs_128x4": 0.8802699457669944,
+      "max_abs_diff": 6.103515625e-05
+    },
+    {
+      "batch": 8,
+      "seq_len": 1024,
+      "arm": "split8_64x2_prefetch_v",
+      "median_ms": 0.1714560016989708,
+      "min_ms": 0.12902399897575378,
+      "max_ms": 1.656831979751587,
+      "speedup_vs_128x4": 0.8884845084842173,
+      "max_abs_diff": 6.103515625e-05
+    },
+    {
+      "batch": 1,
+      "seq_len": 4096,
+      "arm": "per_head_128x4",
+      "median_ms": 0.0942080020904541,
+      "min_ms": 0.06860800087451935,
+      "max_ms": 0.27136000990867615,
+      "speedup_vs_128x4": 1.0,
+      "max_abs_diff": 0.0
+    },
+    {
+      "batch": 1,
+      "seq_len": 4096,
+      "arm": "split8_64x2",
+      "median_ms": 0.06532799825072289,
+      "min_ms": 0.02969600073993206,
+      "max_ms": 0.24345600605010986,
+      "speedup_vs_128x4": 1.4420769748506972,
+      "max_abs_diff": 2.384185791015625e-07
+    },
+    {
+      "batch": 1,
+      "seq_len": 4096,
+      "arm": "split8_64x2_prefetch_v",
+      "median_ms": 0.0655359998345375,
+      "min_ms": 0.030719999223947525,
+      "max_ms": 1.5081919431686401,
+      "speedup_vs_128x4": 1.4375000355271368,
+      "max_abs_diff": 2.384185791015625e-07
+    },
+    {
+      "batch": 8,
+      "seq_len": 4096,
+      "arm": "per_head_128x4",
+      "median_ms": 0.5530079901218414,
+      "min_ms": 0.5347200036048889,
+      "max_ms": 1.9931199550628662,
+      "speedup_vs_128x4": 1.0,
+      "max_abs_diff": 0.0
+    },
+    {
+      "batch": 8,
+      "seq_len": 4096,
+      "arm": "split8_64x2",
+      "median_ms": 0.5714559853076935,
+      "min_ms": 0.5447679758071899,
+      "max_ms": 2.0357120037078857,
+      "speedup_vs_128x4": 0.9677175571519844,
+      "max_abs_diff": 3.0517578125e-05
+    },
+    {
+      "batch": 8,
+      "seq_len": 4096,
+      "arm": "split8_64x2_prefetch_v",
+      "median_ms": 0.5703839957714081,
+      "min_ms": 0.5447679758071899,
+      "max_ms": 0.8181759715080261,
+      "speedup_vs_128x4": 0.9695363022483359,
+      "max_abs_diff": 3.0517578125e-05
+    }
+  ]
+}

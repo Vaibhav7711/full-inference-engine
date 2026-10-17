@@ -52,6 +52,8 @@ def capture_fused_step_graph(
     engine._set_attention(engine.FUSED_ATTN_NAME)
     _, _, block_tables, seq_lens = engine._prepare_decode_metadata([], graph_bucket_size=decode_rows)
     engine._prepare_prefill_metadata([], prefill_rows)
+    if getattr(engine, "packed_fused_prefill", False):
+        engine._prepare_packed_metadata([], prefill_rows)
 
     def set_contexts():
         engine._set_fused_contexts(

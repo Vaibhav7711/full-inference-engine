@@ -1,0 +1,59 @@
+{
+  "args": {
+    "model": "Qwen/Qwen3-1.7B",
+    "batch": 4,
+    "prompt_tokens": 512,
+    "steps": 8,
+    "w8a16_mlp": true,
+    "out": "results/rtx4060/decode_kernel_share_1.7b_w8a16.json"
+  },
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "note": "eager decode; graph replay removes launch gaps but not kernel time",
+  "shares": {
+    "gemm": {
+      "share": 0.48792110807652744,
+      "us_per_step": 5404.158874999989,
+      "launches_per_step": 113.0
+    },
+    "w8a16_gemm": {
+      "share": 0.3866546778597068,
+      "us_per_step": 4282.54337500001,
+      "launches_per_step": 84.0
+    },
+    "attention": {
+      "share": 0.09629448062357682,
+      "us_per_step": 1066.546749999996,
+      "launches_per_step": 28.0
+    },
+    "rmsnorm": {
+      "share": 0.01224862438495868,
+      "us_per_step": 135.66437500001268,
+      "launches_per_step": 113.0
+    },
+    "other": {
+      "share": 0.0068975629298655946,
+      "us_per_step": 76.39662499999415,
+      "launches_per_step": 72.0
+    },
+    "kv_write": {
+      "share": 0.003328728999155058,
+      "us_per_step": 36.86862499999114,
+      "launches_per_step": 28.0
+    },
+    "rope": {
+      "share": 0.0030696865317550834,
+      "us_per_step": 33.999500000008766,
+      "launches_per_step": 28.0
+    },
+    "swiglu": {
+      "share": 0.0026320691956340314,
+      "us_per_step": 29.152499999997474,
+      "launches_per_step": 28.0
+    },
+    "sampling": {
+      "share": 0.0009530613988205247,
+      "us_per_step": 10.55600000000004,
+      "launches_per_step": 1.0
+    }
+  }
+}

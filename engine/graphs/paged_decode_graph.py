@@ -22,7 +22,10 @@ class PagedDecodeGraph:
         return self.logits
 
 
-def capture_paged_decode_graph(engine, *, batch_size: int, block_n: int, num_warps: int) -> PagedDecodeGraph:
+def capture_paged_decode_graph(
+    engine, *, batch_size: int, block_n: int, num_warps: int,
+    max_sequence_length: int,
+) -> PagedDecodeGraph:
     """Capture one fixed-width paged-decode model forward.
 
     The engine's decode metadata tensors have fixed addresses for its lifetime.  Callers
@@ -50,10 +53,12 @@ def capture_paged_decode_graph(engine, *, batch_size: int, block_n: int, num_war
         value_scale_pool=engine.value_scale_pool,
         decode_kernel=getattr(engine, "decode_attention", "per_head"),
         decode_backend=engine.decode_backend,
-        # A graph is captured for one shape, and a split-K decode backend picks its split
-        # count from this bound; the bucket's longest possible row is what replay must
-        # assume, so capture records the same value the regime was chosen for.
-        decode_max_len=128 if block_n >= 128 else 127,
+        decode_num_splits=engine.decode_num_splits,
+        # Split-K bakes the key-range partition into the captured kernel. Its graph
+        # key includes this length bound so replay never uses a stale partition.
+        decode_max_len=max_sequence_length,
+        key_smoothing=getattr(engine, "key_smoothing", None),
+        int8_decode_tuned=getattr(engine, "int8_decode_tuned", False),
     )
     engine.model.config._attn_implementation = engine.ATTN_NAME
     if hasattr(engine.model.config, "_attn_implementation_internal"):

@@ -1,0 +1,189 @@
+{
+  "args": {
+    "models": [
+      "Qwen/Qwen3-0.6B",
+      "Qwen/Qwen3-1.7B"
+    ],
+    "requests": 16,
+    "new_tokens": 128,
+    "context": 512,
+    "prompt_set": "instructions",
+    "out": "results/rtx4060/spec_ngram_cost_model_instructions.json"
+  },
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "models": {
+    "Qwen/Qwen3-0.6B": {
+      "decode_cost_ms_k1": 8.083538208007813,
+      "verify_cost_ms": {
+        "1": 8.083538208007813,
+        "2": 8.762347412109374,
+        "3": 8.814571533203125,
+        "4": 8.83873779296875,
+        "5": 8.80564208984375,
+        "6": 8.817049560546875,
+        "8": 8.836935424804688
+      },
+      "rows": {
+        "2": {
+          "draft_tokens": 1,
+          "tokens_per_verify_step": 1.0790305584826132,
+          "verify_cost_ms": 8.762347412109374,
+          "relative_cost": 1.0839742680289568,
+          "modelled_speedup": 0.9954392740748975,
+          "per_request_tokens_per_step": {
+            "min": 1.032258064516129,
+            "median": 1.0848236730589673,
+            "max": 1.1428571428571428
+          }
+        },
+        "3": {
+          "draft_tokens": 2,
+          "tokens_per_verify_step": 1.097534833869239,
+          "verify_cost_ms": 8.814571533203125,
+          "relative_cost": 1.0904348202957868,
+          "modelled_speedup": 1.0065111764970291,
+          "per_request_tokens_per_step": {
+            "min": 1.032258064516129,
+            "median": 1.0848236730589673,
+            "max": 1.1743119266055047
+          }
+        },
+        "4": {
+          "draft_tokens": 3,
+          "tokens_per_verify_step": 1.1052347544522396,
+          "verify_cost_ms": 8.83873779296875,
+          "relative_cost": 1.0934243849076897,
+          "modelled_speedup": 1.010801267748887,
+          "per_request_tokens_per_step": {
+            "min": 1.032258064516129,
+            "median": 1.0893814283644794,
+            "max": 1.1962616822429906
+          }
+        },
+        "5": {
+          "draft_tokens": 4,
+          "tokens_per_verify_step": 1.1064289573203674,
+          "verify_cost_ms": 8.80564208984375,
+          "relative_cost": 1.0893301748880952,
+          "modelled_speedup": 1.0156966022115643,
+          "per_request_tokens_per_step": {
+            "min": 1.032258064516129,
+            "median": 1.0893814283644794,
+            "max": 1.1962616822429906
+          }
+        },
+        "6": {
+          "draft_tokens": 5,
+          "tokens_per_verify_step": 1.107027027027027,
+          "verify_cost_ms": 8.817049560546875,
+          "relative_cost": 1.090741372609883,
+          "modelled_speedup": 1.014930812038583,
+          "per_request_tokens_per_step": {
+            "min": 1.032258064516129,
+            "median": 1.0893814283644794,
+            "max": 1.2075471698113207
+          }
+        },
+        "8": {
+          "draft_tokens": 7,
+          "tokens_per_verify_step": 1.1094257854821234,
+          "verify_cost_ms": 8.836935424804688,
+          "relative_cost": 1.093201417177757,
+          "modelled_speedup": 1.0148411519134797,
+          "per_request_tokens_per_step": {
+            "min": 1.032258064516129,
+            "median": 1.0893814283644794,
+            "max": 1.2307692307692308
+          }
+        }
+      }
+    },
+    "Qwen/Qwen3-1.7B": {
+      "decode_cost_ms_k1": 16.8260400390625,
+      "verify_cost_ms": {
+        "1": 16.8260400390625,
+        "2": 17.651895751953123,
+        "3": 17.722470703125,
+        "4": 17.7712744140625,
+        "5": 17.778565673828126,
+        "6": 17.8058447265625,
+        "8": 17.858355712890624
+      },
+      "rows": {
+        "2": {
+          "draft_tokens": 1,
+          "tokens_per_verify_step": 1.0694516971279373,
+          "verify_cost_ms": 17.651895751953123,
+          "relative_cost": 1.0490820009326827,
+          "modelled_speedup": 1.0194166863764178,
+          "per_request_tokens_per_step": {
+            "min": 1.0,
+            "median": 1.0756302521008403,
+            "max": 1.1228070175438596
+          }
+        },
+        "3": {
+          "draft_tokens": 2,
+          "tokens_per_verify_step": 1.0876261285183217,
+          "verify_cost_ms": 17.722470703125,
+          "relative_cost": 1.0532763895712474,
+          "modelled_speedup": 1.0326122746955877,
+          "per_request_tokens_per_step": {
+            "min": 1.0,
+            "median": 1.0893814283644794,
+            "max": 1.1636363636363636
+          }
+        },
+        "4": {
+          "draft_tokens": 3,
+          "tokens_per_verify_step": 1.0934329951948745,
+          "verify_cost_ms": 17.7712744140625,
+          "relative_cost": 1.056176876603502,
+          "modelled_speedup": 1.0352745069662785,
+          "per_request_tokens_per_step": {
+            "min": 1.0,
+            "median": 1.0987326849395815,
+            "max": 1.1743119266055047
+          }
+        },
+        "5": {
+          "draft_tokens": 4,
+          "tokens_per_verify_step": 1.0969469737546866,
+          "verify_cost_ms": 17.778565673828126,
+          "relative_cost": 1.0566102084955395,
+          "modelled_speedup": 1.0381756346236526,
+          "per_request_tokens_per_step": {
+            "min": 1.0,
+            "median": 1.0987326849395815,
+            "max": 1.1851851851851851
+          }
+        },
+        "6": {
+          "draft_tokens": 5,
+          "tokens_per_verify_step": 1.099302200751476,
+          "verify_cost_ms": 17.8058447265625,
+          "relative_cost": 1.0582314487083908,
+          "modelled_speedup": 1.038810746073757,
+          "per_request_tokens_per_step": {
+            "min": 1.0,
+            "median": 1.1082458770614694,
+            "max": 1.1851851851851851
+          }
+        },
+        "8": {
+          "draft_tokens": 7,
+          "tokens_per_verify_step": 1.099892588614393,
+          "verify_cost_ms": 17.858355712890624,
+          "relative_cost": 1.061352265383391,
+          "modelled_speedup": 1.036312470880797,
+          "per_request_tokens_per_step": {
+            "min": 1.0,
+            "median": 1.1082458770614694,
+            "max": 1.1962616822429906
+          }
+        }
+      }
+    }
+  },
+  "host_draft_lookup_us_history2048_nomatch": 284.14814499967633
+}

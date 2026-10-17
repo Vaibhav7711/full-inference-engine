@@ -1,0 +1,37 @@
+{
+  "arm": "engine_default",
+  "label": "old_head",
+  "model": "Qwen/Qwen3-0.6B",
+  "engine_tree": "/tmp/claude-1000/-home-divy-Documents-inference-engine/98a20e7c-7337-412d-9842-0f699f5519fd/scratchpad/old_head",
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "new_tokens": 128,
+  "results": {
+    "128": {
+      "prompt_tokens": 128,
+      "runs": 3,
+      "ttft_ms": 13.351567,
+      "itl_p50_ms": 5.450819,
+      "itl_mean_ms": 5.49882379527559,
+      "decode_tok_s": 183.45866923851258,
+      "end_to_end_ms": 711.4638949999517,
+      "end_to_end_tok_s": 179.9107458573266,
+      "peak_allocated_gib": 1.4041719436645508
+    },
+    "2048": {
+      "prompt_tokens": 2048,
+      "runs": 3,
+      "ttft_ms": 239.480082,
+      "itl_p50_ms": 6.536284,
+      "itl_mean_ms": 6.587641076115486,
+      "decode_tok_s": 152.99212824901733,
+      "end_to_end_ms": 1075.9601800000382,
+      "end_to_end_tok_s": 118.9635103410569,
+      "peak_allocated_gib": 1.412226676940918
+    },
+    "warmup_s": 0.8238304569999855,
+    "lazy_graph_captures": 0,
+    "engine_settings": {
+      "prefill_attention": "sdpa"
+    }
+  }
+}

@@ -1,0 +1,199 @@
+{
+  "args": {
+    "model": "Qwen/Qwen3-1.7B",
+    "width": 5,
+    "new_tokens": 128,
+    "requests": 8,
+    "repeats": 3,
+    "out": "results/rtx4060/spec_ngram_batch1_probe_1.7b.json"
+  },
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "sets": {
+    "corpus": {
+      "rows": [
+        {
+          "prompt_tokens": 719,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 37,
+          "tokens_per_step": 3.4594594594594597,
+          "greedy_s": 2.4046997609999607,
+          "spec_s": 0.8314627660000724,
+          "spread": 0.01467442280002569
+        },
+        {
+          "prompt_tokens": 857,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 64,
+          "tokens_per_step": 2.0,
+          "greedy_s": 2.4300823820000232,
+          "spec_s": 1.3999810359999856,
+          "spread": 0.04224931301135983
+        },
+        {
+          "prompt_tokens": 743,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 72,
+          "tokens_per_step": 1.7777777777777777,
+          "greedy_s": 2.4457635080000273,
+          "spec_s": 1.5219376059999377,
+          "spread": 0.020910868460004155
+        },
+        {
+          "prompt_tokens": 566,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 43,
+          "tokens_per_step": 2.9767441860465116,
+          "greedy_s": 2.385387184000024,
+          "spec_s": 0.9297401060000539,
+          "spread": 0.0012654821910567035
+        },
+        {
+          "prompt_tokens": 966,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 87,
+          "tokens_per_step": 1.471264367816092,
+          "greedy_s": 2.4760251939999307,
+          "spec_s": 1.8662665900000093,
+          "spread": 0.013172590520844638
+        },
+        {
+          "prompt_tokens": 661,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 60,
+          "tokens_per_step": 2.1333333333333333,
+          "greedy_s": 2.413754112000106,
+          "spec_s": 1.290228905000049,
+          "spread": 0.015056080300737905
+        },
+        {
+          "prompt_tokens": 797,
+          "identical": false,
+          "first_mismatch": 68,
+          "verify_steps": 68,
+          "tokens_per_step": 1.8823529411764706,
+          "greedy_s": 2.433021134000114,
+          "spec_s": 1.4579109579999567,
+          "spread": 0.011281629911193422
+        },
+        {
+          "prompt_tokens": 503,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 67,
+          "tokens_per_step": 1.9104477611940298,
+          "greedy_s": 2.370772734000184,
+          "spec_s": 1.386088953999888,
+          "spread": 0.012856234409546086
+        }
+      ],
+      "summary": {
+        "identical_requests": 7,
+        "requests": 8,
+        "speedup_median": 1.723100553150366,
+        "speedup_min": 1.3267264212236252,
+        "speedup_max": 2.892131625530603,
+        "aggregate_speedup": 1.8120741460644194,
+        "tokens_per_step_median": 1.955223880597015
+      }
+    },
+    "instructions": {
+      "rows": [
+        {
+          "prompt_tokens": 22,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 114,
+          "tokens_per_step": 1.1228070175438596,
+          "greedy_s": 2.3266648970000006,
+          "spec_s": 2.261420797000028,
+          "spread": 0.00960045128492143
+        },
+        {
+          "prompt_tokens": 21,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 115,
+          "tokens_per_step": 1.1130434782608696,
+          "greedy_s": 2.3372148529999777,
+          "spec_s": 2.2746124880000025,
+          "spread": 0.011421444616365708
+        },
+        {
+          "prompt_tokens": 22,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 114,
+          "tokens_per_step": 1.1228070175438596,
+          "greedy_s": 2.3191130730001532,
+          "spec_s": 2.2557294040000215,
+          "spread": 0.01510510743872857
+        },
+        {
+          "prompt_tokens": 21,
+          "identical": false,
+          "first_mismatch": 54,
+          "verify_steps": 108,
+          "tokens_per_step": 1.1851851851851851,
+          "greedy_s": 2.3195228480001333,
+          "spec_s": 2.136543114999995,
+          "spread": 0.00723597140436723
+        },
+        {
+          "prompt_tokens": 20,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 110,
+          "tokens_per_step": 1.1636363636363636,
+          "greedy_s": 2.3252667159999874,
+          "spec_s": 2.18178259299998,
+          "spread": 0.013168400764219504
+        },
+        {
+          "prompt_tokens": 19,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 107,
+          "tokens_per_step": 1.1962616822429906,
+          "greedy_s": 2.3440418749999026,
+          "spec_s": 2.117367963000106,
+          "spread": 0.02077443069348292
+        },
+        {
+          "prompt_tokens": 20,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 122,
+          "tokens_per_step": 1.0491803278688525,
+          "greedy_s": 2.3405624449999323,
+          "spec_s": 2.438673074999997,
+          "spread": 0.012549608356076679
+        },
+        {
+          "prompt_tokens": 21,
+          "identical": true,
+          "first_mismatch": null,
+          "verify_steps": 112,
+          "tokens_per_step": 1.1428571428571428,
+          "greedy_s": 2.321609684000123,
+          "spec_s": 2.219278891000158,
+          "spread": 0.01284897635701644
+        }
+      ],
+      "summary": {
+        "identical_requests": 7,
+        "requests": 8,
+        "speedup_median": 1.0374804312261514,
+        "speedup_min": 0.9597688468348449,
+        "speedup_max": 1.1070545677278603,
+        "aggregate_speedup": 1.0418546812773455,
+        "tokens_per_step_median": 1.1328320802005012
+      }
+    }
+  }
+}

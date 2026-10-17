@@ -1,0 +1,38 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "sequences": 16,
+  "length": 1024,
+  "summary": {
+    "None": {
+      "top1_agreement": 1.0,
+      "mean_kl": 0.0,
+      "ppl": 15.241117437173523
+    },
+    "token": {
+      "top1_agreement": 0.9104349911212921,
+      "mean_kl": 0.041383687352155314,
+      "ppl": 15.67600707575018
+    },
+    "group32": {
+      "top1_agreement": 0.9429374374449253,
+      "mean_kl": 0.016157625387818758,
+      "ppl": 15.341908784759452
+    },
+    "smooth": {
+      "top1_agreement": 0.9775782153010368,
+      "mean_kl": 0.0023883271708407183,
+      "ppl": 15.265106089648286
+    },
+    "smooth_g32": {
+      "top1_agreement": 0.9788001142442226,
+      "mean_kl": 0.0018068845456653618,
+      "ppl": 15.243065487110606
+    },
+    "fp16k": {
+      "top1_agreement": 0.9952957034111023,
+      "mean_kl": 0.00011005830181305564,
+      "ppl": 15.244599322912505
+    }
+  },
+  "note": "teacher-forced; fake-quant mirrors engine per-token INT8 KV; 'vonly' = FP16 K + INT8 V"
+}

@@ -1,0 +1,19 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "model": "Qwen/Qwen3-0.6B",
+  "batch": 1,
+  "context": 4096,
+  "steps": 4,
+  "decode_attention": "split_k",
+  "prefill_steps": 32,
+  "decode_num_splits": 8,
+  "decode_graph_keys": [
+    [
+      1,
+      128,
+      4,
+      4224
+    ]
+  ],
+  "lazy_graph_captures": 6
+}

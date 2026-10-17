@@ -15,3 +15,7 @@ results/*.prof
 
 # local archives
 *.zip
+
+# Machine-local model checkpoints. Benchmark evidence records the exact model id/path,
+# but multi-gigabyte weights must never be committed to the source repository.
+models/

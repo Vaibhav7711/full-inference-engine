@@ -1,0 +1,23 @@
+{
+  "model": "Qwen/Qwen3-1.7B",
+  "lm_head_w8a16": true,
+  "int8_kv_smoothed_fake_quant": true,
+  "settings": {
+    "1024": {
+      "sequences": 16,
+      "scored_tail": 1023,
+      "top1_agreement": 0.9733015640273706,
+      "mean_kl": 0.004122574441317007,
+      "ppl_fp16": 11.364622156007055,
+      "ppl_w8a16": 11.298700096661534
+    },
+    "4096": {
+      "sequences": 8,
+      "scored_tail": 512,
+      "top1_agreement": 0.9765625,
+      "mean_kl": 0.0037739053259429056,
+      "ppl_fp16": 7.921075564377081,
+      "ppl_w8a16": 7.839011064421434
+    }
+  }
+}

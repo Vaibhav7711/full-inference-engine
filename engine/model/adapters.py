@@ -167,6 +167,15 @@ def mlp_modules(model, *, gate: str = "gate_proj", up: str = "up_proj",
     return found
 
 
+def attention_modules(model, *, projections: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")) -> list:
+    """Every attention block with the four named projections, as `(path, module)` pairs."""
+    found = []
+    for path, module in model.named_modules():
+        if all(hasattr(module, name) for name in projections):
+            found.append((path, module))
+    return found
+
+
 def norm_modules(model, *, suffix: str = "rmsnorm") -> list:
     """Every RMSNorm-shaped module: one weight, an epsilon, no bias."""
     found = []

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Kinds this policy has a measured regime for. Other backends (flash, which tiles
 # internally) accept the values and ignore them.
-DECODE_ATTENTION_KINDS = ("per_head", "gqa", "split_k")
+DECODE_ATTENTION_KINDS = ("per_head", "gqa", "split_k", "ada")
 
 
 def select_paged_decode_config(
@@ -24,6 +24,8 @@ def select_paged_decode_config(
     """
     if max_sequence_length <= 0 or batch_size <= 0:
         raise ValueError("max_sequence_length and batch_size must be positive")
+    if kernel == "ada":
+        return select_ada_decode_config(max_sequence_length, batch_size)
     block_n = 128 if max_sequence_length >= 128 else 64
     return block_n, 4
 
@@ -46,3 +48,32 @@ def choose_splits(
     by_length = max(1, max_sequence_length // block_n)
     splits = min(wanted, by_length, limit)
     return 1 << (splits.bit_length() - 1) if splits > 0 else 1
+
+
+def select_ada_decode_config(
+    max_sequence_length: int, batch_size: int,
+) -> tuple[int, int]:
+    """Tile regime measured on the 24-SM RTX 4060 (sm_89).
+
+    The confirmation sweep retained the established launch outside the paired-GQA win
+    cells: broad 64x2 dispatch regressed launch-dominated batch-1/4 cases. Eight-row GQA
+    keeps a 128x4 tile; sixteen-row short-context GQA uses 64x2 for higher residency.
+    """
+    if max_sequence_length <= 0 or batch_size <= 0:
+        raise ValueError("max_sequence_length and batch_size must be positive")
+    if use_ada_paired_gqa(max_sequence_length, batch_size):
+        # This is also a stable graph-regime marker: the established policy never emits
+        # 64x2, so a captured graph cannot replay the wrong side of the GQA crossover.
+        return 64, 2
+    return select_paged_decode_config(max_sequence_length, batch_size)
+
+
+def use_ada_paired_gqa(max_sequence_length: int, batch_size: int) -> bool:
+    """Cells where halving K/V reads beats the narrower program grid on RTX 4060."""
+    if max_sequence_length <= 0 or batch_size <= 0:
+        raise ValueError("max_sequence_length and batch_size must be positive")
+    if 6 <= batch_size <= 8:
+        return 128 <= max_sequence_length <= 512
+    if batch_size >= 12:
+        return max_sequence_length <= 256
+    return False

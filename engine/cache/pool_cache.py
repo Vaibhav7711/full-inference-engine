@@ -13,7 +13,7 @@ class BatchedPoolBackedPrefillCache(DynamicCache):
 
     def __init__(
         self, key_pool, value_pool, block_tables, seq_lens, padded_length,
-        key_scale_pool=None, value_scale_pool=None,
+        key_scale_pool=None, value_scale_pool=None, key_smoothing=None,
     ):
         if not key_pool or len(key_pool) != len(value_pool):
             raise ValueError("matching non-empty per-layer K/V pools are required")
@@ -30,6 +30,8 @@ class BatchedPoolBackedPrefillCache(DynamicCache):
             raise ValueError("scale pools must match the layer count")
         self.key_scale_pool = key_scale_pool
         self.value_scale_pool = value_scale_pool
+        # INT8 only: per-layer static key smoothing applied by the write kernel.
+        self.key_smoothing = key_smoothing
         self._layer_lengths = [0] * len(key_pool)
         self.layer_class_to_replicate = None
         try:
@@ -53,6 +55,8 @@ class BatchedPoolBackedPrefillCache(DynamicCache):
                 key_states, value_states, self.key_pool[layer_idx], self.value_pool[layer_idx],
                 self.key_scale_pool[layer_idx], self.value_scale_pool[layer_idx],
                 self.block_tables, self.seq_lens,
+                key_smoothing=(self.key_smoothing[layer_idx]
+                               if self.key_smoothing is not None else None),
             )
         self._layer_lengths[layer_idx] = self.padded_length
         return key_states, value_states

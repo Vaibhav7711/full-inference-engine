@@ -1,0 +1,26 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-0.6B",
+    "num_requests": 4,
+    "max_new_tokens": 16,
+    "rounds": 3,
+    "num_blocks": 128,
+    "block_size": 16,
+    "cuda_graph_batch_size": 4,
+    "output": "results/rtx4060/mlp_gate_up_fusion_ab_short.json"
+  },
+  "unfused_ms": [
+    101.07582900127454,
+    101.01443100029428,
+    101.10019000057946
+  ],
+  "fused_ms": [
+    100.82074400088459,
+    100.48299099980795,
+    101.25960999903327
+  ],
+  "unfused_median_ms": 101.07582900127454,
+  "fused_median_ms": 100.82074400088459,
+  "fused_speedup": 1.0025300844872531,
+  "token_identical": true
+}

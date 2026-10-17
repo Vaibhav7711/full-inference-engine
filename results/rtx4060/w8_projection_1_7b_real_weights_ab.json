@@ -1,0 +1,353 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.14.0+cu130",
+  "scope": "Layer-0 checkpoint weights at qwen3_1_7b projection shapes; per-call CUDA events, no model serving or AWQ packing",
+  "rows": [
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.021503999829292297,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.030047999694943428,
+      "relative_error": 0.009450127370655537
+    },
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 0.10635199770331383,
+      "relative_error": 0.013216858729720116
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.01945599913597107,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "w8a16",
+      "median_ms": 0.03167999908328056,
+      "relative_error": 0.009121343493461609
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "w8a8",
+      "median_ms": 0.10371199995279312,
+      "relative_error": 0.012263437733054161
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.019696000032126904,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.02969600073993206,
+      "relative_error": 0.009397842921316624
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 0.10542399808764458,
+      "relative_error": 0.01268813107162714
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.020479999482631683,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "w8a16",
+      "median_ms": 0.030592000111937523,
+      "relative_error": 0.009386267513036728
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "w8a8",
+      "median_ms": 0.10361599922180176,
+      "relative_error": 0.01252885814756155
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.015359999611973763,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.02932799980044365,
+      "relative_error": 0.008977868594229221
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 0.10339199751615524,
+      "relative_error": 0.012144117616117
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.014976000413298607,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "w8a16",
+      "median_ms": 0.030719999223947525,
+      "relative_error": 0.008596748113632202
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "w8a8",
+      "median_ms": 0.10366399958729744,
+      "relative_error": 0.011928766965866089
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.015279999934136868,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.03003200050443411,
+      "relative_error": 0.008800720795989037
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 0.10051199793815613,
+      "relative_error": 0.012126466259360313
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.015359999611973763,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "w8a16",
+      "median_ms": 0.02969600073993206,
+      "relative_error": 0.008743026293814182
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "w8a8",
+      "median_ms": 0.10361599922180176,
+      "relative_error": 0.011898837983608246
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.10607999935746193,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.03686400130391121,
+      "relative_error": 0.009111087769269943
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 0.11572800204157829,
+      "relative_error": 0.012411287985742092
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.03766399994492531,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "w8a16",
+      "median_ms": 0.037456000223755836,
+      "relative_error": 0.009120887145400047
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "w8a8",
+      "median_ms": 0.11641599982976913,
+      "relative_error": 0.012516502290964127
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.03876800090074539,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.03699199855327606,
+      "relative_error": 0.008981021121144295
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 0.11771200224757195,
+      "relative_error": 0.012256852351129055
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.044064000248909,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "w8a16",
+      "median_ms": 0.03788800165057182,
+      "relative_error": 0.009078703820705414
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "w8a8",
+      "median_ms": 0.11849600076675415,
+      "relative_error": 0.012397500686347485
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.10649599879980087,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.05353600159287453,
+      "relative_error": 0.009365815669298172
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 0.11873600259423256,
+      "relative_error": 0.014188087545335293
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.048128001391887665,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "w8a16",
+      "median_ms": 0.053247999399900436,
+      "relative_error": 0.009853718802332878
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "w8a8",
+      "median_ms": 0.11990400031208992,
+      "relative_error": 0.013041634112596512
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.04879999905824661,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.053488001227378845,
+      "relative_error": 0.009773539379239082
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 0.12083200365304947,
+      "relative_error": 0.013202965259552002
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.050175998359918594,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "w8a16",
+      "median_ms": 0.05377600155770779,
+      "relative_error": 0.009915980510413647
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "w8a8",
+      "median_ms": 0.12193599715828896,
+      "relative_error": 0.013453218154609203
+    }
+  ],
+  "config": {
+    "batches": "1,4,8,16",
+    "geometry": "qwen3_1_7b",
+    "modes": "fp16,w8a16,w8a8",
+    "real_weights": true,
+    "warmup": 10,
+    "repeats": 50,
+    "include_lm_head": false,
+    "output": "results/rtx4060/w8_projection_1_7b_real_weights_ab.json"
+  }
+}

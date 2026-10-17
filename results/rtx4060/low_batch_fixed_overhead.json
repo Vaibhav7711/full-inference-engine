@@ -1,0 +1,68 @@
+{
+  "Qwen3-0.6B_b1": {
+    "steps": 149,
+    "step_wall_ms": 5.531920000066748,
+    "host_stage_ms": 0.06314200004453596,
+    "decode_event_ms": 5.426784038543701,
+    "sync_ms": 5.4019429999243584,
+    "graph_replay_only_ms": 5.52205810546875,
+    "graph_key": "(1, 128, 4)",
+    "host_overhead_ms": 0.009861894597998244,
+    "host_overhead_fraction": 0.0017827254547931372
+  },
+  "Qwen3-0.6B_b2": {
+    "steps": 148,
+    "step_wall_ms": 5.644417999974394,
+    "host_stage_ms": 0.06000050001375712,
+    "decode_event_ms": 5.551248073577881,
+    "sync_ms": 5.533250499979658,
+    "graph_replay_only_ms": 5.543881225585937,
+    "graph_key": "(2, 128, 4)",
+    "host_overhead_ms": 0.10053677438845643,
+    "host_overhead_fraction": 0.01781171670647222
+  },
+  "Qwen3-0.6B_b4": {
+    "steps": 146,
+    "step_wall_ms": 5.885035000062544,
+    "host_stage_ms": 0.06575499992322875,
+    "decode_event_ms": 5.765727996826172,
+    "sync_ms": 5.747895499951028,
+    "graph_replay_only_ms": 5.602364501953125,
+    "graph_key": "(4, 128, 4)",
+    "host_overhead_ms": 0.282670498109419,
+    "host_overhead_fraction": 0.04803208444918593
+  },
+  "Qwen3-1.7B_b1": {
+    "steps": 149,
+    "step_wall_ms": 14.763086000016301,
+    "host_stage_ms": 0.07832300002519332,
+    "decode_event_ms": 14.603551864624023,
+    "sync_ms": 14.574110000012297,
+    "graph_replay_only_ms": 14.45578857421875,
+    "graph_key": "(1, 128, 4)",
+    "host_overhead_ms": 0.30729742579755026,
+    "host_overhead_fraction": 0.020815256769296808
+  },
+  "Qwen3-1.7B_b2": {
+    "steps": 148,
+    "step_wall_ms": 14.596114000028138,
+    "host_stage_ms": 0.077681500044946,
+    "decode_event_ms": 14.485008239746094,
+    "sync_ms": 14.464001999954235,
+    "graph_replay_only_ms": 15.353843994140625,
+    "graph_key": "(2, 128, 4)",
+    "host_overhead_ms": -0.7577299941124878,
+    "host_overhead_fraction": -0.051913132091940845
+  },
+  "Qwen3-1.7B_b4": {
+    "steps": 146,
+    "step_wall_ms": 14.900297999929535,
+    "host_stage_ms": 0.07162350004819018,
+    "decode_event_ms": 14.789968013763428,
+    "sync_ms": 14.772394499971142,
+    "graph_replay_only_ms": 14.829202880859375,
+    "graph_key": "(4, 128, 4)",
+    "host_overhead_ms": 0.07109511907015964,
+    "host_overhead_fraction": 0.004771389073594089
+  }
+}

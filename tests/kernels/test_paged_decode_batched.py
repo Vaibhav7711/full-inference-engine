@@ -176,7 +176,11 @@ def test_batched_decode_fp32_tight():
 
 
 def test_t4_regime_selector_boundaries() -> None:
-    from engine.kernels.paged_decode_config import select_paged_decode_config
+    from engine.kernels.paged_decode_config import (
+        select_ada_decode_config,
+        select_paged_decode_config,
+        use_ada_paired_gqa,
+    )
 
     assert select_paged_decode_config(1, 1) == (64, 4)
     assert select_paged_decode_config(127, 16) == (64, 4)
@@ -186,6 +190,18 @@ def test_t4_regime_selector_boundaries() -> None:
     assert select_paged_decode_config(2048, 16, "gqa") == (128, 4)
     with pytest.raises(ValueError):
         select_paged_decode_config(0, 1)
+
+    assert select_ada_decode_config(4096, 1) == (128, 4)
+    assert select_ada_decode_config(256, 1) == (128, 4)
+    assert select_ada_decode_config(4096, 8) == (128, 4)
+    assert select_paged_decode_config(256, 8, "ada") == (64, 2)
+    assert select_paged_decode_config(1024, 8, "ada") == (128, 4)
+    assert not use_ada_paired_gqa(1024, 4)
+    assert use_ada_paired_gqa(512, 8)
+    assert not use_ada_paired_gqa(1024, 8)
+    assert not use_ada_paired_gqa(64, 8)
+    assert use_ada_paired_gqa(256, 16)
+    assert not use_ada_paired_gqa(512, 16)
 
 
 @cuda
@@ -284,9 +300,10 @@ def test_batched_equals_separate_launches():
 @pytest.mark.parametrize("num_q_heads,kv_heads,D", [
     (16, 8, 128),   # GQA 2:1 (Qwen3-0.6B)
     (4, 2, 64),     # GQA 2:1, smaller dim
+    (16, 4, 128),   # GQA 4:1, paired sharing for Mistral/Llama-like geometry
 ])
 def test_gqa_shared_decode_matches_per_head_kernel(block_n, num_q_heads, kv_heads, D):
-    """One program per KV head, all of its query heads: bit-close to the per-head kernel
+    """One program per query-head pair: bit-close to the per-head kernel
     and to SDPA, with an offset length and shuffled block tables."""
     from engine.kernels.paged_decode_batched import paged_decode_batched
     from engine.kernels.paged_decode_gqa import paged_decode_gqa

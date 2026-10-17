@@ -50,11 +50,19 @@ PREFILL_ATTENTION_KINDS = ("per_token", "sdpa", "tiled", "flash")
 DECODE_ATTENTION_KINDS = ("per_head", "gqa", "split_k", "flash")
 
 
-def _prefill_context_bucket(total_len: int, floor: int = 256) -> int:
-    """Gathered-prefix length a captured SDPA prefill graph is shaped for."""
+def _prefill_context_bucket(total_len: int, floor: int = 256, capacity: int | None = None) -> int:
+    """Gathered-prefix length a captured SDPA prefill graph is shaped for.
+
+    Powers of two from ``floor``, clamped to the pool's token capacity: the gather cannot
+    produce more tokens than the pool holds. Unclamped, a 1536-block (24,576-token) pool
+    rounded up to a 32,768-token bucket, whose capture failed and - because one failed
+    capture disables graphs for the kind - left every SDPA prefill and fused step eager.
+    """
     bucket = floor
     while bucket < total_len:
         bucket *= 2
+    if capacity is not None:
+        bucket = min(bucket, capacity)
     return bucket
 from engine.backends import Geometry, defaults_for, resolve
 from engine.batching.sampler import BatchedSampler
@@ -87,6 +95,11 @@ class _BatchContext:
     # kernel needs the bound host-side, since reading `seq_lens` would synchronize.
     decode_backend: object = None
     decode_max_len: int = 0
+    # INT8 pools only: per-layer `[kv_heads, head_dim]` static key smoothing, or None.
+    key_smoothing: list | None = None
+    # INT8 pools only: use the offline-searched decode launch table (see
+    # `_int8_decode_launch`) instead of the per-head T4 regime.
+    int8_decode_tuned: bool = False
 
 
 _BATCH_CTX: Optional[_BatchContext] = None
@@ -110,6 +123,9 @@ class _PrefillContext:
     total_len: int = 0
     prefill_block_m: int | None = None
     prefill_block_n: int | None = None
+    key_smoothing: list | None = None
+    # INT8 pools only: "per_token" (one program per query token) or "tiled" (tensor cores).
+    int8_prefill_attention: str = "per_token"
     # SDPA path: the causal mask and the page-index vector depend only on the batch's
     # metadata, not the layer. Built on the first layer and reused by the other 27; each
     # rebuild was ~15 small launches, which in a launch-bound forward cost more than the
@@ -139,6 +155,13 @@ class _FusedContext:
     decode_rows: int
     prefill_rows: int
     width: int
+    # Packed layout (opt-in): the chunk tokens follow the decode tokens back to back,
+    # `packed_tokens` long (the prefill budget), instead of `prefill_rows * width`. Only
+    # attention needs the padded `[rows, width]` shape; it is built with `to_padded`
+    # (padded slot -> packed index) and undone with `to_packed` (packed index -> slot).
+    packed_tokens: int = 0
+    to_padded: torch.Tensor | None = None
+    to_packed: torch.Tensor | None = None
 
 
 _FUSED_CTX: Optional[_FusedContext] = None
@@ -188,16 +211,52 @@ def _decode_attention(ctx: _BatchContext, layer_idx: int, query, key, value, sca
             num_splits=ctx.decode_num_splits,
         )
     from engine.kernels.int8_paged_kv import paged_decode_batched_int8, write_decode_int8_kv
+    smoothing = ctx.key_smoothing[layer_idx] if ctx.key_smoothing is not None else None
     write_decode_int8_kv(
         key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
         ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
+        key_smoothing=smoothing,
     )
+    if ctx.int8_decode_tuned:
+        launch = _int8_decode_launch(query.shape[0], ctx.decode_block_n)
+        if launch is not None:
+            from engine.kernels.int8_decode_tuned import paged_decode_int8_per_head
+            block_n, num_warps, num_stages = launch
+            return paged_decode_int8_per_head(
+                query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
+                ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
+                scale=scaling, block_n=block_n, num_warps=num_warps, num_stages=num_stages,
+                length_offset=1, key_smoothing=smoothing,
+            )
     return paged_decode_batched_int8(
         query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
         ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.seq_lens,
         scale=scaling, block_n=ctx.decode_block_n, num_warps=ctx.decode_num_warps,
-        length_offset=1,
+        length_offset=1, key_smoothing=smoothing,
     )
+
+
+def _int8_decode_launch(rows: int, regime_block_n: int) -> tuple[int, int, int] | None:
+    """RTX 4060 INT8 decode launch from `int8_decode_search.json`, or None for the default.
+
+    Keyed only on the launched row count (the graph bucket) and the existing tile regime,
+    both part of every decode graph key, so a captured graph never changes launch on
+    replay. Batch 1 is latency-bound (16 programs on 24 SMs): 256-token tiles halve the
+    dependent iterations, 1.07-1.24x. Batch 8 runs below the bandwidth roofline with
+    128x4; 64x2 is 1.11-1.15x. Batch 4 and 16 already sit at ~240 GB/s and keep the default.
+    """
+    if regime_block_n != 128:
+        return None
+    if rows == 1:
+        return 256, 4, 3
+    if _INT8_DECODE_B8_RULE and 7 <= rows <= 12:
+        return 64, 2, 2
+    return None
+
+
+# Isolated search: batch 8 64x2 1.11-1.15x; end to end (chat, max_active 8) the decode
+# step regressed +2.7%. Kept switchable only to reproduce that A/B; off by default.
+_INT8_DECODE_B8_RULE = False
 
 
 def batched_decode_attention_forward(
@@ -239,15 +298,20 @@ def _prefill_attention(ctx: _PrefillContext, layer_idx: int, query, key, value, 
         )
     else:
         from engine.kernels.int8_paged_kv import paged_prefill_int8, write_prefill_int8_kv_batched
+        smoothing = ctx.key_smoothing[layer_idx] if ctx.key_smoothing is not None else None
         write_prefill_int8_kv_batched(
             key, value, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
             ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.chunk_lens,
-            ctx.start_positions,
+            ctx.start_positions, key_smoothing=smoothing,
         )
-        out = paged_prefill_int8(
+        if ctx.int8_prefill_attention == "tiled":
+            from engine.kernels.int8_paged_kv import tiled_paged_prefill_int8 as int8_prefill
+        else:
+            int8_prefill = paged_prefill_int8
+        out = int8_prefill(
             query, key_pool, value_pool, ctx.key_scale_pool[layer_idx],
             ctx.value_scale_pool[layer_idx], ctx.block_tables, ctx.start_positions,
-            ctx.chunk_lens, scale=scaling,
+            ctx.chunk_lens, scale=scaling, key_smoothing=smoothing,
         )
     return out
 
@@ -283,7 +347,9 @@ def fused_step_attention_forward(
     one, heads, total, head_dim = query.shape
     assert one == 1, "fused step packs every token into one row"
     decode_rows, prefill_rows, width = fused.decode_rows, fused.prefill_rows, fused.width
-    assert total == decode_rows + prefill_rows * width, "fused row layout mismatch"
+    packed = fused.packed_tokens > 0
+    prefill_tokens = fused.packed_tokens if packed else prefill_rows * width
+    assert total == decode_rows + prefill_tokens, "fused row layout mismatch"
     parts = []
     if decode_rows:
         ctx = _BATCH_CTX
@@ -303,13 +369,18 @@ def fused_step_attention_forward(
         assert ctx is not None, "chunked prefill context not set"
 
         def rows(tensor):
-            # [1, h, B*W, D] -> [B, h, W, D]
+            # [1, h, B*W, D] -> [B, h, W, D]; packed: [1, h, P, D] -> gather -> [B, h, W, D]
             h = tensor.shape[1]
-            return tensor[0, :, decode_rows:].reshape(h, prefill_rows, width, head_dim) \
-                .transpose(0, 1).contiguous()
+            chunk = tensor[0, :, decode_rows:]
+            if packed:
+                chunk = chunk.index_select(1, fused.to_padded)
+            return chunk.reshape(h, prefill_rows, width, head_dim).transpose(0, 1).contiguous()
 
         out = _prefill_attention(ctx, layer_idx, rows(query), rows(key), rows(value), scaling)
-        parts.append(out.transpose(1, 2).reshape(1, prefill_rows * width, heads, head_dim))
+        out = out.transpose(1, 2).reshape(prefill_rows * width, heads, head_dim)
+        if packed:
+            out = out.index_select(0, fused.to_packed)
+        parts.append(out.reshape(1, prefill_tokens, heads, head_dim))
     out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
     return out.contiguous(), None
 
@@ -317,6 +388,15 @@ def fused_step_attention_forward(
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
+
+def _awq_prefill_on_triton(model, chunk_rows: int) -> bool:
+    """True when every AWQ projection runs a full prefill chunk on the Triton int4pack GEMM."""
+    from engine.quantization.awq_tinygemm import AWQTinyGemmLinear
+
+    thresholds = [module.triton_prefill_rows for module in model.modules()
+                  if isinstance(module, AWQTinyGemmLinear)]
+    return bool(thresholds) and all(t is not None and t <= chunk_rows for t in thresholds)
+
 
 class ContinuousBatchingEngine:
     """Full batched decode over paged KV, scheduler-driven."""
@@ -339,14 +419,21 @@ class ContinuousBatchingEngine:
                  prefill_block_n: int | None = None,
                  decode_num_splits: int = 0,
                  max_prefill_tokens_per_iteration: int = 128,
+                 idle_prefill_tokens: int | None = 4096,
                  max_waiting_requests: int | None = None,
                  prefix_cache_blocks: int = 256,
                  kv_cache_dtype: str = "fp16",
+                 kv_key_smoothing: torch.Tensor | None = None,
+                 int8_prefill_attention: str = "per_token",
+                 int8_decode_tuned: bool = False,
                  cuda_graph_batch_size: int | None = None,
                  cuda_graph_batch_sizes: tuple[int, ...] | None = None,
                  prefill_cuda_graphs: bool = True,
                  fused_step: bool = True,
+                 packed_fused_prefill: bool = False,
+                 packed_prefill_width_buckets: bool = False,
                  fuse_mlp_gate_up: bool = False,
+                 fuse_qkv: bool = False,
                  triton_rmsnorm: bool = True,
                  triton_rope: bool = True,
                  triton_swiglu: bool = True,
@@ -358,6 +445,14 @@ class ContinuousBatchingEngine:
             raise ValueError("prefix_cache_blocks must be non-negative")
         if kv_cache_dtype not in {"fp16", "int8"}:
             raise ValueError("kv_cache_dtype must be 'fp16' or 'int8'")
+        if kv_key_smoothing is not None and kv_cache_dtype != "int8":
+            raise ValueError("kv_key_smoothing applies only to kv_cache_dtype='int8'")
+        if int8_prefill_attention not in {"per_token", "tiled"}:
+            raise ValueError("int8_prefill_attention must be 'per_token' or 'tiled'")
+        # Chunked-prefill attention over an INT8 pool. "tiled" is the tensor-core kernel
+        # selected by the offline RTX 4060 search; opt-in until its end-to-end A/B.
+        self.int8_prefill_attention = int8_prefill_attention
+        self.int8_decode_tuned = int8_decode_tuned
         if decode_num_splits < 0:
             raise ValueError("decode_num_splits must be non-negative")
         if cuda_graph_batch_size is not None and cuda_graph_batch_sizes is not None:
@@ -413,6 +508,14 @@ class ContinuousBatchingEngine:
         self.prefill_block_n = prefill_block_n
         self.decode_num_splits = decode_num_splits
         self.max_prefill_tokens_per_iteration = max_prefill_tokens_per_iteration
+        # With no request decoding there is no ITL to protect, so fresh prompts are
+        # prefilled whole (up to this many tokens per step) through the single-forward
+        # fast path instead of `prefill_chunk_size` slices: a 2048-token prompt took
+        # sixteen 128-token steps and a longer TTFT than stock Transformers. None keeps
+        # chunking always. The chunk budget still applies whenever anything decodes.
+        if idle_prefill_tokens is not None and idle_prefill_tokens <= 0:
+            raise ValueError("idle_prefill_tokens must be positive or None")
+        self.idle_prefill_tokens = idle_prefill_tokens
         self.max_waiting_requests = max_waiting_requests
         self.prefix_cache_blocks = prefix_cache_blocks
         self.kv_cache_dtype = kv_cache_dtype
@@ -432,7 +535,22 @@ class ContinuousBatchingEngine:
         # eagerly on the same staged buffers, which is the A/B for the capture itself.
         self.prefill_cuda_graphs = prefill_cuda_graphs
         self.prefill_graph_eager_reason: str | None = None
-        if not self.prefill_backend.graph_safe:
+        if (getattr(model.config, "_weight_only_int4_backend", None) == "tinygemm"
+                and not (packed_fused_prefill and packed_prefill_width_buckets
+                         and _awq_prefill_on_triton(model, prefill_chunk_size))):
+            # On RTX 4060, native INT4 prefill capture doubled short-prompt TTFT
+            # (108-146 ms eager versus ~222 ms captured) without changing ITL. With the
+            # Triton int4pack prefill GEMM, capture still raised chat ITL p99 42% with
+            # padded rows and was inconclusive with full-width packed rows. Only packed
+            # rows with width buckets won (ITL p999 -34%, every TTFT pair lower;
+            # ab_awq_graphs_packed_buckets_chat_qwen3_4b.json), so only that opt-in
+            # combination captures AWQ prefill.
+            self.prefill_cuda_graphs = False
+            self.prefill_graph_eager_reason = (
+                "native INT4 weight-only models use measured eager prefill; captured "
+                "tinygemm regressed RTX 4060 TTFT"
+            )
+        elif not self.prefill_backend.graph_safe:
             # FA2 kvcache has no query-length vector. Correct variable-size chunks are
             # grouped by their active length in `flash_paged_prefill`, which requires a
             # host-side grouping step; its internal workspace allocation is also not
@@ -448,7 +566,17 @@ class ContinuousBatchingEngine:
         # are read once for both, and the prefill's launch cost rides on the decode
         # forward's. Off runs the two forwards back to back, which is the A/B.
         self.fused_step = fused_step
+        # Packed fused prefill: the fused forward carries `budget` chunk tokens however
+        # the budget is split across rows, instead of every row padded to the full chunk.
+        # A graph replay of two 40/88-token chunks otherwise ran 256 tokens through every
+        # projection and MLP (RTX 4060, Qwen3-1.7B: 63-68 ms versus 41 ms for one row).
+        self.packed_fused_prefill = packed_fused_prefill
+        # Packed fused graphs are otherwise shaped for the whole budget, so a step that plans
+        # 40 chunk tokens still runs `budget` through every projection. Width buckets
+        # (powers of two from 32 up to the budget) replay the smallest graph that fits.
+        self.packed_prefill_width_buckets = packed_prefill_width_buckets
         self.fuse_mlp_gate_up = fuse_mlp_gate_up
+        self.fuse_qkv = fuse_qkv
         self.triton_rmsnorm = triton_rmsnorm
         self.triton_rope = triton_rope
         self.triton_swiglu = triton_swiglu
@@ -500,6 +628,7 @@ class ContinuousBatchingEngine:
         from engine.kernels.rmsnorm import install_triton_rmsnorm, uninstall_triton_rmsnorm
         from engine.kernels.rope import install_triton_rope, uninstall_triton_rope
         from engine.kernels.swiglu import install_triton_swiglu, uninstall_triton_swiglu
+        from engine.kernels.swiglu import install_fused_qkv, uninstall_fused_qkv
         if triton_rmsnorm:
             self.triton_rmsnorm_modules = install_triton_rmsnorm(model)
         else:
@@ -522,6 +651,11 @@ class ContinuousBatchingEngine:
             )
         else:
             self.triton_swiglu_modules = 0
+        # Q/K/V projection fusion changes only the three input GEMMs in attention;
+        # cache writes, RoPE and the selected paged-attention backend stay untouched.
+        # Reinstall explicitly because benchmark engines may share the same model.
+        uninstall_fused_qkv(model)
+        self.fused_qkv_modules = install_fused_qkv(model) if fuse_qkv else 0
 
         # One sampler for the engine. Requests that ask for nothing sample greedily,
         # which is the argmax path every recorded benchmark measured; `sampling_seed`
@@ -548,9 +682,27 @@ class ContinuousBatchingEngine:
             self.key_scale_pool = [torch.zeros(scale_shape, device=device, dtype=torch.float16)
                                    for _ in range(self.num_layers)]
             self.value_scale_pool = [torch.zeros_like(scale) for scale in self.key_scale_pool]
+            self._int8_preemption_spills: dict[str, tuple[int, tuple[torch.Tensor, ...]]] = {}
+            # Static key smoothing (see engine.quantization.kv_smoothing). Opt-in: the
+            # default INT8 mode keeps plain per-token key scales.
+            self.key_smoothing = None
+            if kv_key_smoothing is not None:
+                expected = (self.num_layers, self.num_kv_heads, self.head_dim)
+                if tuple(kv_key_smoothing.shape) != expected:
+                    raise ValueError(f"kv_key_smoothing must have shape {expected}")
+                self.key_smoothing = [
+                    layer.to(device=device, dtype=torch.float32).contiguous()
+                    for layer in kv_key_smoothing
+                ]
         else:
             self.key_scale_pool = None
             self.value_scale_pool = None
+            self._int8_preemption_spills = {}
+            self.key_smoothing = None
+        self._int8_spill_events = 0
+        self._int8_spill_bytes_total = 0
+        self._int8_spill_write_ms_total = 0.0
+        self._int8_spill_restore_ms_total = 0.0
 
         # Decode metadata has a fixed upper bound. Keep both pinned-host staging and
         # GPU tensors alive for the engine lifetime so each token step performs a few
@@ -587,6 +739,27 @@ class ContinuousBatchingEngine:
         self._prefill_device_block_tables = torch.empty(
             (max_active, num_blocks), dtype=torch.int32, device=device
         )
+        # Packed fused-prefill staging (see `_prepare_packed_metadata`).
+        packed = max_prefill_tokens_per_iteration
+        self._packed_tokens = packed
+        widths = [packed]
+        if packed_prefill_width_buckets:
+            width_bucket = 32
+            while width_bucket < packed:
+                widths.append(width_bucket)
+                width_bucket *= 2
+        self._packed_widths = tuple(sorted(set(widths)))
+        self._active_packed_width = packed
+        self._packed_host_ids = torch.empty((packed,), dtype=torch.long, pin_memory=True)
+        self._packed_host_positions = torch.empty((packed,), dtype=torch.long, pin_memory=True)
+        self._packed_host_to_packed = torch.empty((packed,), dtype=torch.long, pin_memory=True)
+        self._packed_host_to_padded = torch.empty((max_active * chunk,), dtype=torch.long, pin_memory=True)
+        self._packed_host_last = torch.empty((max_active,), dtype=torch.long, pin_memory=True)
+        self._packed_device_ids = torch.empty((packed,), dtype=torch.long, device=device)
+        self._packed_device_positions = torch.empty((packed,), dtype=torch.long, device=device)
+        self._packed_device_to_packed = torch.empty((packed,), dtype=torch.long, device=device)
+        self._packed_device_to_padded = torch.empty((max_active * chunk,), dtype=torch.long, device=device)
+        self._packed_device_last = torch.empty((max_active,), dtype=torch.long, device=device)
         # Captured prefill and fused graphs end in the vocabulary projection, and their
         # output has to live at a fixed address for replay. A private `[rows, vocab]`
         # tensor per graph would be ~5 MB each and there are dozens of shapes, so every
@@ -612,6 +785,7 @@ class ContinuousBatchingEngine:
         self.block_manager = KVBlockManager(
             num_blocks=num_blocks, block_size_tokens=block_size
         )
+        self._pool_token_capacity = num_blocks * block_size
         self._reserve_graph_dummy_blocks()
         self.prefix_cache = PrefixCache(self.block_manager, prefix_cache_blocks)
         self.scheduler = FCFSScheduler(
@@ -632,9 +806,10 @@ class ContinuousBatchingEngine:
         self._graph_dummy_blocks: list[int] = []
         if not self.cuda_graph_batch_sizes:
             return
-        required = max(self.cuda_graph_batch_sizes) - 1
-        if required <= 0:
-            return
+        # Padded rows need distinct dummy pages; capture on zero live rows (fused graphs)
+        # needs at least one even when the largest bucket is 1, or every fused capture
+        # fails and a max_active=1 engine runs its fused steps eagerly.
+        required = max(1, max(self.cuda_graph_batch_sizes) - 1)
         allocation = self.block_manager.reserve("__cuda_graph_dummy_rows__", required * self.block_size)
         if allocation is None:
             raise ValueError("insufficient KV blocks to reserve CUDA-Graph dummy rows")
@@ -720,6 +895,11 @@ class ContinuousBatchingEngine:
             prefix_cache=self.prefix_cache,
             reserved_blocks=len(self._graph_dummy_blocks),
         )
+        self._int8_preemption_spills.clear()
+        self._int8_spill_events = 0
+        self._int8_spill_bytes_total = 0
+        self._int8_spill_write_ms_total = 0.0
+        self._int8_spill_restore_ms_total = 0.0
 
     def _ensure_writable_tail(self, request: GenerationRequest) -> bool:
         """Copy a shared partial tail before decode writes into its unused slots."""
@@ -783,9 +963,83 @@ class ContinuousBatchingEngine:
                 # cannot serve it and yielding would spin forever.
                 if len(self.scheduler.active) <= 1:
                     return False
-                self.scheduler.preempt(request.request_id)
+                self._preempt_request(request)
                 return False
-            self.scheduler.preempt(victim.request_id)
+            self._preempt_request(victim)
+
+    def _preempt_request(self, request: GenerationRequest) -> None:
+        """Yield a request, preserving exact INT8 pages once generation has begun.
+
+        Recomputing a generated prefix can select a different GEMM shape from its
+        original mixed batch. The resulting small hidden-state change is amplified by
+        per-token INT8 quantization and can flip a tied greedy logit. Host spill is rare
+        and slower than recompute, but it preserves the authoritative cache bytes.
+        """
+        allocation = request.allocation
+        if (
+            self.kv_cache_dtype == "int8" and request.output_token_ids
+            and allocation is not None and request.request_id not in self._int8_preemption_spills
+        ):
+            spill_started = perf_counter()
+            # Only the pages covering committed tokens. A decode row may already hold the
+            # page for its next token when a later prefill in the same step preempts it;
+            # restore allocates for the committed length, so an extra page here would
+            # make the payload one page longer than its destination.
+            committed = -(-allocation.sequence_length // self.block_size)
+            block_ids = torch.tensor(
+                allocation.physical_block_ids[:committed], dtype=torch.long, device=self.device,
+            )
+            # Pageable `.cpu()` is deliberate: on the measured RTX 4060 host (PCIe link
+            # trained at Gen4 x1, ~1.4 GB/s) pinned per-layer async copies moved bytes
+            # only ~10% faster and paid a fresh pinned allocation per spill, doubling the
+            # measured write time (results/rtx4060/int8_kv_spill_pinned_ab_long_decode.json).
+            payload = tuple(
+                torch.stack([pool.index_select(0, block_ids) for pool in group]).cpu()
+                for group in (
+                    self.key_pool, self.value_pool, self.key_scale_pool, self.value_scale_pool,
+                )
+            )
+            self._int8_preemption_spills[request.request_id] = (
+                allocation.sequence_length, payload,
+            )
+            self._int8_spill_events += 1
+            self._int8_spill_bytes_total += sum(
+                tensor.numel() * tensor.element_size() for tensor in payload
+            )
+            self._int8_spill_write_ms_total += (perf_counter() - spill_started) * 1000
+        self.scheduler.preempt(request.request_id)
+
+    def _restore_int8_spill(self, request: GenerationRequest) -> bool:
+        spill = self._int8_preemption_spills.get(request.request_id)
+        if spill is None:
+            return False
+        sequence_length, payload = spill
+        if not self._capacity_or_fail(request, sequence_length):
+            if request.done:
+                self._int8_preemption_spills.pop(request.request_id, None)
+            return True
+        allocation = request.allocation
+        if allocation is None:
+            return True
+        restore_started = perf_counter()
+        block_ids = torch.tensor(allocation.physical_block_ids, dtype=torch.long, device=self.device)
+        if len(block_ids) != payload[0].shape[1]:
+            raise RuntimeError(
+                f"INT8 spill for {request.request_id!r} holds {payload[0].shape[1]} pages "
+                f"but its restored allocation has {len(block_ids)}"
+            )
+        groups = (self.key_pool, self.value_pool, self.key_scale_pool, self.value_scale_pool)
+        for pools, saved in zip(groups, payload):
+            for layer, pool in enumerate(pools):
+                pool.index_copy_(0, block_ids, saved[layer].to(self.device))
+        torch.cuda.synchronize(self.device)
+        self._int8_spill_restore_ms_total += (perf_counter() - restore_started) * 1000
+        if not self.block_manager.append_tokens(request.request_id, sequence_length):
+            raise RuntimeError("INT8 spill capacity was acquired but could not be restored")
+        request.prefilled_token_count = request.prefill_token_count
+        del self._int8_preemption_spills[request.request_id]
+        self._complete_prefill(request, None)
+        return True
 
     def _capacity_or_fail(self, request: GenerationRequest, target_length: int) -> bool:
         """Acquire capacity; fail the request only if preemption could not help it."""
@@ -838,6 +1092,11 @@ class ContinuousBatchingEngine:
             if request.state is RequestState.DECODING and request.allocation is not None
         ]
         context_tokens = sum(r.allocation.sequence_length for r in decoding)
+        spill_bytes_live = sum(
+            tensor.numel() * tensor.element_size()
+            for _, payload in self._int8_preemption_spills.values()
+            for tensor in payload
+        )
         return {
             "waiting_requests": len(self.scheduler.waiting),
             "active_requests": len(self.scheduler.active),
@@ -865,6 +1124,12 @@ class ContinuousBatchingEngine:
             "prefill_chunked_tokens": self.prefill_chunked_tokens,
             "recomputed_tokens_total": self.scheduler.recomputed_tokens_total,
             "recompute_ms_total": self.scheduler.recompute_ns_total / 1_000_000,
+            "int8_spill_requests_live": len(self._int8_preemption_spills),
+            "int8_spill_bytes_live": spill_bytes_live,
+            "int8_spill_events_total": self._int8_spill_events,
+            "int8_spill_bytes_total": self._int8_spill_bytes_total,
+            "int8_spill_write_ms_total": self._int8_spill_write_ms_total,
+            "int8_spill_restore_ms_total": self._int8_spill_restore_ms_total,
         }
 
     def recompute_report(self) -> dict[str, object]:
@@ -886,6 +1151,11 @@ class ContinuousBatchingEngine:
             "progress_epoch": self.scheduler.progress_epoch,
             "recomputed_tokens": self.scheduler.recomputed_tokens_total + in_flight_tokens,
             "recompute_ms": (self.scheduler.recompute_ns_total + in_flight_ns) / 1_000_000,
+            "int8_spill_requests_live": len(self._int8_preemption_spills),
+            "int8_spill_events": self._int8_spill_events,
+            "int8_spill_bytes": self._int8_spill_bytes_total,
+            "int8_spill_write_ms": self._int8_spill_write_ms_total,
+            "int8_spill_restore_ms": self._int8_spill_restore_ms_total,
         }
 
     def _publish_prefix(
@@ -1005,7 +1275,7 @@ class ContinuousBatchingEngine:
         seq_lens = torch.tensor(lengths_list, dtype=torch.int32, device=self.device)
         cache = BatchedPoolBackedPrefillCache(
             self.key_pool, self.value_pool, block_tables, seq_lens, padded_length,
-            self.key_scale_pool, self.value_scale_pool,
+            self.key_scale_pool, self.value_scale_pool, key_smoothing=self.key_smoothing,
         )
         timer = self._gpu_timer()
         hidden = self._decoder()(
@@ -1079,7 +1349,7 @@ class ContinuousBatchingEngine:
         # exact sizes.
         if use_graph:
             width = self.prefill_chunk_size
-            context_len = _prefill_context_bucket(total_len) if self.prefill_attention == "sdpa" else 0
+            context_len = _prefill_context_bucket(total_len, capacity=self._pool_token_capacity) if self.prefill_attention == "sdpa" else 0
             key = (row_count, self.prefill_attention, context_len)
             graph = self._prefill_graphs.get(key)
             if graph is None:
@@ -1181,6 +1451,52 @@ class ContinuousBatchingEngine:
         self._prefill_device_block_tables[:row_count].copy_(
             self._prefill_host_block_tables[:row_count], non_blocking=True)
 
+    def _prepare_packed_metadata(
+        self, plans: list[tuple[GenerationRequest, int]], row_count: int,
+    ) -> None:
+        """Stage the packed layout of one chunk batch: tokens back to back, then padding.
+
+        The padded attention layout keeps the staged chunk width; every padded slot that
+        holds no real token points at packed index 0, which attention ignores (its chunk
+        length excludes it and the KV writers skip it). Packed slots past the real tokens
+        point at padded slot 0 and their outputs are never read.
+        """
+        chunk = self.prefill_chunk_size
+        total = sum(count for _, count in plans)
+        packed_width = self._active_packed_width
+        if total > packed_width:
+            raise ValueError("packed chunk tokens exceed the packed width")
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = next(iter(self.eos_ids), 0)
+        ids, positions, to_packed, last = [], [], [], []
+        to_padded = [0] * (row_count * chunk)
+        for row, (request, count) in enumerate(plans):
+            start = request.prefilled_token_count
+            base = len(ids)
+            ids.extend(request.prefill_token_ids[start:start + count])
+            positions.extend(range(start, start + count))
+            slots = range(row * chunk, row * chunk + count)
+            to_padded[row * chunk:row * chunk + count] = range(base, base + count)
+            to_packed.extend(slots)
+            last.append(base + count - 1)
+        padding = packed_width - total
+        ids.extend([pad_token_id] * padding)
+        positions.extend([0] * padding)
+        to_packed.extend([0] * padding)
+        last.extend([0] * (row_count - len(plans)))
+        width = row_count * chunk
+        self._packed_host_ids[:packed_width] = torch.tensor(ids, dtype=torch.long)
+        self._packed_host_positions[:packed_width] = torch.tensor(positions, dtype=torch.long)
+        self._packed_host_to_packed[:packed_width] = torch.tensor(to_packed, dtype=torch.long)
+        self._packed_host_to_padded[:width] = torch.tensor(to_padded, dtype=torch.long)
+        self._packed_host_last[:row_count] = torch.tensor(last, dtype=torch.long)
+        self._packed_device_ids[:packed_width].copy_(self._packed_host_ids[:packed_width], non_blocking=True)
+        self._packed_device_positions[:packed_width].copy_(self._packed_host_positions[:packed_width], non_blocking=True)
+        self._packed_device_to_packed[:packed_width].copy_(self._packed_host_to_packed[:packed_width], non_blocking=True)
+        self._packed_device_to_padded[:width].copy_(self._packed_host_to_padded[:width], non_blocking=True)
+        self._packed_device_last[:row_count].copy_(self._packed_host_last[:row_count], non_blocking=True)
+
     def _set_prefill_context(self, row_count: int, total_len: int) -> None:
         attention_cache: dict = {}
         if self.prefill_attention in {"flash", "flash_dense"}:
@@ -1226,6 +1542,8 @@ class ContinuousBatchingEngine:
             total_len=total_len,
             prefill_block_m=self.prefill_block_m,
             prefill_block_n=self.prefill_block_n,
+            key_smoothing=self.key_smoothing,
+            int8_prefill_attention=self.int8_prefill_attention,
             sdpa_cache=attention_cache,
         ))
 
@@ -1276,11 +1594,11 @@ class ContinuousBatchingEngine:
         buckets = []
         bucket = 256
         while True:
-            buckets.append(bucket)
+            buckets.append(min(bucket, self._pool_token_capacity))
             if bucket >= capacity:
                 break
             bucket *= 2
-        return buckets
+        return sorted(set(buckets))
 
     def _capture_prefill_graph(self, row_count: int, context_len: int):
         """Capture one prefill graph, or record that this attention kind cannot be captured."""
@@ -1305,6 +1623,22 @@ class ContinuousBatchingEngine:
         return graph
 
     def _plan_prefill_chunks(self) -> list[tuple[GenerationRequest, int]]:
+        if self.idle_prefill_tokens:
+            prefilling = [
+                request for request in self.scheduler.active.values()
+                if request.state is RequestState.PREFILLING
+            ]
+            decoding = any(
+                request.state is RequestState.DECODING for request in self.scheduler.active.values()
+            )
+            # One fresh prompt on an otherwise idle engine goes through the single-forward
+            # fast path whole. A burst of several prompts keeps chunking: interleaved
+            # chunks gave each of them an earlier first token than serial whole prefills
+            # (1.7B chat, four closed-loop clients: TTFT +7% with whole prefills).
+            if (len(prefilling) == 1 and not decoding
+                    and prefilling[0].prefilled_token_count == 0
+                    and prefilling[0].prefill_token_count <= self.idle_prefill_tokens):
+                return [(prefilling[0], prefilling[0].prefill_token_count)]
         return self.scheduler.plan_prefill(
             chunk_size=self.prefill_chunk_size,
             token_budget=self.max_prefill_tokens_per_iteration,
@@ -1313,6 +1647,7 @@ class ContinuousBatchingEngine:
     def cancel(self, request_id: str, reason: str = "CANCELLED_BY_CLIENT") -> GenerationRequest:
         """Cancel queued, partially-prefilled, or decoding work and release its KV."""
         request = self.scheduler.cancel(request_id, reason=reason)
+        self._int8_preemption_spills.pop(request_id, None)
         self.sampler.forget([request.request_id])
         return request
 
@@ -1349,6 +1684,8 @@ class ContinuousBatchingEngine:
             self.decode_step(decoding)
         admitted = self.scheduler.admit_available(max_active_requests=self.max_active)
         for request in admitted:
+            if self._restore_int8_spill(request):
+                continue
             if request.remaining_prefill_tokens == 0:
                 self._complete_prefill(request, request.cached_next_token_id)
         plans = self._plan_prefill_chunks()
@@ -1493,9 +1830,17 @@ class ContinuousBatchingEngine:
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
             decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
+            key_smoothing=self.key_smoothing, int8_decode_tuned=self.int8_decode_tuned,
         ))
         self._set_prefill_context(prefill_rows, total_len)
-        _set_fused_ctx(_FusedContext(decode_rows, prefill_rows, width))
+        if self.packed_fused_prefill:
+            _set_fused_ctx(_FusedContext(
+                decode_rows, prefill_rows, width, packed_tokens=self._active_packed_width,
+                to_padded=self._packed_device_to_padded[:prefill_rows * width],
+                to_packed=self._packed_device_to_packed[:self._active_packed_width],
+            ))
+        else:
+            _set_fused_ctx(_FusedContext(decode_rows, prefill_rows, width))
 
     @staticmethod
     def _clear_fused_contexts() -> None:
@@ -1513,27 +1858,40 @@ class ContinuousBatchingEngine:
         """
         decode_ids = self._device_input_ids[:decode_rows].reshape(1, decode_rows)
         decode_positions = self._device_position_ids[:decode_rows].reshape(1, decode_rows)
-        chunk_ids = self._prefill_device_input_ids[:prefill_rows, :width].reshape(1, -1)
-        chunk_positions = self._prefill_device_position_ids[:prefill_rows, :width].reshape(1, -1)
+        if self.packed_fused_prefill:
+            chunk_ids = self._packed_device_ids[:self._active_packed_width].reshape(1, -1)
+            chunk_positions = self._packed_device_positions[:self._active_packed_width].reshape(1, -1)
+        else:
+            chunk_ids = self._prefill_device_input_ids[:prefill_rows, :width].reshape(1, -1)
+            chunk_positions = self._prefill_device_position_ids[:prefill_rows, :width].reshape(1, -1)
         input_ids = torch.cat((decode_ids, chunk_ids), dim=1)
         position_ids = torch.cat((decode_positions, chunk_positions), dim=1)
         hidden = self._decoder()(
             input_ids=input_ids, position_ids=position_ids, use_cache=False, return_dict=True,
         ).last_hidden_state[0]
         chunk_lens = self._prefill_device_chunk_lens[:prefill_rows]
-        last = (
-            decode_rows
-            + torch.arange(prefill_rows, device=hidden.device) * width
-            + (chunk_lens.to(torch.long) - 1).clamp_(min=0)
-        )
+        if self.packed_fused_prefill:
+            last = decode_rows + self._packed_device_last[:prefill_rows]
+        else:
+            last = (
+                decode_rows
+                + torch.arange(prefill_rows, device=hidden.device) * width
+                + (chunk_lens.to(torch.long) - 1).clamp_(min=0)
+            )
         picked = torch.cat((hidden[:decode_rows], hidden[last]), dim=0)
         return self._write_logits(self._lm_head()(picked))
+
+    def _packed_width_for(self, tokens: int) -> int:
+        """Smallest captured packed width that holds `tokens` chunk tokens."""
+        return next(width for width in self._packed_widths if width >= tokens)
 
     def _capture_fused_graph(self, key: tuple):
         """Capture one fused step graph, or record that this attention kind cannot be."""
         from engine.graphs.fused_step_graph import capture_fused_step_graph
 
-        decode_rows, prefill_rows, kind, context_len, block_n, num_warps = key
+        decode_rows, prefill_rows, kind, context_len, block_n, num_warps = key[:6]
+        # Packed engines key fused graphs by packed width as well (`_packed_width_for`).
+        self._active_packed_width = key[6] if len(key) > 6 else self._packed_tokens
         tag = f"fused:{kind}"
         if tag in self._prefill_graph_unsupported:
             return None
@@ -1591,10 +1949,14 @@ class ContinuousBatchingEngine:
             and f"fused:{self.prefill_attention}" not in self._prefill_graph_unsupported
         )
         graph = None
+        planned_tokens = sum(count for _, count in plans)
+        packed_width = self._packed_width_for(planned_tokens)
         if use_graph:
             width = self.prefill_chunk_size
-            context_len = _prefill_context_bucket(total_len) if self.prefill_attention == "sdpa" else 0
+            context_len = _prefill_context_bucket(total_len, capacity=self._pool_token_capacity) if self.prefill_attention == "sdpa" else 0
             key = (decode_bucket, prefill_bucket, self.prefill_attention, context_len, block_n, num_warps)
+            if self.packed_fused_prefill:
+                key += (packed_width,)
             graph = self._fused_graphs.get(key)
             if graph is None:
                 self.lazy_graph_captures += 1
@@ -1604,13 +1966,18 @@ class ContinuousBatchingEngine:
             decode_rows, prefill_rows = decode_bucket, prefill_bucket
         else:
             decode_rows, prefill_rows = decode_count, prefill_count
-            width = max(n for _, n in plans)
+            # Packed keeps the staged width for attention's padded view; the per-token
+            # modules see only the packed budget either way.
+            width = self.prefill_chunk_size if self.packed_fused_prefill else max(n for _, n in plans)
             context_len = total_len
         self._set_attention(self.FUSED_ATTN_NAME)
         _, _, block_tables, seq_lens = self._prepare_decode_metadata(
             rows, graph_bucket_size=decode_rows if use_graph else None,
         )
         self._prepare_prefill_metadata(plans, prefill_rows)
+        if self.packed_fused_prefill:
+            self._active_packed_width = packed_width
+            self._prepare_packed_metadata(plans, prefill_rows)
         self._host_elapsed(host_started, "host_stage_ms")
         timer = self._gpu_timer()
         self._set_fused_contexts(
@@ -1698,8 +2065,18 @@ class ContinuousBatchingEngine:
             key_scale_pool=self.key_scale_pool, value_scale_pool=self.value_scale_pool,
             decode_kernel=self.decode_attention,
             decode_backend=self.decode_backend, decode_max_len=max_sequence_length,
+            key_smoothing=self.key_smoothing, int8_decode_tuned=self.int8_decode_tuned,
+        )
+        # Split-K's split length is a launch-time scalar baked into a CUDA graph.
+        # Bucket it separately from the tile regime; otherwise a graph captured
+        # at a short context can silently skip keys when replayed at a longer one.
+        graph_max_len = (
+            ((max_sequence_length + 127) // 128) * 128
+            if self.decode_attention == "split_k" else max_sequence_length
         )
         graph_key = (graph_bucket_size, decode_block_n, decode_num_warps)
+        if self.decode_attention == "split_k":
+            graph_key += (graph_max_len,)
         use_graph = graph_bucket_size is not None
         if use_graph:
             graph = self._decode_graphs.get(graph_key)
@@ -1708,7 +2085,7 @@ class ContinuousBatchingEngine:
                 self.lazy_graph_captures += 1
                 graph = capture_paged_decode_graph(
                     self, batch_size=graph_bucket_size, block_n=decode_block_n,
-                    num_warps=decode_num_warps,
+                    num_warps=decode_num_warps, max_sequence_length=graph_max_len,
                 )
                 self._decode_graphs[graph_key] = graph
             logits = graph.replay()
@@ -1838,23 +2215,28 @@ class ContinuousBatchingEngine:
             # ITL p99 doubled (64.7 -> 126.9 ms) while p50 fell 17%. A capture is two
             # eager forwards plus syncs in a live step; it belongs in warmup or nowhere.
             if self.fused_step and self.decode_cuda_graphs:
-                regimes = sorted({
-                    select_paged_decode_config(length, 1, self.decode_attention)
-                    for length in (64, 128)
-                })
                 fused_rows = [
                     rows for rows in (1,) + self.cuda_graph_batch_sizes
                     if self._prefill_row_bucket(rows, self.FUSED_PREFILL_ROW_LIMIT) == rows
                 ]
                 for decode_rows in self.cuda_graph_batch_sizes:
+                    # A device policy may depend on both context and graph width (the Ada
+                    # paired-GQA crossover does). Capture every regime that this bucket
+                    # can select so the first live request never pays for it.
+                    regimes = sorted({
+                        select_paged_decode_config(length, decode_rows, self.decode_attention)
+                        for length in (64, 128, 256, 512, 1024)
+                    })
                     for prefill_rows in fused_rows:
                         for context_len in contexts:
                             for block_n, num_warps in regimes:
-                                key = (decode_rows, prefill_rows, self.prefill_attention,
-                                       context_len, block_n, num_warps)
-                                if key not in self._fused_graphs:
-                                    if self._capture_fused_graph(key) is None:
-                                        break
+                                base_key = (decode_rows, prefill_rows, self.prefill_attention,
+                                            context_len, block_n, num_warps)
+                                keys = ([base_key + (w,) for w in self._packed_widths]
+                                        if self.packed_fused_prefill else [base_key])
+                                for key in keys:
+                                    if key not in self._fused_graphs:
+                                        self._capture_fused_graph(key)
         summary = {
             "rounds": rounds,
             "graphs": len(self._decode_graphs),

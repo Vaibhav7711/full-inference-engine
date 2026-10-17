@@ -1,0 +1,31 @@
+{
+  "config": {
+    "model": "Qwen/Qwen3-0.6B",
+    "prompt_tokens": 4096,
+    "batch_size": 4,
+    "decode_steps": 32,
+    "rounds": 2,
+    "num_blocks": 1152,
+    "output": "results/rtx4060/int8_kv_continuous_b4_ctx4096.json"
+  },
+  "rows": {
+    "fp16": {
+      "median_decode_ms": 702.2868347167969,
+      "round_decode_ms": [
+        700.6409301757812,
+        703.9327392578125
+      ],
+      "tokens_per_second": 182.26171084584988
+    },
+    "int8": {
+      "median_decode_ms": 553.8262329101562,
+      "round_decode_ms": [
+        579.1428833007812,
+        528.5095825195312
+      ],
+      "tokens_per_second": 231.11942409698864
+    }
+  },
+  "int8_over_fp16_speedup": 1.2680635061768994,
+  "greedy_token_agreement": 1.0
+}

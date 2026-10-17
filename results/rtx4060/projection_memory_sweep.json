@@ -1,0 +1,25 @@
+{
+  "timestamp_utc": "2026-10-08T07:32:19.343868+00:00",
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.14.0+cu130",
+  "model": "Qwen/Qwen3-0.6B",
+  "projection_count": 197,
+  "weight_bytes": 1191968768,
+  "note": "Projection-only CUDA graph; includes arithmetic and output writes. Effective weight rate is a diagnostic, not measured DRAM traffic.",
+  "rows": [
+    {
+      "batch": 1,
+      "median_ms": 5.19270396232605,
+      "min_ms": 4.9251837730407715,
+      "max_ms": 5.594912052154541,
+      "effective_weight_gb_s": 229.5468366091994
+    },
+    {
+      "batch": 8,
+      "median_ms": 5.298687934875488,
+      "min_ms": 5.043007850646973,
+      "max_ms": 5.872511863708496,
+      "effective_weight_gb_s": 224.95545739815483
+    }
+  ]
+}

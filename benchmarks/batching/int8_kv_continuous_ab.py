@@ -73,7 +73,19 @@ def main() -> None:
     from engine.model import load_model
     loaded = load_model(args.model)
     prompt_ids = _prompt_ids(loaded.tokenizer, args.prompt_tokens)
-    results: dict[str, object] = {"config": vars(args), "rows": {}}
+    config = loaded.model.config
+    layers = int(config.num_hidden_layers)
+    kv_heads = int(config.num_key_value_heads)
+    head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+    elements = 2 * layers * args.num_blocks * 16 * kv_heads
+    results: dict[str, object] = {
+        "config": vars(args), "rows": {},
+        "kv_pool_bytes": {
+            "fp16": elements * head_dim * 2,
+            # One INT8 byte per K/V element plus one FP16 scale per token/head.
+            "int8": elements * (head_dim + 2),
+        },
+    }
     outputs: dict[str, list[list[int]]] = {}
     print(f"\nEnd-to-end INT8 KV continuous decode ({len(prompt_ids)}-token prompt, batch {args.batch_size})")
     for mode in ("fp16", "int8"):

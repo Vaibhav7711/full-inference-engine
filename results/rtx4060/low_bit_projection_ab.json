@@ -1,0 +1,182 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.14.0+cu130",
+  "scope": "Qwen3-0.6B projection shapes, per-call CUDA events; no model serving",
+  "rows": [
+    {
+      "shape": "attention",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.021503999829292297,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "attention",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.041471999138593674,
+      "relative_error": 0.007764335721731186
+    },
+    {
+      "shape": "attention",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 0.10555199906229973,
+      "relative_error": 0.010810201056301594
+    },
+    {
+      "shape": "attention",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.02070399932563305,
+      "relative_error": 0.09768424928188324
+    },
+    {
+      "shape": "attention",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.01228800043463707,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "attention",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.031744000501930714,
+      "relative_error": 0.00785946287214756
+    },
+    {
+      "shape": "attention",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 0.10593599826097488,
+      "relative_error": 0.011098156683146954
+    },
+    {
+      "shape": "attention",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.02051199972629547,
+      "relative_error": 0.10048609226942062
+    },
+    {
+      "shape": "mlp",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.03271999955177307,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "mlp",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.02659199945628643,
+      "relative_error": 0.008015980944037437
+    },
+    {
+      "shape": "mlp",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 0.11158400028944016,
+      "relative_error": 0.011582565493881702
+    },
+    {
+      "shape": "mlp",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.022175999358296394,
+      "relative_error": 0.0999949499964714
+    },
+    {
+      "shape": "mlp",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.016383999958634377,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "mlp",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.025599999353289604,
+      "relative_error": 0.007951140403747559
+    },
+    {
+      "shape": "mlp",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 0.10547199845314026,
+      "relative_error": 0.011301583610475063
+    },
+    {
+      "shape": "mlp",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.023264000192284584,
+      "relative_error": 0.09954861551523209
+    },
+    {
+      "shape": "lm_head",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 1.2196959853172302,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "lm_head",
+      "batch": 1,
+      "mode": "w8a16",
+      "median_ms": 0.7990239858627319,
+      "relative_error": 0.007838174700737
+    },
+    {
+      "shape": "lm_head",
+      "batch": 1,
+      "mode": "w8a8",
+      "median_ms": 1.7049599885940552,
+      "relative_error": 0.01035989634692669
+    },
+    {
+      "shape": "lm_head",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.33872000873088837,
+      "relative_error": 0.09954284876585007
+    },
+    {
+      "shape": "lm_head",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 1.2472319602966309,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "lm_head",
+      "batch": 8,
+      "mode": "w8a16",
+      "median_ms": 0.8280799984931946,
+      "relative_error": 0.007824147120118141
+    },
+    {
+      "shape": "lm_head",
+      "batch": 8,
+      "mode": "w8a8",
+      "median_ms": 1.7678399682044983,
+      "relative_error": 0.01084977388381958
+    },
+    {
+      "shape": "lm_head",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.4177919924259186,
+      "relative_error": 0.09966325014829636
+    }
+  ],
+  "config": {
+    "batches": "1,8",
+    "warmup": 12,
+    "repeats": 30,
+    "include_lm_head": true,
+    "output": "results/rtx4060/low_bit_projection_ab.json"
+  }
+}

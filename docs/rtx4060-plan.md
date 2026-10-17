@@ -62,6 +62,8 @@ requires the soak's KV-pressure tests to set the final value.
   8 GB skip (the two-model FP32 speculative parity test) and one strict expected failure.
   The expected failure is INT8 paged-KV recompute/preemption changing a greedy token on
   sm_89; keep INT8 KV disabled until its Ada correctness repair and A/B are complete.
+  This R0 snapshot is historical: the later Priority-4 pass repaired the failure with
+  exact host spill/restore for generated INT8 pages; see `rtx4060-rnd-priorities.md`.
 - Hook gate passes: six decode, 28 prefill and 126 fused-step graphs were captured during
   warm-up, with zero lazy captures and no reported problems. The unmeasured safe defaults
   are `per_head` decode and SDPA prefill; tiled prefill is deliberately opt-in until R1.

@@ -1,0 +1,26 @@
+{
+  "whole_prompt_1024": {
+    "shares": {
+      "gemm": 0.9161,
+      "swiglu": 0.0289,
+      "other": 0.0246,
+      "rmsnorm": 0.019,
+      "rope": 0.0113,
+      "sampling": 0.0001
+    },
+    "total_us_per_step": 112913.16999999982
+  },
+  "fused_128chunk_3decode": {
+    "shares": {
+      "gemm": 0.8732,
+      "other": 0.0883,
+      "rmsnorm": 0.0132,
+      "swiglu": 0.0085,
+      "attention": 0.0079,
+      "rope": 0.007,
+      "kv_write": 0.0014,
+      "sampling": 0.0004
+    },
+    "total_us_per_step": 25174.06766666664
+  }
+}

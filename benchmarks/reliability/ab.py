@@ -83,6 +83,20 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
         ("per_head", {"decode_attention": "per_head"}),
         ("split_k", {"decode_attention": "split_k"}),
     ],
+    "decode_split_k_8": [
+        ("per_head", {"decode_attention": "per_head"}),
+        ("split_k_8", {"decode_attention": "split_k", "decode_num_splits": 8}),
+    ],
+    "decode_split_k_8_16": [
+        ("split_k_8", {"decode_attention": "split_k", "decode_num_splits": 8}),
+        ("split_k_16", {"decode_attention": "split_k", "decode_num_splits": 16}),
+    ],
+    # Ada-specific tile/warp selection plus paired-GQA sharing only before the measured
+    # batch/context bandwidth crossover.
+    "decode_ada": [
+        ("t4_regime", {"decode_attention": "per_head"}),
+        ("ada_regime", {"decode_attention": "ada"}),
+    ],
     # FlashAttention-2 over the pages, where a wheel exists (sm_80+). Both phases at
     # once, because flash replaces the gather and the mask as well as the kernel.
     "flash_attention": [
@@ -125,6 +139,89 @@ SETTINGS: dict[str, list[tuple[str, dict]]] = {
     "fused_step": [
         ("separate_forwards", {"fused_step": False}),
         ("fused_forward", {"fused_step": True}),
+    ],
+    # Ada (sm_89) tensor-core tiled prefill against the SDPA default, page 16.
+    "prefill_tiled": [
+        ("sdpa", {"prefill_attention": "sdpa"}),
+        ("tiled", {"prefill_attention": "tiled"}),
+    ],
+    # Fused graphs pad every chunk row to the full chunk width; packing carries only the
+    # prefill budget through the per-token modules however the budget splits across rows.
+    "packed_fused_prefill": [
+        ("padded_rows", {"packed_fused_prefill": False}),
+        ("packed_rows", {"packed_fused_prefill": True}),
+    ],
+    # Whole-prompt prefill when nothing is decoding, against always chunking at 128.
+    "idle_prefill": [
+        ("chunked_idle", {"idle_prefill_tokens": None}),
+        ("whole_prompt_idle", {"idle_prefill_tokens": 4096}),
+    ],
+    # Packed fused graphs at the full budget width versus the smallest power-of-two width
+    # that holds the planned chunk tokens.
+    "packed_width_buckets": [
+        ("packed_budget_width", {"packed_fused_prefill": True, "packed_prefill_width_buckets": False}),
+        ("packed_width_buckets", {"packed_fused_prefill": True, "packed_prefill_width_buckets": True}),
+    ],
+    "packed_width_buckets_b256": [
+        ("packed_budget_width", {"packed_fused_prefill": True, "packed_prefill_width_buckets": False,
+                                 "prefill_chunk_size": 128, "max_prefill_tokens_per_iteration": 256}),
+        ("packed_width_buckets", {"packed_fused_prefill": True, "packed_prefill_width_buckets": True,
+                                  "prefill_chunk_size": 128, "max_prefill_tokens_per_iteration": 256}),
+    ],
+    # The budget sweep repeated with packed width buckets (removes the full-budget graph width).
+    "prefill_budget_bucketed": [
+        (name, {"packed_fused_prefill": True, "packed_prefill_width_buckets": True,
+                "prefill_chunk_size": chunk, "max_prefill_tokens_per_iteration": budget})
+        for name, chunk, budget in (("c128_b128", 128, 128), ("c64_b64", 64, 64),
+                                    ("c128_b256", 128, 256), ("c256_b256", 256, 256))
+    ],
+    # Priority 6: prefill chunk/budget with packed fused rows (each extra budget token
+    # costs real work, not padding). Baseline first: the engine default 128/128.
+    "prefill_budget_packed": [
+        ("c128_b128", {"packed_fused_prefill": True, "prefill_chunk_size": 128,
+                       "max_prefill_tokens_per_iteration": 128}),
+        ("c64_b64", {"packed_fused_prefill": True, "prefill_chunk_size": 64,
+                     "max_prefill_tokens_per_iteration": 64}),
+        ("c128_b256", {"packed_fused_prefill": True, "prefill_chunk_size": 128,
+                       "max_prefill_tokens_per_iteration": 256}),
+        ("c256_b256", {"packed_fused_prefill": True, "prefill_chunk_size": 256,
+                       "max_prefill_tokens_per_iteration": 256}),
+    ],
+    # Requires --awq-tinygemm. Same packed INT4 weights; prefill-sized projections use the
+    # Triton tensor-core GEMM instead of tinygemm (decode keeps tinygemm in both arms).
+    "awq_prefill_kernel": [
+        ("tinygemm_prefill", {"int4pack_prefill": False}),
+        ("triton_int4pack_prefill", {"int4pack_prefill": True}),
+    ],
+    # Requires --awq-tinygemm: eager prefill against graphed prefill/fused steps whose
+    # chunk rows are packed (graph replay otherwise pads every row to the chunk width).
+    "awq_graphs_packed": [
+        ("prefill_eager", {"prefill_cuda_graphs": False}),
+        ("graphed_packed", {"prefill_cuda_graphs": True, "packed_fused_prefill": True}),
+    ],
+    "awq_graphs_packed_buckets": [
+        ("prefill_eager", {"prefill_cuda_graphs": False}),
+        # `force_prefill_graphs` overrides the engine's AWQ eager-prefill policy for this
+        # measurement only (harness key, applied after construction, before warmup).
+        ("graphed_packed_buckets", {"force_prefill_graphs": True, "packed_fused_prefill": True,
+                                    "packed_prefill_width_buckets": True}),
+    ],
+    # Requires --w8a16-mlp (MLP and lm_head W8A16 in every arm): attention projections in
+    # FP16, q/o only, or all four in W8A16, swapped per engine on one model.
+    "w8a16_attention": [
+        ("attn_fp16", {"w8a16_attention": ()}),
+        ("attn_qo_w8a16", {"w8a16_attention": ("q_proj", "o_proj")}),
+        ("attn_all_w8a16", {"w8a16_attention": ("q_proj", "k_proj", "v_proj", "o_proj")}),
+    ],
+    # Requires --w8a16-mlp. FP16 (tied) lm_head against an INT8 copy, swapped per engine.
+    "w8a16_lm_head": [
+        ("lm_head_fp16", {"w8a16_lm_head": False}),
+        ("lm_head_w8a16", {"w8a16_lm_head": True}),
+    ],
+    # Requires --w8a16-mlp. Same quantized weights; only the projection kernel differs.
+    "w8a16_kernel": [
+        ("w8a16_current", {"w8a16_tuned": False}),
+        ("w8a16_tuned", {"w8a16_tuned": True}),
     ],
     # The two-arm form, once `tiled` has been measured on a device.
     "prefill_sdpa": [
@@ -225,9 +322,11 @@ def resolve_arms(arms: list[tuple[str, dict]], max_active: int) -> list[tuple[st
 # changes output is a bug. Kernel-swapping arms are still gated below: each must agree
 # with stock Transformers for the first `--min-identical-tokens` of every prompt, which a
 # wrong kernel fails immediately and a rounding difference does not.
-TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "triton_rmsnorm",
+TOKEN_DRIFT_EXPECTED = {"kv_dtype", "prefill_kernel", "prefill_sdpa", "prefill_tiled", "idle_prefill", "packed_fused_prefill", "prefill_budget_packed", "w8a16_kernel", "awq_prefill_kernel", "awq_graphs_packed", "w8a16_lm_head", "w8a16_attention", "packed_width_buckets", "packed_width_buckets_b256", "prefill_budget_bucketed", "awq_graphs_packed_buckets", "triton_rmsnorm",
                         "triton_rope", "triton_swiglu", "mlp_gate_up", "fused_step",
-                        "decode_kernel", "decode_split_k", "flash_attention",
+                        "decode_kernel", "decode_split_k", "decode_split_k_8",
+                        "decode_split_k_8_16",
+                        "decode_ada", "flash_attention",
                         "flash_decode", "flash_prefill", "flash_dense_prefill",
                         "flash_decode_splits"}
 
@@ -251,6 +350,8 @@ PROMPT_PROFILES: dict[str, dict] = {
     "short": {"prefix_tokens": (16, 128), "suffix_tokens": (4, 96)},      # ~20-224
     "chat": {"prefix_tokens": (256, 768), "suffix_tokens": (32, 256)},    # ~288-1024
     "long": {"prefix_tokens": (1024, 2048), "suffix_tokens": (64, 512)},  # ~1088-2560
+    "long_4k": {"prefix_tokens": (4096, 4096), "suffix_tokens": (0, 0),
+                "max_new_tokens": (64, 64)},
 }
 
 
@@ -409,6 +510,10 @@ def _verdict(baseline: dict, variant: dict) -> str:  # noqa: D401
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--w8a16-mlp", action="store_true",
+                        help="quantize gate/up/down to W8A16 after the stock reference is taken")
+    parser.add_argument("--awq-tinygemm", action="store_true",
+                        help="load a local GEMM-format AWQ checkpoint through native INT4")
     parser.add_argument("--dtype", default="auto", choices=("auto", "float16", "bfloat16"),
                         help="model/KV activation dtype; explicit values make numerical "
                              "and performance comparisons reproducible")
@@ -441,11 +546,12 @@ def main() -> int:
     args = parser.parse_args()
 
     from engine.batching.continuous_batching import ContinuousBatchingEngine
-    from engine.model import load_model
+    from engine.model import load_awq_tinygemm_model, load_model
 
     # One model, many engines: reloading weights per arm would add minutes and change
     # nothing the comparison is about.
-    loaded = load_model(args.model, dtype=args.dtype)
+    loaded = (load_awq_tinygemm_model(args.model) if args.awq_tinygemm
+              else load_model(args.model, dtype=args.dtype))
     shared = dict(
         num_blocks=args.num_blocks, block_size=args.block_size, max_active=args.max_active,
         max_waiting_requests=args.max_waiting, prefix_cache_blocks=64,
@@ -471,20 +577,45 @@ def main() -> int:
 
     makers = {}
     arm_settings = {}
+    lm_heads: dict = {}  # filled after the stock reference for the w8a16_lm_head setting
+    attention_maps: dict = {}  # per projection name, for the w8a16_attention setting
     for label, overrides in arms_spec:
         settings = _clamp_graph_buckets({**shared, **overrides}, args.max_active)
         if settings.get("cuda_graph_batch_sizes") is None:
             settings.pop("cuda_graph_batch_sizes", None)
         arm_settings[label] = settings
-        harness_keys = {"warmup"}
+        harness_keys = {"warmup", "w8a16_tuned", "int4pack_prefill", "w8a16_lm_head", "force_prefill_graphs",
+                        "w8a16_attention"}
         engine_kwargs = {k: v for k, v in settings.items() if k not in harness_keys}
         skip_warmup = settings.get("warmup", True) is False
+        w8a16_tuned = settings.get("w8a16_tuned")
+        int4pack_prefill = settings.get("int4pack_prefill")
+        lm_head_choice = settings.get("w8a16_lm_head")
+        force_prefill_graphs = settings.get("force_prefill_graphs", False)
+        attention_choice = settings.get("w8a16_attention")
 
-        def make_engine(engine_kwargs=engine_kwargs, skip_warmup=skip_warmup):
+        def make_engine(engine_kwargs=engine_kwargs, skip_warmup=skip_warmup, w8a16_tuned=w8a16_tuned,
+                        int4pack_prefill=int4pack_prefill, lm_head_choice=lm_head_choice,
+                        force_prefill_graphs=force_prefill_graphs, attention_choice=attention_choice):
+            if attention_choice is not None:
+                from engine.kernels.w8a16_tuned import swap_projections
+                for name, mapping in attention_maps.items():
+                    swap_projections(loaded.model, mapping, use_w8a16=name in attention_choice)
+            if lm_head_choice is not None:
+                loaded.model.lm_head = lm_heads["w8a16" if lm_head_choice else "fp16"]
+            if int4pack_prefill is not None:
+                from engine.quantization.awq_tinygemm import install_int4pack_prefill
+                install_int4pack_prefill(loaded.model, 64 if int4pack_prefill else None)
+            if w8a16_tuned is not None:
+                from engine.kernels.w8a16_tuned import install_tuned_w8a16
+                install_tuned_w8a16(loaded.model, enabled=w8a16_tuned)
             engine = ContinuousBatchingEngine(
                 loaded.model, loaded.tokenizer, loaded.device, **engine_kwargs
             )
             engine.skip_benchmark_warmup = skip_warmup
+            if force_prefill_graphs:
+                engine.prefill_cuda_graphs = True
+                engine.prefill_graph_eager_reason = None
             return engine
 
         makers[label] = make_engine
@@ -492,6 +623,22 @@ def main() -> int:
     # Stock greedy reference, computed before any engine patches the shared model. It
     # decides which arm is closer to the truth when the gate below finds a difference.
     reference, margins = _stock_reference(loaded, IDENTITY_PROMPTS, 48)
+    if args.w8a16_mlp:
+        from engine.kernels.w8a16_linear import quantize_mlp_w8a16
+        import torch
+
+        print(f"W8A16 MLP: replaced {quantize_mlp_w8a16(loaded.model)} projections")
+        if args.setting == "w8a16_lm_head":
+            from engine.kernels.w8a16_tuned import quantize_lm_head_w8a16
+            lm_heads.update(quantize_lm_head_w8a16(loaded.model))
+            loaded.model.lm_head = lm_heads["fp16"]
+        if args.setting == "w8a16_attention":
+            from engine.kernels.w8a16_tuned import quantize_attention_w8a16, quantize_lm_head_w8a16, swap_projections
+            quantize_lm_head_w8a16(loaded.model)   # every arm: the current best 1.7B profile
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                attention_maps[name] = quantize_attention_w8a16(loaded.model, (name,))
+                swap_projections(loaded.model, attention_maps[name], use_w8a16=False)
+        torch.cuda.empty_cache()
 
     # Token-identity gate before anything is timed. Each arm generates the same fixed
     # prompts greedily on a warmed engine; the outputs must match unless the setting is

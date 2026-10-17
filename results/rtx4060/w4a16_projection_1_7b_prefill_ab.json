@@ -1,0 +1,128 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.14.0+cu130",
+  "scope": "Synthetic weights at qwen3_1_7b projection shapes; per-call CUDA events, no model serving or AWQ packing",
+  "rows": [
+    {
+      "shape": "q_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.049615999683737755,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 128,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.1525759994983673,
+      "relative_error": 0.09981033205986023
+    },
+    {
+      "shape": "q_proj",
+      "batch": 256,
+      "mode": "fp16",
+      "median_ms": 0.07867200300097466,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 256,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.2908160090446472,
+      "relative_error": 0.09976249933242798
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.030527999624609947,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 128,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.08380799740552902,
+      "relative_error": 0.09954614192247391
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 256,
+      "mode": "fp16",
+      "median_ms": 0.04915200173854828,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 256,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.15360000729560852,
+      "relative_error": 0.0993175059556961
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.12451199814677238,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 128,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.42905598878860474,
+      "relative_error": 0.09989670664072037
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 256,
+      "mode": "fp16",
+      "median_ms": 0.20787200331687927,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 256,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.8446879982948303,
+      "relative_error": 0.09971035271883011
+    },
+    {
+      "shape": "down_proj",
+      "batch": 128,
+      "mode": "fp16",
+      "median_ms": 0.14270400255918503,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 128,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.5226240158081055,
+      "relative_error": 0.09981004893779755
+    },
+    {
+      "shape": "down_proj",
+      "batch": 256,
+      "mode": "fp16",
+      "median_ms": 0.21196800470352173,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 256,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 1.0415039658546448,
+      "relative_error": 0.09984871000051498
+    }
+  ],
+  "config": {
+    "batches": "128,256",
+    "geometry": "qwen3_1_7b",
+    "modes": "fp16,w4a16_tinygemm",
+    "warmup": 5,
+    "repeats": 20,
+    "include_lm_head": false,
+    "output": "results/rtx4060/w4a16_projection_1_7b_prefill_ab.json"
+  }
+}

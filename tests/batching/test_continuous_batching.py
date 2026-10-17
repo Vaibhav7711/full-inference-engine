@@ -23,13 +23,6 @@ from engine.runtime import GenerationRequest
 
 cuda = pytest.mark.cuda
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-ada_int8_preemption_revalidation = pytest.mark.xfail(
-    condition=(torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (8, 9)),
-    strict=True,
-    reason=("RTX R0 finding: INT8 paged-KV recompute/preemption changes a greedy token; "
-            "keep INT8 KV disabled pending its Ada A/B and correctness repair"),
-)
-
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
@@ -427,6 +420,35 @@ def test_fixed_width_cuda_graph_bucket_matches_reference():
 
 @cuda
 @requires_cuda
+def test_split_k_cuda_graph_rebuckets_when_context_grows():
+    """A split-K graph must never replay a partition captured for a shorter row."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+
+    model, tok = _load()
+    phrase = tok("Paged attention reads prior tokens in blocks. ", add_special_tokens=False).input_ids
+    token_ids = (phrase * ((120 + len(phrase) - 1) // len(phrase)))[:120]
+
+    def run(decode_attention: str):
+        eng = ContinuousBatchingEngine(
+            model, tok, "cuda", num_blocks=256, max_active=1,
+            prefix_cache_blocks=0, cuda_graph_batch_sizes=(1,),
+            decode_attention=decode_attention, decode_num_splits=8,
+        )
+        eng.eos_ids = set()
+        request = _admit(eng, decode_attention, token_ids, 20)
+        eng.prefill_chunks([(request, request.remaining_prefill_tokens)])
+        while request.state.name == "DECODING":
+            eng.decode_step([request])
+        return request.output_token_ids, eng._decode_graphs
+
+    reference, _ = run("per_head")
+    actual, graphs = run("split_k")
+    assert actual == reference
+    assert {key[3] for key in graphs} == {128, 256}
+
+
+@cuda
+@requires_cuda
 def test_padded_cuda_graph_bucket_matches_reference():
     """Three live rows may safely replay a width-four graph with one dummy KV page."""
     from engine.batching.continuous_batching import ContinuousBatchingEngine
@@ -460,6 +482,8 @@ def _fused_engine(model, tok, **overrides):
     settings = dict(
         num_blocks=1024, block_size=16, max_active=4, prefix_cache_blocks=0,
         prefill_chunk_size=16, max_prefill_tokens_per_iteration=16,
+        # The chunked path under test only runs when idle whole-prompt prefill is off.
+        idle_prefill_tokens=None,
     )
     settings.update(overrides)
     return ContinuousBatchingEngine(model, tok, "cuda", **settings)
@@ -556,6 +580,7 @@ def test_d4_chunked_prefill_matches_reference_and_releases_blocks(prefill_attent
         model, tok, "cuda", num_blocks=512, block_size=16, max_active=4,
         prefill_chunk_size=8, max_prefill_tokens_per_iteration=8,
         prefill_attention=prefill_attention, cuda_graph_batch_sizes=graphs,
+        idle_prefill_tokens=None,  # exercise the chunked path, not the idle fast path
     )
     actual = eng.generate([prompt], max_new_tokens=max_new)[0]
     assert actual == reference
@@ -800,7 +825,6 @@ def test_g1b_preemption_under_cuda_graphs_stays_token_identical():
 
 @cuda
 @requires_cuda
-@ada_int8_preemption_revalidation
 def test_g1b_int8_kv_preemption_matches_int8_without_preemption():
     """INT8 rebuilds per-block scales on recompute.
 
@@ -827,6 +851,8 @@ def test_g1b_int8_kv_preemption_matches_int8_without_preemption():
     pressured = _run_to_completion(tight, _PRESSURE_PROMPTS, max_new)
     print("\nint8 pressure:", tight.recompute_report())
     assert tight.scheduler.preemption_count > 0
+    assert tight.recompute_report()["int8_spill_events"] > 0
+    assert tight.recompute_report()["int8_spill_requests_live"] == 0
     assert all(r.state is RequestState.FINISHED for r in pressured)
     for under_pressure, reference in zip(pressured, baseline):
         assert under_pressure.output_token_ids == reference.output_token_ids
@@ -1011,3 +1037,44 @@ def test_stop_token_ids_and_logprobs_are_honoured():
     assert len(request.output_logprobs) == len(request.output_token_ids)
     for entries in request.output_logprobs:
         assert entries and entries[0][1] <= 0.0
+
+
+@cuda
+@requires_cuda
+def test_int8_spill_after_next_page_acquired_restores_exactly():
+    """A decode row can own the page for its next token when a later prefill in the same
+    step preempts it. Its spill must cover only committed pages, or restore (which
+    allocates for the committed length) receives one page more than it allocated."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.runtime import GenerationRequest, RequestState
+
+    model, tok = _load()
+    prompt = tok("The lighthouse keeper wrote in his diary every night because",
+                 return_tensors="pt").input_ids[0].tolist()
+    prompt = (prompt * 4)[:31]
+    max_new = 12
+
+    def run(preempt: bool):
+        eng = ContinuousBatchingEngine(
+            model, tok, "cuda", num_blocks=64, block_size=16, max_active=2,
+            kv_cache_dtype="int8", prefix_cache_blocks=0,
+        )
+        eng.eos_ids.clear()
+        request = GenerationRequest("edge", prompt_token_count=len(prompt),
+                                    max_new_tokens=max_new, prompt_token_ids=list(prompt))
+        assert eng.submit(request)
+        while request.allocation is None or request.allocation.sequence_length < 32:
+            eng.step()
+        if preempt:
+            assert request.allocation.sequence_length == 32
+            assert eng._ensure_kv_capacity(request, 33)
+            assert len(request.allocation.physical_block_ids) == 3
+            eng._preempt_request(request)
+            assert eng.recompute_report()["int8_spill_events"] == 1
+        while eng.has_unfinished_requests:
+            eng.step()
+        assert request.state is RequestState.FINISHED
+        assert eng.block_manager.snapshot()["used_blocks"] == 0
+        return request.output_token_ids
+
+    assert run(preempt=True) == run(preempt=False)

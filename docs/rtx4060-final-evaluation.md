@@ -1,5 +1,9 @@
 # RTX 4060 final evaluation
 
+> Historical FlashAttention checkpoint. For the complete later Ada R&D—including tiled
+> page-16 prefill, INT8 KV, W8A16, Qwen3-4B-AWQ and final profiles—see
+> `docs/rtx4060-ada-sm89-complete-report.md`.
+
 Date: 2026-09-24  
 Target: NVIDIA GeForce RTX 4060, Ada `sm_89`, 8 GB VRAM  
 Models: `Qwen/Qwen3-0.6B` and `Qwen/Qwen3-1.7B`  
@@ -163,6 +167,11 @@ outside that component.
 The HTTP smoke covers readiness/model discovery, completion, streaming chat, stop and seed
 determinism, unsupported-input refusal, concurrent callers and Prometheus metrics. It is an
 outside process and does not import engine internals.
+
+Subsequent Priority-4 R&D supersedes the expected-failure row above: exact INT8
+page spill/restore now passes the Ada preemption gate, and 4096-context A/Bs are
+positive. INT8 KV remains opt-in pending mixed-arrival spill-tail measurement; see
+`rtx4060-rnd-priorities.md`.
 
 ## Reproduction
 

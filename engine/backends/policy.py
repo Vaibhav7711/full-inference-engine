@@ -51,7 +51,14 @@ MEASURED: dict[int, dict] = {
                                  "reduced prefill step 7.8% (0.6B) and TTFT 13.7% (1.7B); "
                                  "requires 256-token pages",
             "dtype": "FP16 passed the early stock-token gate; BF16 Flash diverged at token 2",
+            "prefill_fallback": "RTX 4060 page-16 A/B with every graph captured: tiled "
+                                "prefill step -6.3%/-12.5% (0.6B chat/long), -3.1%/-5.2% "
+                                "(1.7B), ITL p99 -15.8%/-42.9% (0.6B); token gate passed; "
+                                "SDPA graphs also exhaust 8 GB at large pools",
         },
+        # Used when the measured default cannot run on the geometry, e.g. Flash on the
+        # compact 16-token pages: measured, rather than the registry's priority order.
+        "prefill_fallback": "tiled",
     },
 }
 
@@ -90,6 +97,17 @@ def defaults_for(profile, geometry: Geometry) -> DeviceDefaults:
             if chosen in available[phase]:
                 continue
             alternatives = available[phase]
+            measured_fallback = entry.get(f"{phase}_fallback")
+            if measured_fallback in alternatives:
+                reasons[f"{phase}_attention"] = (
+                    f"measured default {chosen!r} cannot run here; measured fallback "
+                    f"{measured_fallback}: {entry['reasons'].get(f'{phase}_fallback', '')}"
+                )
+                if phase == "decode":
+                    decode = measured_fallback
+                else:
+                    prefill = measured_fallback
+                continue
             if alternatives:
                 from engine.backends.registry import get
 

@@ -1,0 +1,39 @@
+{
+  "arm": "engine_optimized",
+  "label": "current_optimized",
+  "model": "models/Qwen3-4B-AWQ",
+  "engine_tree": "/home/divy/Documents/inference-engine",
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "new_tokens": 128,
+  "results": {
+    "128": {
+      "prompt_tokens": 128,
+      "runs": 3,
+      "ttft_ms": 78.951341,
+      "itl_p50_ms": 12.460757,
+      "itl_mean_ms": 12.637443440944882,
+      "decode_tok_s": 80.25194616988358,
+      "end_to_end_ms": 1686.4138369999182,
+      "end_to_end_tok_s": 75.90070550399913,
+      "peak_allocated_gib": 2.920322895050049
+    },
+    "2048": {
+      "prompt_tokens": 2048,
+      "runs": 3,
+      "ttft_ms": 1322.806116,
+      "itl_p50_ms": 14.112751,
+      "itl_mean_ms": 14.238776545931758,
+      "decode_tok_s": 70.85790715077451,
+      "end_to_end_ms": 3129.0752349998456,
+      "end_to_end_tok_s": 40.90665464616299,
+      "peak_allocated_gib": 2.910249710083008
+    },
+    "warmup_s": 1.5634943119998752,
+    "lazy_graph_captures": 0,
+    "engine_settings": {
+      "packed_fused_prefill": true,
+      "packed_prefill_width_buckets": true,
+      "prefill_attention": "tiled"
+    }
+  }
+}

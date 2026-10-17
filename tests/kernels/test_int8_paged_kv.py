@@ -138,3 +138,102 @@ def test_int8_paged_prefill_stays_close_to_fp16() -> None:
     valid_reference = torch.cat([fp16[row, :, :length].reshape(-1) for row, length in enumerate(lengths.tolist())])
     relative_error = (valid.float() - valid_reference.float()).abs().mean() / valid_reference.float().abs().mean().clamp_min(1e-5)
     assert relative_error.item() < 0.03, f"INT8 paged prefill relative error {relative_error.item():.4f}"
+
+
+@cuda
+@requires_cuda
+def test_int8_key_smoothing_recovers_outlier_channel_precision() -> None:
+    """Static K smoothing: write stores quant(k / s), attention multiplies q by s."""
+    from engine.kernels.int8_paged_kv import (
+        paged_decode_batched_int8, paged_prefill_int8, write_prefill_int8_kv_batched,
+    )
+    from engine.kernels.paged_decode_batched import paged_decode_batched
+    from engine.kernels.paged_prefill import paged_prefill
+    from engine.quantization.kv_smoothing import pair_equal
+
+    torch.manual_seed(73)
+    batch, q_heads, kv_heads, dim, block_size, length = 2, 16, 8, 128, 16, 192
+    blocks_per_row = length // block_size
+    tables = torch.arange(batch * blocks_per_row, device="cuda", dtype=torch.int32).flip(0).view(batch, -1)
+    # A few large channels per head, as Qwen3 k_norm/RoPE keys have.
+    channel_gain = torch.ones(kv_heads, dim, device="cuda")
+    channel_gain[:, 3] = 40.0
+    channel_gain[:, 3 + dim // 2] = 25.0
+    channel_gain[:, 70] = 15.0
+    keys = (torch.randn(batch, kv_heads, length, dim, device="cuda") * channel_gain[None, :, None]).half()
+    # Integer values with absmax 127 quantize exactly (scale 1), isolating the key path.
+    values = torch.randint(-100, 101, keys.shape, device="cuda").half()
+    values[..., 0] = 127
+    query = torch.randn(batch, q_heads, length, dim, device="cuda", dtype=torch.float16) * 0.2
+    starts = torch.zeros(batch, device="cuda", dtype=torch.int32)
+    lengths = torch.full((batch,), length, device="cuda", dtype=torch.int32)
+    smoothing = pair_equal(channel_gain).float().contiguous()
+    total_blocks = batch * blocks_per_row
+
+    key_fp16 = torch.zeros(total_blocks, block_size, kv_heads, dim, device="cuda", dtype=torch.float16)
+    value_fp16 = torch.zeros_like(key_fp16)
+    for row in range(batch):
+        for position in range(length):
+            block, offset = int(tables[row, position // block_size]), position % block_size
+            key_fp16[block, offset] = keys[row, :, position]
+            value_fp16[block, offset] = values[row, :, position]
+    reference_decode = paged_decode_batched(query[:, :, -1:], key_fp16, value_fp16, tables, lengths)
+    reference_prefill = paged_prefill(query, key_fp16, value_fp16, tables, starts, lengths)
+
+    errors = {}
+    for label, factor in (("plain", None), ("smoothed", smoothing)):
+        key_pages = torch.zeros(total_blocks, block_size, kv_heads, dim, device="cuda", dtype=torch.int8)
+        value_pages = torch.zeros_like(key_pages)
+        key_scales = torch.zeros(total_blocks, block_size, kv_heads, device="cuda", dtype=torch.float16)
+        value_scales = torch.zeros_like(key_scales)
+        write_prefill_int8_kv_batched(
+            keys, values, key_pages, value_pages, key_scales, value_scales, tables, lengths,
+            starts, key_smoothing=factor,
+        )
+        decode = paged_decode_batched_int8(
+            query[:, :, -1:], key_pages, value_pages, key_scales, value_scales, tables,
+            lengths, key_smoothing=factor,
+        )
+        prefill = paged_prefill_int8(
+            query, key_pages, value_pages, key_scales, value_scales, tables, starts, lengths,
+            key_smoothing=factor,
+        )
+        errors[label] = tuple(
+            float((out.float() - ref.float()).abs().mean() / ref.float().abs().mean())
+            for out, ref in ((decode, reference_decode), (prefill, reference_prefill))
+        )
+    assert errors["smoothed"][0] < 0.5 * errors["plain"][0], errors
+    assert errors["smoothed"][1] < 0.5 * errors["plain"][1], errors
+    assert max(errors["smoothed"]) < 0.03, errors
+
+
+@cuda
+@requires_cuda
+@pytest.mark.parametrize("smoothed", [False, True])
+@pytest.mark.parametrize("chunk", [16, 128])
+def test_tiled_int8_prefill_matches_per_token_kernel(chunk: int, smoothed: bool) -> None:
+    """The tensor-core INT8 tile reproduces the per-token INT8 kernel on ragged rows."""
+    from engine.kernels.int8_paged_kv import paged_prefill_int8, tiled_paged_prefill_int8
+
+    torch.manual_seed(79 + chunk)
+    batch, q_heads, kv_heads, dim, block_size, total_blocks = 3, 16, 8, 128, 16, 40
+    starts = torch.tensor([0, 37, 200], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([chunk, max(1, chunk - 5), 0], device="cuda", dtype=torch.int32)
+    tables = torch.randperm(total_blocks, device="cuda")[:3 * 13].view(3, 13).to(torch.int32)
+    query = torch.randn(batch, q_heads, chunk, dim, device="cuda", dtype=torch.float16)
+    key_int8 = torch.randint(-127, 128, (total_blocks, block_size, kv_heads, dim), device="cuda", dtype=torch.int8)
+    value_int8 = torch.randint(-127, 128, key_int8.shape, device="cuda", dtype=torch.int8)
+    key_scale = (torch.rand(key_int8.shape[:-1], device="cuda") * 0.02 + 0.002).half()
+    value_scale = (torch.rand(key_int8.shape[:-1], device="cuda") * 0.02 + 0.002).half()
+    smoothing = None
+    if smoothed:
+        smoothing = torch.rand(kv_heads, dim // 2, device="cuda") * 3 + 0.5
+        smoothing = torch.cat((smoothing, smoothing), dim=-1).contiguous()
+    expected = paged_prefill_int8(query, key_int8, value_int8, key_scale, value_scale, tables,
+                                  starts, lengths, key_smoothing=smoothing)
+    actual = tiled_paged_prefill_int8(query, key_int8, value_int8, key_scale, value_scale, tables,
+                                      starts, lengths, key_smoothing=smoothing)
+    for row, length in enumerate(lengths.tolist()):
+        torch.testing.assert_close(actual[row, :, :length].float(), expected[row, :, :length].float(),
+                                   atol=2e-2, rtol=2e-2)
+        assert torch.count_nonzero(actual[row, :, length:]) == 0

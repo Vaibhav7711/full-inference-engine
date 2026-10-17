@@ -1,0 +1,240 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.14.0+cu130",
+  "scope": "Synthetic weights at qwen3_1_7b projection shapes; per-call CUDA events, no model serving or AWQ packing",
+  "rows": [
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.04095999896526337,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.02068800013512373,
+      "relative_error": 0.10284648835659027
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.01945599913597107,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 4,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.020479999482631683,
+      "relative_error": 0.09863441437482834
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.01945599913597107,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.023552000522613525,
+      "relative_error": 0.09913276135921478
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.020479999482631683,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "q_proj",
+      "batch": 16,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.03167999908328056,
+      "relative_error": 0.09986576437950134
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.02457600086927414,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.020479999482631683,
+      "relative_error": 0.10096926987171173
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.014719999860972166,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 4,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.020479999482631683,
+      "relative_error": 0.10108672082424164
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.014992000069469213,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.020479999482631683,
+      "relative_error": 0.09969409555196762
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.015359999611973763,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "kv_proj",
+      "batch": 16,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.022880000062286854,
+      "relative_error": 0.09834711998701096
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.10556799918413162,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.028672000393271446,
+      "relative_error": 0.10174945741891861
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.03686400130391121,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 4,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.03169599920511246,
+      "relative_error": 0.09965434670448303
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.038704000413417816,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.04403200000524521,
+      "relative_error": 0.09958276897668839
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.04391999915242195,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "gate_up_proj",
+      "batch": 16,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.06518399715423584,
+      "relative_error": 0.09997063130140305
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "fp16",
+      "median_ms": 0.10630399733781815,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 1,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.028672000393271446,
+      "relative_error": 0.09967277199029922
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "fp16",
+      "median_ms": 0.04787199944257736,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 4,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.03174399957060814,
+      "relative_error": 0.10157854855060577
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "fp16",
+      "median_ms": 0.048128001391887665,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 8,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.043007999658584595,
+      "relative_error": 0.0996658056974411
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "fp16",
+      "median_ms": 0.05427199974656105,
+      "relative_error": 0.0
+    },
+    {
+      "shape": "down_proj",
+      "batch": 16,
+      "mode": "w4a16_tinygemm",
+      "median_ms": 0.07475200295448303,
+      "relative_error": 0.10020466893911362
+    }
+  ],
+  "config": {
+    "batches": "1,4,8,16",
+    "geometry": "qwen3_1_7b",
+    "modes": "fp16,w4a16_tinygemm",
+    "warmup": 10,
+    "repeats": 40,
+    "include_lm_head": false,
+    "output": "results/rtx4060/w4a16_projection_1_7b_ab.json"
+  }
+}

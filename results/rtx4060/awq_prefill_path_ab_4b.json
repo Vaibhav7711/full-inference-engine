@@ -1,0 +1,179 @@
+{
+  "benchmark": "awq_prefill_path_ab",
+  "model": "models/Qwen3-4B-AWQ",
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "args": {
+    "model": "models/Qwen3-4B-AWQ",
+    "prompts": [
+      128,
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "rounds": 3,
+    "new_tokens": 32,
+    "out": "results/rtx4060/awq_prefill_path_ab_4b.json"
+  },
+  "arms": {
+    "tinygemm": {
+      "fused_min_rows": null,
+      "dequant_min_rows": null
+    },
+    "fused_from_64": {
+      "fused_min_rows": 64,
+      "dequant_min_rows": null
+    },
+    "fused_64_dequant_192": {
+      "fused_min_rows": 64,
+      "dequant_min_rows": 192
+    }
+  },
+  "rows": {
+    "128": {
+      "tinygemm": {
+        "ttft_p50_ms": 147.466175,
+        "min_ms": 147.337249,
+        "max_ms": 147.915526,
+        "spread": 0.003921421302207003
+      },
+      "fused_from_64": {
+        "ttft_p50_ms": 71.805789,
+        "min_ms": 71.797578,
+        "max_ms": 71.884989,
+        "spread": 0.0012173252493612042
+      },
+      "fused_64_dequant_192": {
+        "ttft_p50_ms": 71.826512,
+        "min_ms": 71.725172,
+        "max_ms": 71.850402,
+        "spread": 0.0017435066316460134
+      },
+      "speedup_vs_tinygemm": {
+        "tinygemm": 1.0,
+        "fused_from_64": 2.053680866872725,
+        "fused_64_dequant_192": 2.0530883498839536
+      },
+      "first_divergence_vs_tinygemm": {
+        "fused_from_64": null,
+        "fused_64_dequant_192": null
+      }
+    },
+    "512": {
+      "tinygemm": {
+        "ttft_p50_ms": 580.799093,
+        "min_ms": 577.098835,
+        "max_ms": 581.849944,
+        "spread": 0.00818029686558075
+      },
+      "fused_from_64": {
+        "ttft_p50_ms": 256.566817,
+        "min_ms": 256.251523,
+        "max_ms": 256.964388,
+        "spread": 0.002778477000008794
+      },
+      "fused_64_dequant_192": {
+        "ttft_p50_ms": 176.127725,
+        "min_ms": 174.504514,
+        "max_ms": 176.440435,
+        "spread": 0.010991574438379918
+      },
+      "speedup_vs_tinygemm": {
+        "tinygemm": 1.0,
+        "fused_from_64": 2.2637342575754835,
+        "fused_64_dequant_192": 3.297601743280338
+      },
+      "first_divergence_vs_tinygemm": {
+        "fused_from_64": null,
+        "fused_64_dequant_192": null
+      }
+    },
+    "1024": {
+      "tinygemm": {
+        "ttft_p50_ms": 1169.803761,
+        "min_ms": 1163.152489,
+        "max_ms": 1174.262498,
+        "spread": 0.009497327133315647
+      },
+      "fused_from_64": {
+        "ttft_p50_ms": 507.351922,
+        "min_ms": 505.92738,
+        "max_ms": 510.857256,
+        "spread": 0.009716876562852517
+      },
+      "fused_64_dequant_192": {
+        "ttft_p50_ms": 322.64123,
+        "min_ms": 318.597142,
+        "max_ms": 322.909364,
+        "spread": 0.01336537800826002
+      },
+      "speedup_vs_tinygemm": {
+        "tinygemm": 1.0,
+        "fused_from_64": 2.3057047983352272,
+        "fused_64_dequant_192": 3.625710703495644
+      },
+      "first_divergence_vs_tinygemm": {
+        "fused_from_64": 16,
+        "fused_64_dequant_192": null
+      }
+    },
+    "2048": {
+      "tinygemm": {
+        "ttft_p50_ms": 2363.904726,
+        "min_ms": 2354.703519,
+        "max_ms": 2365.742616,
+        "spread": 0.004669856986444324
+      },
+      "fused_from_64": {
+        "ttft_p50_ms": 1038.349317,
+        "min_ms": 1037.127151,
+        "max_ms": 1041.467446,
+        "spread": 0.0041799950449625005
+      },
+      "fused_64_dequant_192": {
+        "ttft_p50_ms": 620.175714,
+        "min_ms": 618.740833,
+        "max_ms": 621.887582,
+        "spread": 0.0050739636025153995
+      },
+      "speedup_vs_tinygemm": {
+        "tinygemm": 1.0,
+        "fused_from_64": 2.276598720004744,
+        "fused_64_dequant_192": 3.8116692940994468
+      },
+      "first_divergence_vs_tinygemm": {
+        "fused_from_64": null,
+        "fused_64_dequant_192": null
+      }
+    },
+    "4096": {
+      "tinygemm": {
+        "ttft_p50_ms": 4836.735135,
+        "min_ms": 4813.6954,
+        "max_ms": 4893.284876,
+        "spread": 0.01645520661738698
+      },
+      "fused_from_64": {
+        "ttft_p50_ms": 2168.450973,
+        "min_ms": 2153.67807,
+        "max_ms": 2177.375972,
+        "spread": 0.010928493332369145
+      },
+      "fused_64_dequant_192": {
+        "ttft_p50_ms": 1286.155706,
+        "min_ms": 1278.268364,
+        "max_ms": 1286.381702,
+        "spread": 0.006308208222496418
+      },
+      "speedup_vs_tinygemm": {
+        "tinygemm": 1.0,
+        "fused_from_64": 2.230502416344001,
+        "fused_64_dequant_192": 3.7606139851001834
+      },
+      "first_divergence_vs_tinygemm": {
+        "fused_from_64": null,
+        "fused_64_dequant_192": null
+      }
+    }
+  }
+}

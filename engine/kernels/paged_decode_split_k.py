@@ -49,6 +49,7 @@ def _split_decode_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     LENGTH_OFFSET: tl.constexpr,
+    PREFETCH_VALUE: tl.constexpr,
 ):
     pid_s = tl.program_id(0)    # sequence
     pid_h = tl.program_id(1)    # query head
@@ -81,6 +82,12 @@ def _split_decode_kernel(
         k_row = phys_block[:, None] * stride_kb + offset[:, None] * stride_ks + kv_head * stride_kh
         k = tl.load(kp_ptr + k_row + offs_d[None, :] * stride_kd,
                     mask=n_mask[:, None], other=0.0)
+        v_row = phys_block[:, None] * stride_vb + offset[:, None] * stride_vs + kv_head * stride_vh
+        if PREFETCH_VALUE:
+            # The V address depends on the page-table load, but not on QK or softmax.
+            # Issue it alongside K to expose independent memory work to the scheduler.
+            v = tl.load(vp_ptr + v_row + offs_d[None, :] * stride_vd,
+                        mask=n_mask[:, None], other=0.0)
         scores = tl.sum(q[None, :] * k, axis=1) * scale
         scores = tl.where(n_mask, scores, float("-inf"))
 
@@ -89,9 +96,9 @@ def _split_decode_kernel(
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(scores - m_new)
 
-        v_row = phys_block[:, None] * stride_vb + offset[:, None] * stride_vs + kv_head * stride_vh
-        v = tl.load(vp_ptr + v_row + offs_d[None, :] * stride_vd,
-                    mask=n_mask[:, None], other=0.0)
+        if not PREFETCH_VALUE:
+            v = tl.load(vp_ptr + v_row + offs_d[None, :] * stride_vd,
+                        mask=n_mask[:, None], other=0.0)
         acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
         l_i = l_i * alpha + tl.sum(p, axis=0)
         m_i = m_new
@@ -158,6 +165,7 @@ def paged_decode_split_k(
     *,
     max_sequence_length: int | None = None,
     splits: int | None = None,
+    prefetch_value: bool = False,
 ) -> torch.Tensor:
     """Same contract as `paged_decode_batched`, with the key range split across programs.
 
@@ -228,7 +236,8 @@ def paged_decode_split_k(
         split_len,
         H, kv_heads, scale,
         BLOCK_SIZE=block_size, HEAD_DIM=D, BLOCK_N=block_n,
-        LENGTH_OFFSET=length_offset, num_warps=num_warps,
+        LENGTH_OFFSET=length_offset, PREFETCH_VALUE=prefetch_value,
+        num_warps=num_warps,
     )
     _merge_splits_kernel[(S, H)](
         partial, partial_m, partial_l, out_view,

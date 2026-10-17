@@ -74,10 +74,19 @@ def _decode_gqa(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
     return paged_decode_gqa(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
 
 
+def _decode_ada(query, key_pages, value_pages, block_tables, seq_lens, **kwargs):
+    from engine.kernels.paged_decode_ada import paged_decode_ada
+
+    kwargs.pop("num_splits", None)
+    return paged_decode_ada(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
+
+
 def _decode_split_k(query, key_pages, value_pages, block_tables, seq_lens, **kwargs):
     from engine.kernels.paged_decode_split_k import paged_decode_split_k
 
-    kwargs.pop("num_splits", None)
+    num_splits = kwargs.pop("num_splits", 0)
+    if num_splits:
+        kwargs["splits"] = num_splits
     return paged_decode_split_k(query, key_pages, value_pages, block_tables, seq_lens, **kwargs)
 
 
@@ -89,11 +98,17 @@ def _decode_flash(query, key_pages, value_pages, block_tables, seq_lens, **kwarg
 
 
 def _gqa_available(profile, geometry: Geometry) -> str | None:
-    if geometry.gqa_group != 2:
-        return f"written for a GQA group of exactly 2, not {geometry.gqa_group}"
+    if geometry.gqa_group < 2 or geometry.gqa_group % 2:
+        return f"paired sharing needs a positive even GQA group, not {geometry.gqa_group}"
     if _int8_pool(geometry):
         return "no INT8 variant"
     return _triton_available(profile, geometry)
+
+
+def _ada_available(profile, geometry: Geometry) -> str | None:
+    if profile is None or profile.sm != 89:
+        return "tile and paired-GQA crossover are measured only on sm_89"
+    return _gqa_available(profile, geometry)
 
 
 def _split_k_available(profile, geometry: Geometry) -> str | None:
@@ -110,9 +125,16 @@ register(Backend(
 register(Backend(
     name="gqa", phase="decode", run=_decode_gqa, available=_gqa_available,
     priority=10,
-    summary="Triton, one program per (row, KV head), K/V tile shared by the group. "
-            "Measured 0.95-1.06x on the T4: L2 already serves the second read.",
+    summary="Triton, one program per (row, query-head pair), K/V shared by the pair. "
+            "Supports even GQA groups without four-accumulator register pressure.",
     tags=("triton", "paged", "negative-result"),
+))
+register(Backend(
+    name="ada", phase="decode", run=_decode_ada, available=_ada_available,
+    priority=55,
+    summary="RTX 4060 measured dispatcher: 64x2 general tiles and paired-GQA only "
+            "before the batch/context memory-bandwidth crossover.",
+    tags=("triton", "paged", "sm89", "measured-candidate"),
 ))
 register(Backend(
     name="split_k", phase="decode", run=_decode_split_k, available=_split_k_available,

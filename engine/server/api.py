@@ -342,6 +342,28 @@ def create_app(
     return app
 
 
+def create_rtx4060_optimized_app(model_name: str = "Qwen/Qwen3-1.7B", *,
+                                 profile: str = "optimized", max_active: int = 8,
+                                 num_blocks: int | None = None,
+                                 max_pending_requests: int = 256) -> FastAPI:
+    """Measured per-model profile for the 8 GB RTX 4060 (see `engine.profiles`).
+
+    Use with ``uvicorn 'engine.server.api:create_rtx4060_optimized_app' --factory``;
+    pass ``profile="lossless"`` for FP16 weights and KV with only the scheduling wins.
+    """
+    from engine.profiles import build_engine, default_num_blocks
+
+    blocks = num_blocks if num_blocks is not None else default_num_blocks(model_name, profile)
+    return create_app(
+        model_name=model_name, max_active=max_active, num_blocks=blocks,
+        max_pending_requests=max_pending_requests,
+        engine_factory=lambda: build_engine(
+            model_name, profile=profile, max_active=max_active, num_blocks=blocks,
+            max_waiting_requests=max_pending_requests,
+        ),
+    )
+
+
 def create_rtx4060_flash_app() -> FastAPI:
     """Measured long-context profile for the 8 GB RTX 4060 and Qwen3-0.6B.
 

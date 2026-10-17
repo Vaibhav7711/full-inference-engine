@@ -47,7 +47,7 @@ def scratch_backend():
 
 
 def test_builtins_are_registered_for_both_phases() -> None:
-    assert {"per_head", "gqa", "split_k", "flash"} <= set(names("decode"))
+    assert {"per_head", "gqa", "split_k", "ada", "flash"} <= set(names("decode"))
     assert {"sdpa", "per_token", "tiled", "flash"} <= set(names("prefill"))
 
 
@@ -94,6 +94,7 @@ def test_int8_pool_excludes_the_gather_and_group_backends() -> None:
     decode = {row["name"]: row for row in describe("decode", _profile(80), int8)}
     assert prefill["sdpa"]["available"] is False and "INT8" in prefill["sdpa"]["reason"]
     assert decode["gqa"]["available"] is False
+    assert decode["ada"]["available"] is False
     # per_token is the chunked path that dequantizes in-kernel, so it must survive.
     assert prefill["per_token"]["reason"] is None or "triton" in prefill["per_token"]["reason"]
 
@@ -153,6 +154,14 @@ def test_rtx4060_uses_the_measured_fp16_policy() -> None:
     assert defaults.dtype == "float16"
     assert defaults.decode_attention == "per_head"
     assert "RTX 4060" in defaults.reasons["decode_attention"]
+
+
+def test_ada_decode_backend_is_restricted_to_its_measured_architecture() -> None:
+    t4 = {row["name"]: row for row in describe("decode", _profile(75), QWEN)}
+    ada = {row["name"]: row for row in describe("decode", _profile(89), QWEN)}
+    assert not t4["ada"]["available"]
+    assert "sm_89" in t4["ada"]["reason"]
+    assert ada["ada"]["available"]
 
 
 def test_measured_default_that_cannot_run_here_falls_back_and_says_so() -> None:

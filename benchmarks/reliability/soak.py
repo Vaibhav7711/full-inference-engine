@@ -380,8 +380,10 @@ def run_soak(engine, config: SoakConfig | None = None) -> SoakResult:
     queues = [r.total_queue_time_ms() for r in produced if r.total_queue_time_ms()]
     stalls = [r.stall_time_ms() for r in produced]
     result.latency = {
-        "ttft_p50": _percentile(ttfts, 0.50), "ttft_p99": _percentile(ttfts, 0.99),
-        "itl_p50": _percentile(gaps, 0.50), "itl_p99": _percentile(gaps, 0.99),
+        "ttft_p50": _percentile(ttfts, 0.50), "ttft_p95": _percentile(ttfts, 0.95),
+        "ttft_p99": _percentile(ttfts, 0.99),
+        "itl_p50": _percentile(gaps, 0.50), "itl_p95": _percentile(gaps, 0.95),
+        "itl_p99": _percentile(gaps, 0.99),
         "itl_p999": _percentile(gaps, 0.999),
         "itl_samples": len(gaps),
         "itl_p99_including_preempted": _percentile(gaps_all, 0.99),
@@ -540,7 +542,13 @@ def _warmed(engine):
     first-use cost landing on live requests; everything else warms.
     """
     if hasattr(engine, "warmup") and not getattr(engine, "skip_benchmark_warmup", False):
-        engine.warmup()
+        summary = engine.warmup()
+        engine.warmup_summary = summary
+        # A failed capture disables graphs for that attention kind for the whole run, so
+        # an arm can silently measure an eager path. Say so where the numbers are read.
+        failed = (summary or {}).get("prefill_graph_unsupported") if isinstance(summary, dict) else None
+        if failed:
+            print(f"WARNING warmup graph capture failed; these paths run eagerly: {failed}")
     return engine
 
 

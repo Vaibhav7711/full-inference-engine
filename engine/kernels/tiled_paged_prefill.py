@@ -86,7 +86,10 @@ def _tiled_paged_prefill_kernel(
     # Causal bound for the whole tile: no row here can see past the last row's position.
     # Tiles early in the chunk therefore stream far less KV than tiles late in it.
     tile_last = tl.minimum(tile * BLOCK_M + BLOCK_M, chunk_len)
-    kv_end = start + tile_last
+    # A tile holding only padding rows visits no keys. Clamping alone left it streaming
+    # the whole prefix: a graph-padded 128-wide chunk with 16 real tokens cost as much as
+    # a full one (RTX 4060, context 2048).
+    kv_end = tl.where(tile * BLOCK_M < chunk_len, start + tile_last, 0)
     table = bt_ptr + batch * stride_btb
 
     for start_n in range(0, kv_end, BLOCK_N):
